@@ -64,6 +64,18 @@
                     <mainClass>io.doindev.cvector.CvectorApplication</mainClass>
                 </configuration>
                 <executions>
+                    <!--
+                        AOT pre-processes the Spring bean factory at build time so reflection-heavy
+                        bean construction can be replaced with generated, branch-predictable code.
+                        Picked up at runtime via `-Dspring.aot.enabled=true` (or by GraalVM native).
+                        Pairs with CDS (`-XX:SharedArchiveFile=...`) for the best startup wall-clock.
+                    -->
+                    <execution>
+                        <id>process-aot</id>
+                        <goals>
+                            <goal>process-aot</goal>
+                        </goals>
+                    </execution>
                     <execution>
                         <goals>
                             <goal>repackage</goal>

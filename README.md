@@ -542,13 +542,34 @@ Project size: ~226 files, ~3.5 k distinct nodes, ~10 k distinct edges, 28 active
 | Parser walk (parallel) | sequential ~3 s | **~1.7 s** | **~1.7 s** |
 | Kuzu flush | n/a | **~0.7 s** (COPY) | **~5 s** (skip-MERGE + ~145 node + ~765 edge writes) |
 | Scan loop (parser + flush) | 5.7–6.1 s | **~2.5 s** | **~6.5 s** |
-| Wall clock incl. JVM start, Spring boot, post-pass | ~12 s | **~10 s** | **~15 s** |
+| Wall clock incl. JVM start, Spring boot, post-pass | ~12 s | **~10 s** *(default)* / **~8 s** *(AOT + CDS)* | **~15 s** *(default)* / **~13 s** *(AOT + CDS)* |
+
+Read-only commands (`status`, `explain`, `search`, `recent`, etc.) start at **~2 s** with AOT + CDS, down from ~3.7 s — Spring lazy initialization alone (`spring.main.lazy-initialization=true`) saves ~0.5 s by not constructing the 28 parser beans for commands that never call a parser; AOT-processed bean factories + a CDS shared-archive on top save another ~1 s.
 
 Parser walk uses Java's parallel stream over `Files.walk(...)`. All 28 parsers were audited for thread safety; the two real fixes needed were `JavaParserAdapter`'s `JavaParser` field (now `ThreadLocal<JavaParser>` — JavaParser's library isn't thread-safe for concurrent `parse()` on a single instance) and `PomParserAdapter.bomCache` (HashMap → ConcurrentHashMap). The `Ingestor` / `KuzuIngestor` sinks already serialise via `synchronized accept(GraphEvent)`, so concurrent emits are safe; the speedup comes from parallel AST construction across worker threads.
 
 `ScanCommand` automatically picks between bulk mode (when the project's Kuzu DB is empty — `KuzuBulkLoader` stages CSVs and runs `COPY <table> FROM '...'`) and merge mode (re-scan — `KuzuIngestor` pre-fetches existing `contentHash` per node + existing `(from, to)` per edge type, skips writes for unchanged rows, bulk-bumps `lastIngestedAt` on the skipped set). On a re-scan with substantive code changes, only changed rows actually MERGE, so the worst-case scan time scales with the diff size rather than the full graph size.
 
 E2E coverage on the embedded backend: `cvector-app/src/test/java/io/doindev/cvector/EndToEndKuzuScanIT.java` exercises the full parser → bulk-load → KuzuGraphStore read pipeline against the same `sample-project` and `comment-audit` fixtures the Neo4j IT uses. No Testcontainers / Docker requirement; both tests complete in ~3 s combined.
+
+### Optional: enable AOT + CDS for the JVM/Spring fast path
+
+Two layered optimisations cut Spring Boot startup roughly in half:
+
+1. **Spring AOT** is built in. The Maven build runs `spring-boot:process-aot` automatically (see `cvector-app/pom.xml`), so `BOOT-INF/classes/.../*__BeanDefinitions.class` ships inside the fat jar. Activate it at runtime with `-Dspring.aot.enabled=true`.
+2. **Class Data Sharing**: generate a `cvector.jsa` shared archive once, then point every subsequent invocation at it.
+
+```bash
+# One-time, run after rebuilding the fat jar (writes cvector.jsa next to the jar):
+java -Dspring.aot.enabled=true -XX:ArchiveClassesAtExit=cvector-app/target/cvector.jsa \
+     -jar cvector-app/target/cvector.jar --embedded status
+
+# Subsequent invocations:
+java -Dspring.aot.enabled=true -XX:SharedArchiveFile=cvector-app/target/cvector.jsa \
+     -jar cvector-app/target/cvector.jar --embedded <command> ...
+```
+
+The shared archive is platform-specific (regenerate per OS / JDK). The default invocation without these flags still works — AOT bean-definition classes are inert when `spring.aot.enabled` is unset.
 | Embedded KuzuDB foundation test (open + schema + round-trip) | ~0.6 s for 4 tests |
 
 The parse loop steady state is **~5.9 s for 218 files** — about 27 ms per file averaged across the parser mix.
