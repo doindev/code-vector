@@ -23,9 +23,12 @@ public class DashboardCommand implements Callable<Integer> {
         CvectorConfig cfg = runtime.loadConfig();
         CvectorConfig.ProjectEntry active = runtime.requireActiveProject(cfg);
 
+        String backend = CvectorRuntime.isEmbeddedRequested()
+                ? "kuzu (embedded)"
+                : "neo4j @ " + (cfg.neo4j() != null ? cfg.neo4j().uri() : "default");
         System.out.println("cvector dashboard running");
         System.out.println("  project:  " + active.name() + " (" + active.projectId() + ")");
-        System.out.println("  neo4j:    " + cfg.neo4j().uri());
+        System.out.println("  backend:  " + backend);
         System.out.println("  api:      http://localhost:2969/api");
         System.out.println();
         System.out.println("Endpoints:");

@@ -2,8 +2,7 @@ package io.doindev.cvector.cli.commands;
 
 import io.doindev.cvector.cli.CvectorRuntime;
 import io.doindev.cvector.core.config.CvectorConfig;
-import io.doindev.cvector.neo4j.Neo4jClient;
-import io.doindev.cvector.neo4j.repo.GraphQueries;
+import io.doindev.cvector.core.store.GraphStore;
 import org.springframework.stereotype.Component;
 import picocli.CommandLine.Command;
 
@@ -24,23 +23,22 @@ public class StatusCommand implements Callable<Integer> {
     public Integer call() {
         CvectorConfig cfg = runtime.loadConfig();
         CvectorConfig.ProjectEntry active = runtime.requireActiveProject(cfg);
-        try (Neo4jClient client = runtime.openNeo4j(cfg)) {
-            if (!client.ping()) {
-                System.err.println("neo4j unreachable at " + client.uri());
+        try (GraphStore store = runtime.openGraphStore(cfg)) {
+            if (!store.ping()) {
+                System.err.println("graph backend unreachable at " + store.displayUri());
                 return 1;
             }
-            GraphQueries q = new GraphQueries(client);
             System.out.println("project:  " + active.name() + " (" + active.projectId() + ")");
             System.out.println("root:     " + active.rootPath());
-            System.out.println("neo4j:    " + client.uri());
+            System.out.println("backend:  " + store.displayUri());
             System.out.println();
             System.out.println("nodes:");
-            Map<String, Long> nodes = q.nodeCounts(active.projectId());
+            Map<String, Long> nodes = store.nodeCounts(active.projectId());
             if (nodes.isEmpty()) System.out.println("  (none)");
             nodes.forEach((label, c) -> System.out.printf("  %-12s %d%n", label, c));
             System.out.println();
             System.out.println("edges:");
-            Map<String, Long> edges = q.edgeCounts(active.projectId());
+            Map<String, Long> edges = store.edgeCounts(active.projectId());
             if (edges.isEmpty()) System.out.println("  (none)");
             edges.forEach((type, c) -> System.out.printf("  %-12s %d%n", type, c));
         }

@@ -1,7 +1,6 @@
 package io.doindev.cvector.rest;
 
-import io.doindev.cvector.neo4j.Neo4jClient;
-import io.doindev.cvector.neo4j.repo.GraphQueries;
+import io.doindev.cvector.core.store.GraphStore;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplication;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -15,22 +14,21 @@ import java.util.Map;
 @RequestMapping("/api")
 public class StatsController {
 
-    private final GraphQueries queries;
-    private final Neo4jClient client;
+    private final GraphStore store;
     private final ActiveProject project;
 
-    public StatsController(GraphQueries restGraphQueries, Neo4jClient restNeo4jClient, ActiveProject activeProject) {
-        this.queries = restGraphQueries;
-        this.client = restNeo4jClient;
+    public StatsController(GraphStore restGraphStore, ActiveProject activeProject) {
+        this.store = restGraphStore;
         this.project = activeProject;
     }
 
     @GetMapping("/health")
     public Map<String, Object> health() {
         Map<String, Object> out = new LinkedHashMap<>();
-        boolean ok = client.ping();
+        boolean ok = store.ping();
         out.put("status", ok ? "UP" : "DOWN");
-        out.put("neo4j", client.uri());
+        out.put("backend", store.backend());
+        out.put("uri", store.displayUri());
         out.put("project", project.name());
         out.put("projectId", project.projectId());
         return out;
@@ -41,8 +39,8 @@ public class StatsController {
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("project", project.name());
         out.put("projectId", project.projectId());
-        out.put("nodes", queries.nodeCounts(project.projectId()));
-        out.put("edges", queries.edgeCounts(project.projectId()));
+        out.put("nodes", store.nodeCounts(project.projectId()));
+        out.put("edges", store.edgeCounts(project.projectId()));
         return out;
     }
 

@@ -3,7 +3,12 @@ package io.doindev.cvector.cli;
 import io.doindev.cvector.core.ProjectContext;
 import io.doindev.cvector.core.config.CvectorConfig;
 import io.doindev.cvector.core.config.CvectorConfigService;
+import io.doindev.cvector.core.store.GraphStore;
+import io.doindev.cvector.embedded.EmbeddedKuzu;
+import io.doindev.cvector.embedded.KuzuGraphStore;
+import io.doindev.cvector.embedded.KuzuSchemaBootstrap;
 import io.doindev.cvector.neo4j.Neo4jClient;
+import io.doindev.cvector.neo4j.Neo4jGraphStore;
 import org.springframework.stereotype.Component;
 
 import java.io.IOException;
@@ -58,6 +63,37 @@ public class CvectorRuntime {
     public Neo4jClient openNeo4j(CvectorConfig cfg) {
         CvectorConfig.Neo4jConfig n = cfg.neo4j() != null ? cfg.neo4j() : CvectorConfig.Neo4jConfig.defaults();
         return new Neo4jClient(n.uri(), n.user(), n.password());
+    }
+
+    /**
+     * Open the right read store for the active backend. Callers should close the returned store.
+     * The Kuzu store assumes the schema has already been bootstrapped (it's safe to re-bootstrap;
+     * {@code CREATE NODE TABLE IF NOT EXISTS} is idempotent).
+     */
+    public GraphStore openGraphStore(CvectorConfig cfg) {
+        if (isEmbeddedRequested()) {
+            CvectorConfig.ProjectEntry entry = requireActiveProject(cfg);
+            Path db = EmbeddedKuzu.defaultDbPath(entry.projectId());
+            try {
+                EmbeddedKuzu kuzu = new EmbeddedKuzu(db);
+                new KuzuSchemaBootstrap(kuzu).bootstrap();
+                return new KuzuGraphStore(kuzu);
+            } catch (IOException e) {
+                throw new UncheckedIOException("failed to open embedded kuzu at " + db, e);
+            }
+        }
+        return new Neo4jGraphStore(openNeo4j(cfg));
+    }
+
+    /**
+     * True when the operator asked for the embedded KuzuDB backend instead of Neo4j. Set by the
+     * {@code --embedded} CLI flag (which writes the system property) or by exporting
+     * {@code CVECTOR_EMBEDDED=true}.
+     */
+    public static boolean isEmbeddedRequested() {
+        if (Boolean.getBoolean("cvector.embedded")) return true;
+        String env = System.getenv("CVECTOR_EMBEDDED");
+        return env != null && env.equalsIgnoreCase("true");
     }
 
     public ProjectContext projectContext(CvectorConfig cfg) {

@@ -25,6 +25,10 @@
         </dependency>
         <dependency>
             <groupId>io.doindev</groupId>
+            <artifactId>cvector-embedded-kuzudb-server</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.doindev</groupId>
             <artifactId>cvector-parser-java</artifactId>
         </dependency>
         <dependency>

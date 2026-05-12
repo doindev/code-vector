@@ -4,8 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.doindev.cvector.cli.CvectorRuntime;
 import io.doindev.cvector.core.config.CvectorConfig;
-import io.doindev.cvector.neo4j.Neo4jClient;
-import io.doindev.cvector.neo4j.repo.GraphQueries;
+import io.doindev.cvector.core.store.GraphStore;
 import io.doindev.cvector.rules.RulesConfig;
 import io.doindev.cvector.rules.RulesConfigLoader;
 import io.doindev.cvector.rules.RulesEngine;
@@ -22,7 +21,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Callable;
@@ -57,17 +55,11 @@ public class BadgeCommand implements Callable<Integer> {
     public Integer call() throws Exception {
         CvectorConfig cfg = runtime.loadConfig();
         CvectorConfig.ProjectEntry active = runtime.requireActiveProject(cfg);
-        try (Neo4jClient client = runtime.openNeo4j(cfg)) {
-            GraphQueries q = new GraphQueries(client);
+        try (GraphStore store = runtime.openGraphStore(cfg)) {
             String pid = active.projectId();
-
-            Map<String, Long> nodes = q.nodeCounts(pid);
+            Map<String, Long> nodes = store.nodeCounts(pid);
             List<Badge> badges = new ArrayList<>();
-
-            Path rulesYml = Path.of(active.rootPath()).resolve(".cvector").resolve("rules.yml");
-            RulesConfig rulesCfg = RulesConfigLoader.loadOrDefault(rulesYml);
-            RulesEngine.Report report = new RulesEngine(pid, q, rulesCfg).run();
-            badges.add(rulesBadge(report));
+            badges.add(rulesBadge(store, active, pid));
 
             long deps = nodes.getOrDefault("MavenDependency", 0L);
             badges.add(new Badge("dependencies", String.valueOf(deps), deps == 0 ? "lightgrey" : "blue"));
@@ -82,7 +74,7 @@ public class BadgeCommand implements Callable<Integer> {
             if (tables > 0) badges.add(new Badge("tables", String.valueOf(tables), "blue"));
 
             if (!skipAudit) {
-                int vulns = countVulnerabilities(q, pid);
+                int vulns = countVulnerabilities(store, pid);
                 String color = vulns == 0 ? "brightgreen" : vulns <= 5 ? "orange" : "red";
                 badges.add(new Badge("vulnerabilities", String.valueOf(vulns), color));
             }
@@ -103,29 +95,27 @@ public class BadgeCommand implements Callable<Integer> {
         return 0;
     }
 
-    private Badge rulesBadge(RulesEngine.Report report) {
+    private Badge rulesBadge(GraphStore store, CvectorConfig.ProjectEntry active, String pid) {
+        Path rulesYml = Path.of(active.rootPath()).resolve(".cvector").resolve("rules.yml");
+        RulesConfig rulesCfg = RulesConfigLoader.loadOrDefault(rulesYml);
+        RulesEngine.Report report = new RulesEngine(pid, store, rulesCfg).run();
         if (report.hasErrors()) return new Badge("cvector rules", "failing", "red");
-        Map<String, Integer> bySeverity = report.bySeverity();
-        int warn = bySeverity.getOrDefault(Severity.WARN.name(), 0);
+        int warn = report.bySeverity().getOrDefault(Severity.WARN.name(), 0);
         if (warn > 0) return new Badge("cvector rules", "warnings", "yellow");
         return new Badge("cvector rules", "passing", "brightgreen");
     }
 
-    private int countVulnerabilities(GraphQueries q, String pid) {
-        List<Map<String, Object>> deps = q.raw(
-                "MATCH (d:MavenDependency {projectId: $pid}) "
-                        + "RETURN d.groupId AS groupId, d.artifactId AS artifactId, d.version AS version "
-                        + "ORDER BY groupId, artifactId",
-                Map.of("pid", pid));
+    private int countVulnerabilities(GraphStore store, String pid) {
+        List<Map<String, Object>> deps = store.mavenDependencies(pid);
         if (deps.isEmpty()) return 0;
 
         HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
         ObjectMapper mapper = new ObjectMapper();
         int vulns = 0;
         for (Map<String, Object> d : deps) {
-            String groupId = String.valueOf(d.get("groupId"));
-            String artifactId = String.valueOf(d.get("artifactId"));
-            String version = String.valueOf(d.get("version"));
+            String groupId = stringOf(d.get("groupId"));
+            String artifactId = stringOf(d.get("artifactId"));
+            String version = stringOf(d.get("version"));
             if (version == null || version.isBlank() || "null".equals(version) || version.contains("${")) continue;
             try {
                 String body = String.format(
@@ -147,6 +137,8 @@ public class BadgeCommand implements Callable<Integer> {
         }
         return vulns;
     }
+
+    private static String stringOf(Object v) { return v == null ? null : v.toString(); }
 
     private String renderMarkdown(List<Badge> badges, String projectName) {
         StringBuilder s = new StringBuilder();

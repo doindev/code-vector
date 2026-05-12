@@ -16,11 +16,12 @@ Neo4j-backed code knowledge graph with a polyglot scanner, a Picocli CLI, a Spri
    - [Resources](#mcp-resources)
    - [Prompts](#mcp-prompts)
    - [Client setup](#mcp-client-setup)
-7. [Supported languages](#supported-languages)
-8. [Rules & quality gates](#rules--quality-gates)
-9. [Roles & access control](#roles--access-control)
-10. [Module layout](#module-layout)
-11. [Performance notes](#performance-notes)
+7. [Embedded KuzuDB](#embedded-kuzudb)
+8. [Supported languages](#supported-languages)
+9. [Rules & quality gates](#rules--quality-gates)
+10. [Roles & access control](#roles--access-control)
+11. [Module layout](#module-layout)
+12. [Performance notes](#performance-notes)
 
 ---
 
@@ -168,6 +169,13 @@ custom:
 | Variable | Effect |
 |---|---|
 | `cvector_role` / `CVECTOR_ROLE` | Restrict tools/REST paths exposed: `dev` (default), `architect`, `security`, `pm`. |
+| `CVECTOR_EMBEDDED` | When `true`, route graph access through the embedded KuzuDB store under `~/.cvector/kuzu-data/<projectId>/` instead of `project.json`'s `neo4j` block. Equivalent to passing `--embedded`. See the [Embedded KuzuDB](#embedded-kuzudb) section. |
+
+### Global flags
+
+| Flag | Effect |
+|---|---|
+| `--embedded` | Use the embedded KuzuDB store (no Neo4j required). Inherited by every subcommand. |
 
 ---
 
@@ -233,6 +241,15 @@ Invoke as `java -jar cvector.jar <command> [args]`.
 |---|---|
 | `dashboard` | Start the REST API on port 2969. |
 | `serve` | Start the MCP server over stdio (for IDE/AI integration). |
+
+### Embedded KuzuDB
+
+| Command | Purpose |
+|---|---|
+| `embedded init` | Create the embedded database directory and bootstrap its schema. |
+| `embedded info` | Show the embedded database path, size, and declared tables. |
+| `embedded query <cypher>` | Run an ad-hoc Cypher query against the embedded database. |
+| `embedded wipe` | Delete the embedded database directory for the active project. |
 
 ### Client config helpers
 
@@ -376,6 +393,70 @@ Each helper writes an MCP server entry that runs `java -jar <path>/cvector.jar s
 
 ---
 
+## Embedded KuzuDB
+
+The `cvector-embedded-kuzudb-server` module ships an in-process [KuzuDB](https://kuzudb.com) store as an alternative backing for the graph. KuzuDB is an embedded property-graph database (MIT licensed) that speaks Cypher — no separate process, no port, no Docker. The Kuzu native library is bundled in the artifact for Linux / macOS / Windows.
+
+The module is named with its backend (`-kuzudb-`) so additional embedded backends (e.g. DuckDB, SQLite-backed graph) can ship as parallel modules without colliding.
+
+### Status
+
+- **Write path: ready.** `cvector --embedded scan` runs the full parser pipeline against KuzuDB instead of Neo4j. `EmbeddedKuzu` opens a database in-process, `KuzuSchemaBootstrap` declares cvector's schema (one polymorphic `Node` table + 14 typed `REL` tables), and `KuzuIngestor` issues per-row MERGE/SET writes batched in 500-row transactions. 12 unit tests pass.
+- **Post-passes: ported.** `KuzuPostScan.resolveUnresolvedCalls`, `resolveDeferredHandlers`, and `cleanupStale` all run on embedded scans. The Neo4j versions leaned on `EXISTS { ... }` subqueries, `properties(r)` map projections, and `SET r += oldProps`; the Kuzu ports replace those with OPTIONAL MATCH + IS NULL, explicit per-column reads, and explicit per-column SET.
+- **Read path: most surfaces migrated.** The `GraphStore` interface in `cvector-core/store` covers {ping, displayUri, bootstrapSchema, schemaReady, nodeCounts, edgeCounts, findSymbol, searchByName, callers, callees, impactDownstream, fileOf, projectMeta, contains, referencingNodes, importingFiles, recentlyChanged, mavenDependencies, fileInventory, healthRollup, guardSummary, infrastructureSummary, traceFlows, serviceLinks, onboardSummary, projectsList, methodCallGraph, testReach, backend, supportsRawCypher}. `Neo4jGraphStore` and `KuzuGraphStore` both implement it. The MCP and REST modules wire `GraphStore` via Spring config that branches on `cvector.embedded`. Kuzu queries skip the `projectId` predicate (each Kuzu DB is per-project, so the filter is a no-op) and use Kuzu's `regexp_matches()` / `list_slice()` / variable-length `*1..N` traversal in place of Neo4j's `=~` / `collect()[0..N]`. The `testReach` impl is Java BFS over a fetched reverse-adjacency list since Kuzu has no `shortestPath()`.
+- **CLI commands on `GraphStore`:** all 22 except `diff`. `diff` creates ephemeral snapshot projects and runs cross-snapshot `NOT EXISTS` diffs that don't map cleanly to the embedded one-DB-per-project model — it errors out with a clear message on `--embedded`.
+- **MCP tools on `GraphStore`:** all 16. `cv_rules` runs the full `RulesEngine` (god-file, god-class, long-method, deep-inheritance, dead-code + custom Cypher rules from `rules.yml`) on Kuzu via per-rule dialect-aware Cypher pairs.
+- **MCP resources on `GraphStore`:** all 8 — `stats`, `schema`, `files`, `health`, `infrastructure`, `guard`, `projects`, `onboard`.
+- **REST controllers:** both `StatsController` and `QueryController` (including `/test-impact`) fully on `GraphStore`.
+- **`cvector-rules` and `cvector-watcher` are backend-agnostic.** Both modules dropped their `cvector-neo4j` dependency. `Rule.evaluate` and `CvectorWatcher` take `GraphStore` directly. Custom rules in `.cvector/rules.yml` can supply an optional `cypherKuzu` field for per-backend bodies; otherwise `cypher` is used for both.
+- **Write paths.** `scan`, `scan:incremental`, `watch` (live + cron), and the watcher itself all go through `GraphStore.openIngestor()` → `GraphIngestor` (implemented by `Ingestor` for Neo4j and `KuzuIngestor` for Kuzu). File-removal uses `GraphStore.deleteFileSubtree(projectId, path)` — variable-length `CONTAINS*` DETACH DELETE on Neo4j, Java BFS over CONTAINS edges on Kuzu.
+- **`testReach` is native on Kuzu.** Previously the Kuzu impl fetched every CALLS+REFERENCES edge into Java memory and BFS'd backwards from the target. Now uses Kuzu's variable-length union-edge traversal — `MATCH p = (t)-[:CALLS|REFERENCES*1..N]->(target)` + `min(length(p))` per test — so query cost scales with reachable subgraph instead of total edge count.
+- **`EmbeddedKuzu` filters bound parameters** to only those the prepared statement references. Kuzu rejects `execute` calls where the param map contains extra keys (Neo4j silently ignores). The filter is a one-time regex scan per unique Cypher; the prepared-statement cache keeps the resolved references hot, so callers can pass uniform `{pid, t, ...}` maps regardless of which placeholders each dialect-specific query actually uses.
+- **Schema completeness.** The Kuzu Node table declares 65+ properties parsers emit. `KuzuSchemaBootstrap` issues `ALTER TABLE Node ADD ...` per missing column on startup, so existing on-disk databases lift to the current schema without a wipe.
+- **Performance.** Two ingest paths, picked automatically by `ScanCommand`:
+  - **Bulk mode** (empty DB): `KuzuBulkLoader` buffers events in memory, stages typed CSVs, and runs `COPY Node FROM '...'` + one `COPY <REL_TYPE> FROM '...'` per populated edge table. Flush of ~3.5 k nodes + ~10 k edges takes **~700 ms** on this repo. Total scan wall-clock **~12 s** (most of it JVM/Spring startup + the post-pass rewire).
+  - **Merge mode** (re-scan with existing data): `KuzuIngestor` does per-row MERGE batched in 500-row transactions. ~5 ms per MERGE × ~14 k rows ≈ 60 s flush. Used for incremental scans where existing rows need updating. To force the fast path, `cvector --embedded embedded wipe && cvector --embedded scan` rebuilds from scratch.
+  - Both paths share the same in-memory dedup (14 k raw events → 3.5 k distinct nodes + 10 k distinct edges), a shape-keyed prepared-statement cache, and a regex-cached parameter filter. Read paths are sub-100 ms across the board.
+
+### CLI
+
+```bash
+cvector embedded init                 # create the database directory and bootstrap the schema
+cvector embedded info                 # path, on-disk size, declared tables
+cvector embedded query "MATCH (n:Node) RETURN count(n)"
+cvector embedded wipe                 # delete the project's database directory
+```
+
+The `--embedded` global flag (and `CVECTOR_EMBEDDED=true`) are wired through `CvectorCommand`; commands that don't yet honour it will continue using the Neo4j connection from `project.json`.
+
+### Layout
+
+| Path | Contents |
+|---|---|
+| `~/.cvector/kuzu-data/<projectId>/graph.kuzu/` | KuzuDB database directory for the project. |
+
+A KuzuDB "database" is a directory, not a single file — Kuzu writes columnar storage files inside it. Wipe by deleting the directory.
+
+### Config knobs
+
+| System property | Default | Effect |
+|---|---|---|
+| `cvector.embedded` | unset | Same as the `--embedded` flag. Set via `-Dcvector.embedded=true` or env. |
+
+### Trade-offs vs Neo4j
+
+| Aspect | Neo4j (Bolt) | KuzuDB (in-process) |
+|---|---|---|
+| Cold start | ~10 s | ~50 ms |
+| Memory floor | ~500 MB heap | ~50 MB |
+| License | GPL v3 (Community) | MIT |
+| Cypher dialect | Reference | Subset; no `SET n += $props`, limited `MERGE` |
+| Schema | Schema-on-read | Upfront `CREATE NODE TABLE` |
+| Tooling | Neo4j Browser, GDS, Bloom | CLI + Kuzu Explorer (separate web UI) |
+| Network | Bolt TCP | Java function call |
+
+---
+
 ## Rules & quality gates
 
 Built-in rules ship in `cvector-rules`. Run via `cvector rules` (human/JSON) or `cvector guard` (CI mode — exits non-zero on errors).
@@ -413,6 +494,7 @@ Resources and prompts are not currently role-gated (additive surface).
 cvector/
 ├── cvector-core/              # GraphEvent, NodeKey, ProjectContext, CvectorConfig, CvectorRole
 ├── cvector-neo4j/             # Neo4jClient, Ingestor, SchemaBootstrap, GraphQueries
+├── cvector-embedded-kuzudb-server/  # Optional embedded KuzuDB store (in-process graph DB)
 ├── cvector-parser-*/          # 25 language/format parsers (see Supported languages)
 ├── cvector-rules/             # Rule engine + builtin rules
 ├── cvector-watcher/           # Live file-watch + cron-driven re-scan
@@ -449,4 +531,20 @@ The Java parser used to dominate scans (~48 s for a ~200-file project). Optimisa
 - **Extension dispatch map** replaces O(N parsers) per-file scanning with O(1) lookup.
 - **Virtual threads** enabled in MCP and dashboard modes (Spring property `spring.threads.virtual.enabled=true`). Active on JDK 21+, no-op otherwise.
 
-End-to-end scan time on this repo: **~5 s** for 209 files, 13 k nodes, 13 k edges.
+### Measured numbers (this repo)
+
+Hardware: Windows 11, JDK 25 runtime.
+
+Project size: ~226 files, ~3.5 k distinct nodes, ~10 k distinct edges, 28 active parsers, ~126 cross-file calls resolved by the post-pass.
+
+| Phase | Neo4j | Embedded Kuzu (bulk) | Embedded Kuzu (re-scan / merge) |
+|---|---|---|---|
+| Scan loop (parsing + ingest) — warm | 5.7–6.1 s | **~3.8 s** (parser ~3 s + COPY ~0.7 s) | ~64 s (parser ~3 s + MERGE ~60 s) |
+| Wall clock incl. JVM start, Spring boot, post-pass | ~12 s | **~12 s** | ~70 s |
+
+The embedded bulk path uses `KuzuBulkLoader` (CSV + `COPY <table> FROM '...'`) and kicks in automatically when the project's Kuzu DB is empty. Re-scans on a non-empty DB use `KuzuIngestor` (per-row MERGE), which is bounded by Kuzu's ~5 ms-per-MERGE cost on Windows; for fast re-scans, `cvector --embedded embedded wipe && cvector --embedded scan` reuses the bulk path.
+
+E2E coverage on the embedded backend: `cvector-app/src/test/java/io/doindev/cvector/EndToEndKuzuScanIT.java` exercises the full parser → bulk-load → KuzuGraphStore read pipeline against the same `sample-project` and `comment-audit` fixtures the Neo4j IT uses. No Testcontainers / Docker requirement; both tests complete in ~3 s combined.
+| Embedded KuzuDB foundation test (open + schema + round-trip) | ~0.6 s for 4 tests |
+
+The parse loop steady state is **~5.9 s for 218 files** — about 27 ms per file averaged across the parser mix.

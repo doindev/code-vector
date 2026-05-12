@@ -3,8 +3,12 @@ package io.doindev.cvector.mcp;
 import io.doindev.cvector.core.CvectorRole;
 import io.doindev.cvector.core.config.CvectorConfig;
 import io.doindev.cvector.core.config.CvectorConfigService;
+import io.doindev.cvector.core.store.GraphStore;
+import io.doindev.cvector.embedded.EmbeddedKuzu;
+import io.doindev.cvector.embedded.KuzuGraphStore;
+import io.doindev.cvector.embedded.KuzuSchemaBootstrap;
 import io.doindev.cvector.neo4j.Neo4jClient;
-import io.doindev.cvector.neo4j.repo.GraphQueries;
+import io.doindev.cvector.neo4j.Neo4jGraphStore;
 import io.modelcontextprotocol.server.McpServerFeatures;
 import org.springframework.ai.tool.ToolCallback;
 import org.springframework.ai.tool.ToolCallbackProvider;
@@ -20,20 +24,37 @@ import java.nio.file.Paths;
 import java.util.Arrays;
 import java.util.List;
 
+/**
+ * Wires the MCP server's beans against either Neo4j or the embedded KuzuDB store, controlled by
+ * {@code cvector.embedded} / {@code CVECTOR_EMBEDDED}. The {@link GraphStore} bean owns the live
+ * connection; {@link GraphQueries} is only wired for the Neo4j path (it backs the few legacy MCP
+ * tools that still use raw Cypher with Neo4j-specific dialect).
+ */
 @Configuration
 @Profile("mcp")
 public class McpServerConfig {
 
-    @Bean(destroyMethod = "close")
-    public Neo4jClient mcpNeo4jClient(CvectorConfigService configService) {
-        CvectorConfig cfg = loadConfig(configService);
-        CvectorConfig.Neo4jConfig n = cfg.neo4j() != null ? cfg.neo4j() : CvectorConfig.Neo4jConfig.defaults();
-        return new Neo4jClient(n.uri(), n.user(), n.password());
+    private static boolean embeddedRequested() {
+        if (Boolean.getBoolean("cvector.embedded")) return true;
+        String env = System.getenv("CVECTOR_EMBEDDED");
+        return env != null && env.equalsIgnoreCase("true");
     }
 
-    @Bean
-    public GraphQueries mcpGraphQueries(Neo4jClient mcpNeo4jClient) {
-        return new GraphQueries(mcpNeo4jClient);
+    @Bean(destroyMethod = "close")
+    public GraphStore mcpGraphStore(CvectorConfigService configService, McpActiveProject project) {
+        CvectorConfig cfg = loadConfig(configService);
+        if (embeddedRequested()) {
+            Path db = EmbeddedKuzu.defaultDbPath(project.projectId());
+            try {
+                EmbeddedKuzu kuzu = new EmbeddedKuzu(db);
+                new KuzuSchemaBootstrap(kuzu).bootstrap();
+                return new KuzuGraphStore(kuzu);
+            } catch (IOException e) {
+                throw new UncheckedIOException("failed to open embedded kuzu at " + db, e);
+            }
+        }
+        CvectorConfig.Neo4jConfig n = cfg.neo4j() != null ? cfg.neo4j() : CvectorConfig.Neo4jConfig.defaults();
+        return new Neo4jGraphStore(new Neo4jClient(n.uri(), n.user(), n.password()));
     }
 
     @Bean
@@ -47,8 +68,8 @@ public class McpServerConfig {
     }
 
     @Bean
-    public CvectorTools cvectorTools(GraphQueries mcpGraphQueries, Neo4jClient mcpNeo4jClient, McpActiveProject mcpActiveProject) {
-        return new CvectorTools(mcpGraphQueries, mcpNeo4jClient, mcpActiveProject);
+    public CvectorTools cvectorTools(GraphStore mcpGraphStore, McpActiveProject mcpActiveProject) {
+        return new CvectorTools(mcpGraphStore, mcpActiveProject);
     }
 
     @Bean
@@ -57,8 +78,8 @@ public class McpServerConfig {
     }
 
     @Bean
-    public CvectorResources cvectorResources(GraphQueries mcpGraphQueries, McpActiveProject mcpActiveProject) {
-        return new CvectorResources(mcpGraphQueries, mcpActiveProject);
+    public CvectorResources cvectorResources(GraphStore mcpGraphStore, McpActiveProject mcpActiveProject) {
+        return new CvectorResources(mcpGraphStore, mcpActiveProject);
     }
 
     @Bean

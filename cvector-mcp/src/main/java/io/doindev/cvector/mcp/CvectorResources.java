@@ -1,7 +1,7 @@
 package io.doindev.cvector.mcp;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import io.doindev.cvector.neo4j.repo.GraphQueries;
+import io.doindev.cvector.core.store.GraphStore;
 import io.modelcontextprotocol.server.McpServerFeatures;
 import io.modelcontextprotocol.spec.McpSchema;
 
@@ -13,17 +13,20 @@ import java.util.Map;
 /**
  * Read-only MCP resources backed by the project graph. Clients fetch these as JSON snapshots without
  * having to compose tool calls. Resources are project-scoped via the active {@code McpActiveProject}.
+ *
+ * <p>Every resource here is backend-agnostic — they route through {@link GraphStore} which has
+ * Neo4j and Kuzu implementations.
  */
 public class CvectorResources {
 
     private static final String MIME_JSON = "application/json";
     private static final ObjectMapper JSON = new ObjectMapper();
 
-    private final GraphQueries q;
+    private final GraphStore store;
     private final McpServerConfig.McpActiveProject project;
 
-    public CvectorResources(GraphQueries q, McpServerConfig.McpActiveProject project) {
-        this.q = q;
+    public CvectorResources(GraphStore store, McpServerConfig.McpActiveProject project) {
+        this.store = store;
         this.project = project;
     }
 
@@ -86,72 +89,33 @@ public class CvectorResources {
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("projectId", project.projectId());
         out.put("projectName", project.name());
-        out.put("nodes", q.nodeCounts(project.projectId()));
-        out.put("edges", q.edgeCounts(project.projectId()));
+        out.put("nodes", store.nodeCounts(project.projectId()));
+        out.put("edges", store.edgeCounts(project.projectId()));
         return out;
     }
 
     private Map<String, Object> readSchema() {
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("projectId", project.projectId());
-        out.put("nodeLabels", q.nodeCounts(project.projectId()));
-        out.put("relationshipTypes", q.edgeCounts(project.projectId()));
+        out.put("nodeLabels", store.nodeCounts(project.projectId()));
+        out.put("relationshipTypes", store.edgeCounts(project.projectId()));
         return out;
     }
 
     private Map<String, Object> readFiles() {
-        List<Map<String, Object>> rows = q.raw(
-                "MATCH (f:File {projectId: $pid}) "
-                        + "OPTIONAL MATCH (f)-[:CONTAINS]->(m:Method) "
-                        + "WITH f, count(m) AS methodCount "
-                        + "RETURN f.path AS path, f.language AS language, f.lineCount AS lineCount, "
-                        + "       methodCount, f.lastIngestedAt AS lastIngestedAt "
-                        + "ORDER BY f.path",
-                Map.of("pid", project.projectId()));
+        List<Map<String, Object>> rows = store.fileInventory(project.projectId());
         return Map.of("projectId", project.projectId(), "count", rows.size(), "files", rows);
     }
 
     private Map<String, Object> readProjects() {
-        List<Map<String, Object>> rows = q.raw(
-                "MATCH (p:Project) "
-                        + "OPTIONAL MATCH (p)<-[:IN_PROJECT]-(f:File) "
-                        + "WITH p, count(f) AS fileCount "
-                        + "RETURN p.projectId AS projectId, p.name AS name, p.rootPath AS rootPath, "
-                        + "       p.lastScanCommit AS lastScanCommit, fileCount "
-                        + "ORDER BY p.name",
-                Map.of());
-        return Map.of("active", project.projectId(), "projects", rows);
+        return Map.of("active", project.projectId(),
+                "projects", store.projectsList());
     }
 
     private Map<String, Object> readHealth() {
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("projectId", project.projectId());
-        out.put("godFiles", q.raw(
-                "MATCH (f:File {projectId: $pid})-[:CONTAINS]->(:Class)-[:CONTAINS]->(m:Method) "
-                        + "WITH f, count(m) AS methods WHERE methods >= 30 "
-                        + "RETURN f.path AS path, methods ORDER BY methods DESC LIMIT 20",
-                Map.of("pid", project.projectId())));
-        out.put("godClasses", q.raw(
-                "MATCH (c:Class {projectId: $pid})-[:CONTAINS]->(m:Method) "
-                        + "WITH c, count(m) AS methods WHERE methods >= 20 "
-                        + "RETURN c.fqName AS fqName, methods ORDER BY methods DESC LIMIT 20",
-                Map.of("pid", project.projectId())));
-        out.put("longMethods", q.raw(
-                "MATCH (m:Method {projectId: $pid}) "
-                        + "WHERE m.startLine IS NOT NULL AND m.endLine IS NOT NULL "
-                        + "AND (m.endLine - m.startLine) >= 80 "
-                        + "RETURN m.fqName AS fqName, (m.endLine - m.startLine) AS lines "
-                        + "ORDER BY lines DESC LIMIT 20",
-                Map.of("pid", project.projectId())));
-        out.put("deadCode", q.raw(
-                "MATCH (m:Method {projectId: $pid}) "
-                        + "WHERE NOT EXISTS { MATCH ()-[:CALLS]->(m) } "
-                        + "AND coalesce(m.isTest, false) = false "
-                        + "AND m.name <> 'main' "
-                        + "AND coalesce(m.isConstructor, false) = false "
-                        + "AND coalesce(m.visibility, '') IN ['private', 'package'] "
-                        + "RETURN m.fqName AS fqName ORDER BY m.fqName LIMIT 20",
-                Map.of("pid", project.projectId())));
+        out.putAll(store.healthRollup(project.projectId()));
         return out;
     }
 
@@ -159,92 +123,24 @@ public class CvectorResources {
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("projectId", project.projectId());
         out.put("projectName", project.name());
-        out.put("nodes", q.nodeCounts(project.projectId()));
-        out.put("edges", q.edgeCounts(project.projectId()));
-        out.put("languageMix", q.raw(
-                "MATCH (f:File {projectId: $pid}) "
-                        + "RETURN f.language AS language, count(*) AS files ORDER BY files DESC",
-                Map.of("pid", project.projectId())));
-        out.put("topCallHubs", q.raw(
-                "MATCH (m:Method {projectId: $pid}) "
-                        + "OPTIONAL MATCH (m)-[out:CALLS]->() "
-                        + "OPTIONAL MATCH (m)<-[in:CALLS]-() "
-                        + "WITH m, count(DISTINCT out) AS outDeg, count(DISTINCT in) AS inDeg "
-                        + "WHERE NOT m.fqName STARTS WITH 'unresolved.' "
-                        + "RETURN m.fqName AS fqName, outDeg, inDeg, (outDeg + inDeg) AS total "
-                        + "ORDER BY total DESC LIMIT 10",
-                Map.of("pid", project.projectId())));
-        out.put("apiEndpoints", q.raw(
-                "MATCH (e:ApiEndpoint {projectId: $pid}) "
-                        + "RETURN e.httpMethod AS httpMethod, e.path AS path, e.framework AS framework "
-                        + "ORDER BY path LIMIT 50",
-                Map.of("pid", project.projectId())));
-        out.put("dependencies", q.raw(
-                "MATCH (d:MavenDependency {projectId: $pid}) "
-                        + "RETURN d.fqName AS fqName, d.scope AS scope ORDER BY d.fqName",
-                Map.of("pid", project.projectId())));
+        out.put("nodes", store.nodeCounts(project.projectId()));
+        out.put("edges", store.edgeCounts(project.projectId()));
+        out.put("dependencies", store.mavenDependencies(project.projectId()));
+        out.putAll(store.onboardSummary(project.projectId()));
         return out;
     }
 
     private Map<String, Object> readInfrastructure() {
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("projectId", project.projectId());
-        out.put("apiEndpoints", q.raw(
-                "MATCH (e:ApiEndpoint {projectId: $pid}) "
-                        + "RETURN e.httpMethod AS httpMethod, e.path AS path, e.framework AS framework "
-                        + "ORDER BY path",
-                Map.of("pid", project.projectId())));
-        out.put("queueListeners", q.raw(
-                "MATCH (m:Method {projectId: $pid}) WHERE coalesce(m.isQueueListener, false) = true "
-                        + "RETURN m.fqName AS fqName",
-                Map.of("pid", project.projectId())));
-        out.put("scheduledJobs", q.raw(
-                "MATCH (m:Method {projectId: $pid}) WHERE coalesce(m.isScheduled, false) = true "
-                        + "RETURN m.fqName AS fqName",
-                Map.of("pid", project.projectId())));
-        out.put("configKeys", q.raw(
-                "MATCH (c:ConfigKey {projectId: $pid}) RETURN c.fqName AS fqName ORDER BY c.fqName",
-                Map.of("pid", project.projectId())));
-        out.put("envVars", q.raw(
-                "MATCH (e:EnvVar {projectId: $pid}) RETURN e.fqName AS fqName, e.value AS value ORDER BY e.fqName",
-                Map.of("pid", project.projectId())));
-        out.put("containerImages", q.raw(
-                "MATCH (i:ContainerImage {projectId: $pid}) RETURN i.fqName AS fqName, i.repository AS repository, i.tag AS tag",
-                Map.of("pid", project.projectId())));
-        out.put("containerPorts", q.raw(
-                "MATCH (p:ContainerPort {projectId: $pid}) RETURN p.port AS port, p.protocol AS protocol",
-                Map.of("pid", project.projectId())));
-        out.put("terraformResources", q.raw(
-                "MATCH (r:Resource {projectId: $pid}) RETURN r.fqName AS fqName, r.resourceType AS resourceType, r.provider AS provider",
-                Map.of("pid", project.projectId())));
+        out.putAll(store.infrastructureSummary(project.projectId()));
         return out;
     }
 
     private Map<String, Object> readGuard() {
-        long godFiles = countRule(
-                "MATCH (f:File {projectId: $pid})-[:CONTAINS]->(:Class)-[:CONTAINS]->(m:Method) "
-                        + "WITH f, count(m) AS methods WHERE methods >= 30 RETURN count(f) AS c");
-        long godClasses = countRule(
-                "MATCH (c:Class {projectId: $pid})-[:CONTAINS]->(m:Method) "
-                        + "WITH c, count(m) AS methods WHERE methods >= 20 RETURN count(c) AS c");
-        long longMethods = countRule(
-                "MATCH (m:Method {projectId: $pid}) "
-                        + "WHERE (m.endLine - m.startLine) >= 80 RETURN count(m) AS c");
-        boolean pass = godFiles == 0 && godClasses == 0;
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("projectId", project.projectId());
-        out.put("pass", pass);
-        out.put("errors", godFiles + godClasses);
-        out.put("warnings", longMethods);
-        out.put("breakdown", Map.of(
-                "godFiles", godFiles,
-                "godClasses", godClasses,
-                "longMethods", longMethods));
+        out.putAll(store.guardSummary(project.projectId()));
         return out;
-    }
-
-    private long countRule(String cypher) {
-        var rows = q.raw(cypher, Map.of("pid", project.projectId()));
-        return rows.isEmpty() ? 0 : ((Number) rows.get(0).get("c")).longValue();
     }
 }

@@ -2,8 +2,7 @@ package io.doindev.cvector.cli.commands;
 
 import io.doindev.cvector.cli.CvectorRuntime;
 import io.doindev.cvector.core.config.CvectorConfig;
-import io.doindev.cvector.neo4j.Neo4jClient;
-import io.doindev.cvector.neo4j.repo.GraphQueries;
+import io.doindev.cvector.core.store.GraphStore;
 import io.doindev.cvector.rules.RulesConfig;
 import io.doindev.cvector.rules.RulesConfigLoader;
 import io.doindev.cvector.rules.RulesEngine;
@@ -72,19 +71,17 @@ public class GuardCommand implements Callable<Integer> {
         RulesConfig rulesCfg = RulesConfigLoader.loadOrDefault(configRoot.resolve(".cvector").resolve("rules.yml"));
         applyOverrides(rulesCfg);
 
-        try (Neo4jClient client = runtime.openNeo4j(cfg)) {
-            RulesEngine engine = new RulesEngine(active.projectId(), new GraphQueries(client), rulesCfg);
+        try (GraphStore store = runtime.openGraphStore(cfg)) {
+            RulesEngine engine = new RulesEngine(active.projectId(), store, rulesCfg);
             RulesEngine.Report report = engine.run();
-
             if (json) {
                 System.out.println(RulesCommand.reportToJson(report));
             } else {
                 renderSummary(report);
             }
-
-            boolean fail = report.hasErrors() || (failOnWarn && report.runs().stream().anyMatch(r -> r.severity() == Severity.WARN && r.violations() > 0));
-            if (fail && ci) return 1;
-            return 0;
+            boolean fail = report.hasErrors()
+                    || (failOnWarn && report.runs().stream().anyMatch(r -> r.severity() == Severity.WARN && r.violations() > 0));
+            return fail && ci ? 1 : 0;
         }
     }
 

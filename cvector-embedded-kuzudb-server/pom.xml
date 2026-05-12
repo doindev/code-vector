@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>io.doindev</groupId>
+        <artifactId>cwc-code-vector</artifactId>
+        <version>0.0.1-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>cvector-embedded-kuzudb-server</artifactId>
+    <name>cvector-embedded-kuzudb-server</name>
+    <description>Optional embedded graph store using KuzuDB. Zero-setup alternative to an external Neo4j: single in-process database keyed per project, schema bootstrapped at first open. Named with the backend (kuzudb) so other embedded backends can sit alongside as separate modules.</description>
+
+    <dependencies>
+        <dependency>
+            <groupId>io.doindev</groupId>
+            <artifactId>cvector-core</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.kuzudb</groupId>
+            <artifactId>kuzu</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.assertj</groupId>
+            <artifactId>assertj-core</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+</project>

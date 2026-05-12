@@ -3,7 +3,7 @@ package io.doindev.cvector.cli.commands;
 import io.doindev.cvector.cli.CvectorRuntime;
 import io.doindev.cvector.cli.util.GitHelper;
 import io.doindev.cvector.core.config.CvectorConfig;
-import io.doindev.cvector.neo4j.Neo4jClient;
+import io.doindev.cvector.core.store.GraphStore;
 import org.springframework.stereotype.Component;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
@@ -73,14 +73,10 @@ public class CiCommand implements Callable<Integer> {
             CvectorConfig.ProjectEntry active = runtime.requireActiveProject(cfg);
             Optional<String> head = GitHelper.head(runtime.resolveConfigRoot());
             if (head.isEmpty()) return false;
-            try (Neo4jClient client = runtime.openNeo4j(cfg)) {
-                var rows = client.read(
-                        "MATCH (p:Project {projectId: $pid}) RETURN p.lastScanCommit AS sha",
-                        Map.of("pid", active.projectId())
-                );
-                if (rows.isEmpty()) return false;
-                var v = rows.get(0).get("sha");
-                return !v.isNull() && head.get().equals(v.asString());
+            try (GraphStore store = runtime.openGraphStore(cfg)) {
+                Map<String, Object> meta = store.projectMeta(active.projectId());
+                Object sha = meta.get("lastScanCommit");
+                return sha != null && head.get().equals(sha.toString());
             }
         } catch (RuntimeException e) {
             return false;

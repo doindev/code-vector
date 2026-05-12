@@ -57,6 +57,13 @@ public class DiffCommand implements Callable<Integer> {
 
     @Override
     public Integer call() throws Exception {
+        if (CvectorRuntime.isEmbeddedRequested()) {
+            System.err.println("cvector diff: not supported on the embedded backend yet. The diff");
+            System.err.println("  creates two ephemeral snapshots and runs cross-snapshot NOT EXISTS");
+            System.err.println("  queries — both of which are tied to Neo4j's multi-project model.");
+            System.err.println("  Drop --embedded to run against Neo4j.");
+            return 2;
+        }
         CvectorConfig cfg = runtime.loadConfig();
         CvectorConfig.ProjectEntry active = runtime.requireActiveProject(cfg);
         Path repo = repoPath != null

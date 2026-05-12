@@ -3,8 +3,7 @@ package io.doindev.cvector.cli.commands;
 import io.doindev.cvector.cli.CvectorRuntime;
 import io.doindev.cvector.cli.output.TableRenderer;
 import io.doindev.cvector.core.config.CvectorConfig;
-import io.doindev.cvector.neo4j.Neo4jClient;
-import io.doindev.cvector.neo4j.repo.GraphQueries;
+import io.doindev.cvector.core.store.GraphStore;
 import org.springframework.stereotype.Component;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
@@ -34,9 +33,8 @@ public class ImpactCommand implements Callable<Integer> {
     public Integer call() {
         CvectorConfig cfg = runtime.loadConfig();
         CvectorConfig.ProjectEntry active = runtime.requireActiveProject(cfg);
-        try (Neo4jClient client = runtime.openNeo4j(cfg)) {
-            GraphQueries q = new GraphQueries(client);
-            List<Map<String, Object>> matches = q.findSymbol(active.projectId(), symbol);
+        try (GraphStore store = runtime.openGraphStore(cfg)) {
+            List<Map<String, Object>> matches = store.findSymbol(active.projectId(), symbol);
             if (matches.isEmpty()) {
                 System.err.println("no symbol found matching '" + symbol + "'");
                 return 1;
@@ -46,7 +44,7 @@ public class ImpactCommand implements Callable<Integer> {
             String fqName = (String) hit.get("fqName");
 
             System.out.println("impact of changing: " + fqName + " (depth=" + depth + ")");
-            List<Map<String, Object>> impacted = q.impactDownstream(active.projectId(), id, depth);
+            List<Map<String, Object>> impacted = store.impactDownstream(active.projectId(), id, depth);
             if (impacted.isEmpty()) {
                 System.out.println("  (no downstream impact found)");
             } else {

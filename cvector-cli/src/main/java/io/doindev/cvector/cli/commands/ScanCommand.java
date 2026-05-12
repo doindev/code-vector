@@ -7,6 +7,12 @@ import io.doindev.cvector.core.NodeKey;
 import io.doindev.cvector.core.Parser;
 import io.doindev.cvector.core.ProjectContext;
 import io.doindev.cvector.core.config.CvectorConfig;
+import io.doindev.cvector.core.store.GraphIngestor;
+import io.doindev.cvector.embedded.EmbeddedKuzu;
+import io.doindev.cvector.embedded.KuzuBulkLoader;
+import io.doindev.cvector.embedded.KuzuIngestor;
+import io.doindev.cvector.embedded.KuzuPostScan;
+import io.doindev.cvector.embedded.KuzuSchemaBootstrap;
 import io.doindev.cvector.neo4j.Ingestor;
 import io.doindev.cvector.neo4j.Neo4jClient;
 import io.doindev.cvector.neo4j.SchemaBootstrap;
@@ -27,6 +33,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.Callable;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 import java.util.stream.Stream;
 
 @Component
@@ -66,6 +73,12 @@ public class ScanCommand implements Callable<Integer> {
         System.out.println("scanning " + scanRoot + " into project '" + ctx.projectName() + "' (" + ctx.projectId() + ")");
         System.out.println("parsers: " + parsers.stream().map(Parser::name).toList());
 
+        return CvectorRuntime.isEmbeddedRequested()
+                ? scanEmbedded(ctx, scanRoot)
+                : scanNeo4j(cfg, ctx, scanRoot);
+    }
+
+    private Integer scanNeo4j(CvectorConfig cfg, ProjectContext ctx, Path scanRoot) throws Exception {
         ZonedDateTime scanStart = ZonedDateTime.now(ZoneOffset.UTC);
         try (Neo4jClient client = runtime.openNeo4j(cfg);
              Ingestor ingestor = new Ingestor(client)) {
@@ -74,38 +87,10 @@ public class ScanCommand implements Callable<Integer> {
             Optional<String> head = GitHelper.head(scanRoot);
             emitProjectNode(ctx, head.orElse(null), ingestor);
 
-            for (Parser p : parsers) p.prepare(ctx);
-
-            // Pre-compute extension → parser map so dispatch is O(1) per file instead of O(N parsers).
-            // Parsers with custom accepts() (Dockerfile, TypeScript skip list) fall back to the linear scan.
-            Map<String, Parser> byExt = new HashMap<>();
-            List<Parser> customAccepts = new ArrayList<>();
-            for (Parser p : parsers) {
-                if (hasCustomAccepts(p)) {
-                    customAccepts.add(p);
-                } else {
-                    for (String ext : p.supportedExtensions()) byExt.putIfAbsent(ext.toLowerCase(), p);
-                }
-            }
-
-            AtomicInteger fileCount = new AtomicInteger();
-            long startMs = System.currentTimeMillis();
-            try (Stream<Path> walk = Files.walk(scanRoot)) {
-                walk.filter(Files::isRegularFile)
-                        .filter(ScanCommand::notInIgnored)
-                        .forEach(file -> {
-                            Parser p = dispatch(file, byExt, customAccepts);
-                            if (p != null) {
-                                p.parse(file, ctx, ingestor);
-                                fileCount.incrementAndGet();
-                            }
-                        });
-            }
-            for (Parser p : parsers) p.finish();
+            ScanStats stats = runParsers(ctx, scanRoot, ingestor);
             ingestor.flush();
 
-            long elapsedMs = System.currentTimeMillis() - startMs;
-            System.out.printf("scanned %d file(s) in %dms%n", fileCount.get(), elapsedMs);
+            System.out.printf("scanned %d file(s) in %dms%n", stats.fileCount, stats.elapsedMs);
             System.out.printf("nodes upserted: %d, edges upserted: %d%n", ingestor.totalNodes(), ingestor.totalEdges());
 
             int linked = resolveDeferredHandlers(client, ctx.projectId());
@@ -121,6 +106,97 @@ public class ScanCommand implements Callable<Integer> {
         }
         return 0;
     }
+
+    /**
+     * Embedded scan path: streams events into KuzuDB instead of Neo4j, then runs the Kuzu ports
+     * of the post-scan reconciliation passes. Picks the bulk-load ingestor (CSV + COPY FROM)
+     * when the project's Kuzu DB is empty — ~10-100× faster than per-row MERGE on Windows. Falls
+     * back to the MERGE-based ingestor on re-scans.
+     */
+    private Integer scanEmbedded(ProjectContext ctx, Path scanRoot) throws Exception {
+        Path db = EmbeddedKuzu.defaultDbPath(ctx.projectId());
+        System.out.println("backend: embedded kuzu @ " + db);
+        java.time.Instant scanStartInstant = java.time.Instant.now();
+        try (EmbeddedKuzu kuzu = new EmbeddedKuzu(db)) {
+            new KuzuSchemaBootstrap(kuzu).bootstrap();
+            boolean empty = isKuzuEmpty(kuzu);
+            String mode = empty ? "bulk" : "merge";
+            System.out.println("ingest mode: " + mode + (empty ? " (empty DB → COPY FROM)" : " (incremental → MERGE)"));
+
+            try (GraphIngestor ingestor = empty
+                    ? new KuzuBulkLoader(kuzu, scanStartInstant)
+                    : new KuzuIngestor(kuzu, scanStartInstant)) {
+                Optional<String> head = GitHelper.head(scanRoot);
+                emitProjectNode(ctx, head.orElse(null), ingestor);
+
+                ScanStats stats = runParsers(ctx, scanRoot, ingestor);
+                long flushStart = System.currentTimeMillis();
+                ingestor.flush();
+                long flushMs = System.currentTimeMillis() - flushStart;
+
+                System.out.printf("scanned %d file(s) in %dms (parser=%dms, kuzu-flush=%dms)%n",
+                        stats.fileCount, stats.elapsedMs + flushMs, stats.elapsedMs, flushMs);
+                System.out.printf("nodes upserted: %d, edges upserted: %d%n",
+                        ingestor.totalNodes(), ingestor.totalEdges());
+            }
+
+            int linked = KuzuPostScan.resolveDeferredHandlers(kuzu, ctx.projectId());
+            if (linked > 0) System.out.printf("linked %d deferred handler(s)%n", linked);
+
+            int rewired = KuzuPostScan.resolveUnresolvedCalls(kuzu, ctx.projectId());
+            if (rewired > 0) System.out.printf("resolved %d cross-file call(s)%n", rewired);
+
+            // Bulk loader doesn't stamp lastIngestedAt the same way; only run cleanup on the merge path.
+            if (!noClean && !empty) {
+                String iso = scanStartInstant.atOffset(java.time.ZoneOffset.UTC)
+                        .format(java.time.format.DateTimeFormatter.ISO_LOCAL_DATE_TIME);
+                int removed = KuzuPostScan.cleanupStale(kuzu, ctx.projectId(), iso);
+                if (removed > 0) System.out.printf("removed %d stale node(s) from prior scans%n", removed);
+            }
+        }
+        return 0;
+    }
+
+    private static boolean isKuzuEmpty(EmbeddedKuzu kuzu) {
+        List<Map<String, Object>> rows = kuzu.read("MATCH (n:Node) RETURN count(n) AS c");
+        if (rows.isEmpty()) return true;
+        Object c = rows.get(0).get("c");
+        return !(c instanceof Number) || ((Number) c).longValue() == 0;
+    }
+
+    private ScanStats runParsers(ProjectContext ctx, Path scanRoot, Consumer<GraphEvent> sink) throws Exception {
+        for (Parser p : parsers) p.prepare(ctx);
+
+        // Pre-compute extension → parser map so dispatch is O(1) per file instead of O(N parsers).
+        // Parsers with custom accepts() (Dockerfile, TypeScript skip list) fall back to the linear scan.
+        Map<String, Parser> byExt = new HashMap<>();
+        List<Parser> customAccepts = new ArrayList<>();
+        for (Parser p : parsers) {
+            if (hasCustomAccepts(p)) {
+                customAccepts.add(p);
+            } else {
+                for (String ext : p.supportedExtensions()) byExt.putIfAbsent(ext.toLowerCase(), p);
+            }
+        }
+
+        AtomicInteger fileCount = new AtomicInteger();
+        long startMs = System.currentTimeMillis();
+        try (Stream<Path> walk = Files.walk(scanRoot)) {
+            walk.filter(Files::isRegularFile)
+                    .filter(ScanCommand::notInIgnored)
+                    .forEach(file -> {
+                        Parser p = dispatch(file, byExt, customAccepts);
+                        if (p != null) {
+                            p.parse(file, ctx, sink);
+                            fileCount.incrementAndGet();
+                        }
+                    });
+        }
+        for (Parser p : parsers) p.finish();
+        return new ScanStats(fileCount.get(), System.currentTimeMillis() - startMs);
+    }
+
+    private record ScanStats(int fileCount, long elapsedMs) {}
 
     /**
      * Resolve cross-file handler references that the per-file parsers couldn't link directly.
@@ -249,14 +325,14 @@ public class ScanCommand implements Callable<Integer> {
         return byExt.get(name.substring(dot + 1).toLowerCase());
     }
 
-    static void emitProjectNode(ProjectContext ctx, String head, Ingestor ingestor) {
+    static void emitProjectNode(ProjectContext ctx, String head, Consumer<GraphEvent> sink) {
         NodeKey projectKey = new NodeKey(ctx.projectId(), "Project", ctx.projectId());
         Map<String, Object> props = new HashMap<>();
         props.put("name", ctx.projectName());
         props.put("fqName", ctx.projectId());
         props.put("rootPath", ctx.rootPath().toString());
         if (head != null) props.put("lastScanCommit", head);
-        ingestor.accept(new GraphEvent.NodeUpsert(projectKey, props));
+        sink.accept(new GraphEvent.NodeUpsert(projectKey, props));
     }
 
     private static boolean notInIgnored(Path p) {

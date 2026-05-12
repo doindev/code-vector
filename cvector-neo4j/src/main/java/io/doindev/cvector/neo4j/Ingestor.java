@@ -2,15 +2,15 @@ package io.doindev.cvector.neo4j;
 
 import io.doindev.cvector.core.GraphEvent;
 import io.doindev.cvector.core.NodeKey;
+import io.doindev.cvector.core.store.GraphIngestor;
 
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.function.Consumer;
 
-public class Ingestor implements Consumer<GraphEvent>, AutoCloseable {
+public class Ingestor implements GraphIngestor {
 
     private static final int BATCH_SIZE = 500;
 

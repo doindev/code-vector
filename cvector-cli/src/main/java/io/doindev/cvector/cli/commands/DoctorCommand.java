@@ -3,8 +3,7 @@ package io.doindev.cvector.cli.commands;
 import io.doindev.cvector.cli.CvectorRuntime;
 import io.doindev.cvector.core.config.CvectorConfig;
 import io.doindev.cvector.core.config.CvectorConfigService;
-import io.doindev.cvector.neo4j.Neo4jClient;
-import io.doindev.cvector.neo4j.SchemaBootstrap;
+import io.doindev.cvector.core.store.GraphStore;
 import org.springframework.stereotype.Component;
 import picocli.CommandLine.Command;
 
@@ -52,26 +51,25 @@ public class DoctorCommand implements Callable<Integer> {
             pass("active project: " + cfg.activeProject());
         }
 
-        try (Neo4jClient client = runtime.openNeo4j(cfg)) {
-            if (!client.ping()) {
-                fail("neo4j unreachable at " + client.uri());
+        try (GraphStore store = runtime.openGraphStore(cfg)) {
+            if (!store.ping()) {
+                fail("graph backend unreachable at " + store.displayUri());
                 ok = false;
             } else {
-                pass("neo4j reachable at " + client.uri());
-                SchemaBootstrap bootstrap = new SchemaBootstrap(client);
-                if (!bootstrap.hasConstraints()) {
+                pass("graph backend reachable at " + store.displayUri());
+                if (!store.schemaReady()) {
                     System.out.println("[..] bootstrapping schema");
-                    bootstrap.bootstrap();
+                    store.bootstrapSchema();
                 }
-                if (bootstrap.hasConstraints()) {
-                    pass("schema constraints present");
+                if (store.schemaReady()) {
+                    pass("schema present");
                 } else {
-                    fail("schema constraints missing");
+                    fail("schema bootstrap failed");
                     ok = false;
                 }
             }
         } catch (Exception e) {
-            fail("neo4j error: " + e.getMessage());
+            fail("graph backend error: " + e.getMessage());
             ok = false;
         }
 
