@@ -159,6 +159,7 @@ public final class KuzuBulkLoader implements GraphIngestor {
     private void writeNodeRow(BufferedWriter w, BufferedNode buf) throws IOException {
         Map<String, Object> raw = buf.props;
         NodeKey key = buf.key;
+        String contentHash = KuzuNodeHash.compute(key, raw);
         for (int i = 0; i < nodeColumnOrder.size(); i++) {
             if (i > 0) w.write(',');
             String col = nodeColumnOrder.get(i);
@@ -168,6 +169,7 @@ public final class KuzuBulkLoader implements GraphIngestor {
                 case "label" -> key.label();
                 case "fqName" -> key.fqName();
                 case "lastIngestedAt" -> scanStartIso;
+                case "contentHash" -> contentHash;
                 default -> formatNodeField(col, raw.get(col));
             };
             if (cell != null) w.write(escapeCsv(cell));

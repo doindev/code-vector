@@ -6,6 +6,9 @@ import io.doindev.cvector.cli.util.GitHelper;
 import io.doindev.cvector.core.Parser;
 import io.doindev.cvector.core.ProjectContext;
 import io.doindev.cvector.core.config.CvectorConfig;
+import io.doindev.cvector.embedded.EmbeddedKuzu;
+import io.doindev.cvector.embedded.KuzuBulkLoader;
+import io.doindev.cvector.embedded.KuzuSchemaBootstrap;
 import io.doindev.cvector.neo4j.Ingestor;
 import io.doindev.cvector.neo4j.Neo4jClient;
 import io.doindev.cvector.neo4j.SchemaBootstrap;
@@ -19,10 +22,13 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.Callable;
 import java.util.stream.Stream;
@@ -41,7 +47,7 @@ public class DiffCommand implements Callable<Integer> {
     @Option(names = "--repo", description = "Path to the git repo (default: active project rootPath).")
     private Path repoPath;
 
-    @Option(names = "--keep", description = "Keep snapshot data in Neo4j after the diff (default: cleanup).")
+    @Option(names = "--keep", description = "Keep snapshot data after the diff (Neo4j: as pidA/pidB project nodes; Kuzu: as temp directories). Default: cleanup.")
     private boolean keep;
 
     @Option(names = "--include-calls", description = "Also diff CALLS edges (heavier query).")
@@ -57,13 +63,6 @@ public class DiffCommand implements Callable<Integer> {
 
     @Override
     public Integer call() throws Exception {
-        if (CvectorRuntime.isEmbeddedRequested()) {
-            System.err.println("cvector diff: not supported on the embedded backend yet. The diff");
-            System.err.println("  creates two ephemeral snapshots and runs cross-snapshot NOT EXISTS");
-            System.err.println("  queries — both of which are tied to Neo4j's multi-project model.");
-            System.err.println("  Drop --embedded to run against Neo4j.");
-            return 2;
-        }
         CvectorConfig cfg = runtime.loadConfig();
         CvectorConfig.ProjectEntry active = runtime.requireActiveProject(cfg);
         Path repo = repoPath != null
@@ -86,6 +85,13 @@ public class DiffCommand implements Callable<Integer> {
             return 0;
         }
 
+        return CvectorRuntime.isEmbeddedRequested()
+                ? runEmbedded(cfg, active, repo, fullA, fullB)
+                : runNeo4j(cfg, active, repo, fullA, fullB);
+    }
+
+    private Integer runNeo4j(CvectorConfig cfg, CvectorConfig.ProjectEntry active,
+                             Path repo, String fullA, String fullB) throws Exception {
         String pidA = active.projectId() + "__sha_" + fullA.substring(0, 12);
         String pidB = active.projectId() + "__sha_" + fullB.substring(0, 12);
 
@@ -95,7 +101,7 @@ public class DiffCommand implements Callable<Integer> {
         try (Neo4jClient client = runtime.openNeo4j(cfg)) {
             new SchemaBootstrap(client).bootstrap();
 
-            System.out.println("=== diff " + shortSha(fullA) + " ↔ " + shortSha(fullB) + " ===");
+            System.out.println("=== diff " + shortSha(fullA) + " ↔ " + shortSha(fullB) + " (backend: neo4j) ===");
             System.out.println("repo:    " + repo);
             System.out.println("base:    " + fullA);
             System.out.println("target:  " + fullB);
@@ -118,6 +124,63 @@ public class DiffCommand implements Callable<Integer> {
             GitHelper.worktreeRemove(repo, worktreeB);
             tryDeleteDir(worktreeA);
             tryDeleteDir(worktreeB);
+        }
+        return 0;
+    }
+
+    /**
+     * Embedded diff: two temp Kuzu DBs, one per SHA, each bulk-loaded via {@link KuzuBulkLoader}.
+     * The cross-snapshot diff that runs as Neo4j Cypher with {@code NOT EXISTS} doesn't translate
+     * cleanly to Kuzu's one-DB-per-project model, so we compute added/removed/changed sets in
+     * Java from the rows each DB returns.
+     */
+    private Integer runEmbedded(CvectorConfig cfg, CvectorConfig.ProjectEntry active,
+                                Path repo, String fullA, String fullB) throws Exception {
+        Path tmpRoot = Files.createTempDirectory("cvector-diff-");
+        Path dbA = tmpRoot.resolve("a.kuzu");
+        Path dbB = tmpRoot.resolve("b.kuzu");
+        Path worktreeA = createWorktreePath(fullA);
+        Path worktreeB = createWorktreePath(fullB);
+        String pidA = active.projectId() + "__sha_" + fullA.substring(0, 12);
+        String pidB = active.projectId() + "__sha_" + fullB.substring(0, 12);
+
+        try {
+            System.out.println("=== diff " + shortSha(fullA) + " ↔ " + shortSha(fullB) + " (backend: kuzu) ===");
+            System.out.println("repo:    " + repo);
+            System.out.println("base:    " + fullA);
+            System.out.println("target:  " + fullB);
+
+            // Phase 1: scan snapshot A. Open-close so the COPY-FROM bulk path is exercised against
+            // a freshly-bootstrapped empty DB.
+            try (EmbeddedKuzu kuzu = new EmbeddedKuzu(dbA)) {
+                new KuzuSchemaBootstrap(kuzu).bootstrap();
+                checkoutAndScanKuzu(repo, fullA, worktreeA, pidA,
+                        active.name() + "@" + shortSha(fullA), kuzu);
+            }
+            // Phase 2: scan snapshot B into its own DB.
+            try (EmbeddedKuzu kuzu = new EmbeddedKuzu(dbB)) {
+                new KuzuSchemaBootstrap(kuzu).bootstrap();
+                checkoutAndScanKuzu(repo, fullB, worktreeB, pidB,
+                        active.name() + "@" + shortSha(fullB), kuzu);
+            }
+            // Phase 3: reopen both side-by-side and diff in Java.
+            try (EmbeddedKuzu kuzuA = new EmbeddedKuzu(dbA);
+                 EmbeddedKuzu kuzuB = new EmbeddedKuzu(dbB)) {
+                renderDiffKuzu(kuzuA, kuzuB);
+            }
+
+            if (keep) {
+                System.out.println();
+                System.out.println("snapshots retained at:");
+                System.out.println("  " + dbA);
+                System.out.println("  " + dbB);
+            }
+        } finally {
+            GitHelper.worktreeRemove(repo, worktreeA);
+            GitHelper.worktreeRemove(repo, worktreeB);
+            tryDeleteDir(worktreeA);
+            tryDeleteDir(worktreeB);
+            if (!keep) tryDeleteDir(tmpRoot);
         }
         return 0;
     }
@@ -263,6 +326,177 @@ public class DiffCommand implements Callable<Integer> {
     private static void cleanupSnapshots(Neo4jClient client, String pidA, String pidB) {
         client.write("MATCH (n) WHERE n.projectId IN [$a, $b] DETACH DELETE n",
                 Map.of("a", pidA, "b", pidB));
+    }
+
+    // ===== Embedded (Kuzu) diff helpers =====
+
+    private void checkoutAndScanKuzu(Path repo, String sha, Path worktree, String pid,
+                                      String displayName, EmbeddedKuzu kuzu) throws IOException {
+        System.out.println();
+        System.out.println("scan @ " + shortSha(sha) + " → " + pid);
+        if (Files.exists(worktree)) {
+            GitHelper.worktreeRemove(repo, worktree);
+            tryDeleteDir(worktree);
+        }
+        if (!GitHelper.worktreeAdd(repo, worktree, sha)) {
+            throw new IllegalStateException("`git worktree add` failed for " + sha + " at " + worktree);
+        }
+        ProjectContext ctx = new ProjectContext(pid, displayName, worktree);
+        for (Parser p : parsers) p.prepare(ctx);
+        int[] files = {0};
+        try (KuzuBulkLoader ingestor = new KuzuBulkLoader(kuzu)) {
+            try (Stream<Path> walk = Files.walk(worktree)) {
+                walk.filter(Files::isRegularFile).filter(DiffCommand::notIgnored).forEach(file -> {
+                    for (Parser p : parsers) {
+                        if (!p.accepts(file)) continue;
+                        try { p.parse(file, ctx, ingestor); files[0]++; }
+                        catch (RuntimeException ignored) { /* per-file parse failure */ }
+                        break;
+                    }
+                });
+            }
+            for (Parser p : parsers) p.finish();
+            ingestor.flush();
+            System.out.printf("  scanned %d file(s); nodes=%d edges=%d%n",
+                    files[0], ingestor.totalNodes(), ingestor.totalEdges());
+        }
+    }
+
+    private void renderDiffKuzu(EmbeddedKuzu a, EmbeddedKuzu b) {
+        section("Files");
+        diffByLabelKuzu(a, b, "File", "path");
+        section("Classes");
+        diffByLabelKuzu(a, b, "Class", "fqName");
+        section("Methods");
+        diffByLabelKuzu(a, b, "Method", "fqName");
+        section("API endpoints");
+        diffByLabelKuzu(a, b, "ApiEndpoint", "fqName");
+        section("Maven dependencies");
+        diffDependenciesKuzu(a, b);
+        section("Tables");
+        diffByLabelKuzu(a, b, "Table", "name");
+
+        if (includeCalls) {
+            section("CALLS edges");
+            diffCallsKuzu(a, b);
+        }
+    }
+
+    private static void diffByLabelKuzu(EmbeddedKuzu a, EmbeddedKuzu b, String label, String keyProp) {
+        TreeSet<String> keysA = readKeysKuzu(a, label, keyProp);
+        TreeSet<String> keysB = readKeysKuzu(b, label, keyProp);
+        TreeSet<String> added = new TreeSet<>(keysB);
+        added.removeAll(keysA);
+        TreeSet<String> removed = new TreeSet<>(keysA);
+        removed.removeAll(keysB);
+        System.out.println("  added: " + added.size() + "  removed: " + removed.size());
+        if (!added.isEmpty()) {
+            System.out.println("  + added:");
+            renderTruncated(added, '+', 25);
+        }
+        if (!removed.isEmpty()) {
+            System.out.println("  - removed:");
+            renderTruncated(removed, '-', 25);
+        }
+    }
+
+    private static TreeSet<String> readKeysKuzu(EmbeddedKuzu kuzu, String label, String keyProp) {
+        // Each snapshot DB holds exactly one projectId so we can skip the projectId filter.
+        List<Map<String, Object>> rows = kuzu.read(
+                "MATCH (n:Node) WHERE n.label = $label RETURN n." + keyProp + " AS k",
+                Map.of("label", label));
+        TreeSet<String> out = new TreeSet<>();
+        for (Map<String, Object> r : rows) {
+            Object v = r.get("k");
+            if (v != null) out.add(v.toString());
+        }
+        return out;
+    }
+
+    private static void renderTruncated(TreeSet<String> values, char marker, int limit) {
+        int shown = 0;
+        for (String v : values) {
+            if (shown++ >= limit) {
+                System.out.println("    ... (" + (values.size() - shown + 1) + " more)");
+                break;
+            }
+            System.out.println("    " + marker + " " + v);
+        }
+    }
+
+    private static void diffDependenciesKuzu(EmbeddedKuzu a, EmbeddedKuzu b) {
+        Map<String, String> aMap = readDependenciesKuzu(a);
+        Map<String, String> bMap = readDependenciesKuzu(b);
+        List<String> added = new ArrayList<>();
+        List<String> removed = new ArrayList<>();
+        List<String> changed = new ArrayList<>();
+        for (Map.Entry<String, String> entry : bMap.entrySet()) {
+            String coord = entry.getKey();
+            String bVersion = entry.getValue();
+            if (!aMap.containsKey(coord)) {
+                added.add(coord + ":" + bVersion);
+            } else if (!String.valueOf(aMap.get(coord)).equals(bVersion)) {
+                changed.add(coord + " (" + aMap.get(coord) + " → " + bVersion + ")");
+            }
+        }
+        for (Map.Entry<String, String> entry : aMap.entrySet()) {
+            if (!bMap.containsKey(entry.getKey())) removed.add(entry.getKey() + ":" + entry.getValue());
+        }
+        added.sort(Comparator.naturalOrder());
+        removed.sort(Comparator.naturalOrder());
+        changed.sort(Comparator.naturalOrder());
+        System.out.printf("  added: %d  removed: %d  version-changed: %d%n",
+                added.size(), removed.size(), changed.size());
+        for (String s : added) System.out.println("    + " + s);
+        for (String s : removed) System.out.println("    - " + s);
+        for (String s : changed) System.out.println("    ~ " + s);
+    }
+
+    private static Map<String, String> readDependenciesKuzu(EmbeddedKuzu kuzu) {
+        List<Map<String, Object>> rows = kuzu.read(
+                "MATCH (d:Node) WHERE d.label = 'MavenDependency' "
+                        + "RETURN d.groupId AS groupId, d.artifactId AS artifactId, d.version AS version");
+        Map<String, String> out = new LinkedHashMap<>();
+        for (Map<String, Object> r : rows) {
+            Object g = r.get("groupId");
+            Object aid = r.get("artifactId");
+            if (g == null || aid == null) continue;
+            out.put(g + ":" + aid, String.valueOf(r.get("version")));
+        }
+        return out;
+    }
+
+    private static void diffCallsKuzu(EmbeddedKuzu a, EmbeddedKuzu b) {
+        TreeSet<String> pairsA = readCallPairsKuzu(a);
+        TreeSet<String> pairsB = readCallPairsKuzu(b);
+        TreeSet<String> added = new TreeSet<>(pairsB);
+        added.removeAll(pairsA);
+        TreeSet<String> removed = new TreeSet<>(pairsA);
+        removed.removeAll(pairsB);
+        System.out.println("  added edges:   " + added.size());
+        System.out.println("  removed edges: " + removed.size());
+        int shown = 0;
+        for (String p : added) {
+            if (shown++ >= 50) { System.out.println("    ... (" + (added.size() - shown + 1) + " more added)"); break; }
+            System.out.println("    + " + p);
+        }
+        shown = 0;
+        for (String p : removed) {
+            if (shown++ >= 50) { System.out.println("    ... (" + (removed.size() - shown + 1) + " more removed)"); break; }
+            System.out.println("    - " + p);
+        }
+    }
+
+    private static TreeSet<String> readCallPairsKuzu(EmbeddedKuzu kuzu) {
+        List<Map<String, Object>> rows = kuzu.read(
+                "MATCH (caller:Node)-[:CALLS]->(callee:Node) "
+                        + "WHERE caller.label = 'Method' AND callee.label = 'Method' "
+                        + "RETURN caller.fqName AS src, callee.fqName AS dst");
+        TreeSet<String> out = new TreeSet<>();
+        for (Map<String, Object> r : rows) {
+            out.add(r.get("src") + " -> " + r.get("dst"));
+        }
+        return out;
     }
 
     private static Path createWorktreePath(String sha) {

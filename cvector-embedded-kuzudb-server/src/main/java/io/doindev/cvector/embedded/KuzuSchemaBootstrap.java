@@ -105,6 +105,7 @@ public final class KuzuSchemaBootstrap {
         m.put("rootPath", "STRING");
         m.put("lastScanCommit", "STRING");
         m.put("lastIngestedAt", "TIMESTAMP");
+        m.put("contentHash", "STRING");
         return m;
     }
 

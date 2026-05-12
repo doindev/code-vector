@@ -24,7 +24,14 @@ public class JavaParserAdapter implements Parser {
 
     private static final Logger log = LoggerFactory.getLogger(JavaParserAdapter.class);
 
-    private JavaParser parser;
+    private volatile ParserConfiguration parserConfig;
+    /**
+     * One {@link JavaParser} per thread. The library isn't thread-safe for concurrent {@code parse}
+     * calls on a single instance (it holds error/comment-collection state internally), so when the
+     * scan walks files in parallel each worker gets its own. Configured once in {@link #prepare}
+     * and lazily initialised the first time each thread parses.
+     */
+    private final ThreadLocal<JavaParser> parser = ThreadLocal.withInitial(() -> new JavaParser(parserConfig));
 
     @Override
     public String name() { return "java"; }
@@ -37,15 +44,14 @@ public class JavaParserAdapter implements Parser {
         // Symbol resolution is no longer performed during parse — see CvectorJavaVisitor for the
         // post-pass placeholder/rewire strategy. This skips both setup cost (walking for source roots)
         // and the per-call resolve() reflection that previously dominated scan time.
-        ParserConfiguration cfg = new ParserConfiguration()
+        this.parserConfig = new ParserConfiguration()
                 .setLanguageLevel(ParserConfiguration.LanguageLevel.JAVA_17);
-        this.parser = new JavaParser(cfg);
     }
 
     @Override
     public void parse(Path file, ProjectContext ctx, Consumer<GraphEvent> sink) {
         try {
-            ParseResult<CompilationUnit> result = parser.parse(file);
+            ParseResult<CompilationUnit> result = parser.get().parse(file);
             if (!result.isSuccessful() || result.getResult().isEmpty()) {
                 log.debug("parse failed for {}: {}", file, result.getProblems());
                 return;

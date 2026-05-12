@@ -19,6 +19,7 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
 
 public class PomParserAdapter implements Parser {
@@ -28,7 +29,8 @@ public class PomParserAdapter implements Parser {
     private static final int MAX_PROPERTY_INTERPOLATION = 10;
     private static final int MAX_BOM_DEPTH = 6;
 
-    private final Map<String, Map<String, String>> bomCache = new HashMap<>();
+    /** BOM (bill-of-materials) lookup cache shared across all pom.xml parses in a scan. Concurrent because the parser walk runs in parallel. */
+    private final Map<String, Map<String, String>> bomCache = new ConcurrentHashMap<>();
 
     @Override
     public String name() { return "maven-pom"; }

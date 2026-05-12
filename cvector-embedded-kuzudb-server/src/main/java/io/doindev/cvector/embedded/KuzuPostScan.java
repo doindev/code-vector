@@ -3,6 +3,7 @@ package io.doindev.cvector.embedded;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -96,31 +97,94 @@ public final class KuzuPostScan {
             rewireMap.add(new String[]{p.id, cands.get(0)});
         }
 
-        // Rewire each matched placeholder. The per-placeholder caller fetch + edge writes are
-        // still serial Cypher round-trips, but inside one transaction so commit overhead is
-        // amortised.
-        int rewired = rewireAll(kuzu, rewireMap);
+        // Rewire all matched placeholders in batched fashion: ONE bulk caller-fetch across every
+        // selected placeholder, the per-row MERGE writes inside a single transaction, then ONE
+        // bulk delete of every old caller→placeholder edge. Replaces an earlier N-queries-per-
+        // -placeholder loop (3 round-trips × ~127 placeholders ≈ 400 saved JNI executes).
+        int rewired = rewireAllBatched(kuzu, rewireMap);
         dropOrphanPlaceholders(kuzu, projectId);
         return rewired;
     }
 
     private record Placeholder(String id, String name, long arity) {}
 
-    /** Rewire all placeholders inside a single Kuzu transaction. */
-    private static int rewireAll(EmbeddedKuzu kuzu, List<String[]> rewireMap) {
+    private static int rewireAllBatched(EmbeddedKuzu kuzu, List<String[]> rewireMap) {
         if (rewireMap.isEmpty()) return 0;
-        int rewired = 0;
+
+        // placeholderId → candidateId lookup so we can group fetched callers by which placeholder
+        // they came in via and resolve to the right rewire target.
+        Map<String, String> placeholderToCandidate = new HashMap<>(rewireMap.size() * 2);
+        StringBuilder idList = new StringBuilder();
+        for (int i = 0; i < rewireMap.size(); i++) {
+            String[] pair = rewireMap.get(i);
+            placeholderToCandidate.put(pair[0], pair[1]);
+            if (i > 0) idList.append(", ");
+            idList.append('\'').append(pair[0].replace("'", "\\'")).append('\'');
+        }
+
+        // One bulk query: every CALLS edge that points at any selected placeholder, with its
+        // column-by-column properties (Kuzu has no properties() map projection).
+        List<Map<String, Object>> callers = kuzu.read(
+                "MATCH (caller)-[r:CALLS]->(p:Node) "
+                        + "WHERE p.id IN [" + idList + "] "
+                        + "RETURN caller.id AS callerId, p.id AS placeholderId, "
+                        + "       r.confidence AS confidence, "
+                        + "       r.callSiteLine AS callSiteLine, "
+                        + "       r.kind AS kind, "
+                        + "       r.via AS via, "
+                        + "       r.viaMethodReference AS viaMethodReference, "
+                        + "       r.ambiguous AS ambiguous");
+        if (callers.isEmpty()) return 0;
+
+        // Track which placeholders actually had >=1 incoming CALLS (the "rewired" count for the
+        // user-facing report).
+        java.util.Set<String> placeholdersWithCallers = new java.util.HashSet<>();
+        for (Map<String, Object> c : callers) placeholdersWithCallers.add((String) c.get("placeholderId"));
+
         kuzu.write("BEGIN TRANSACTION", Map.of());
         try {
-            for (String[] pair : rewireMap) {
-                if (rewireCallers(kuzu, pair[0], pair[1])) rewired++;
+            // Write new caller→candidate edges. Still per-row MERGE (Kuzu can't UNWIND map params)
+            // but inside one transaction so commit overhead is amortised.
+            for (Map<String, Object> c : callers) {
+                String callerId = (String) c.get("callerId");
+                String candidateId = placeholderToCandidate.get(c.get("placeholderId"));
+                if (candidateId == null) continue;
+                double newConfidence = numericConfidence(c.get("confidence")) + 0.2;
+
+                Map<String, Object> params = new LinkedHashMap<>();
+                params.put("callerId", callerId);
+                params.put("candidateId", candidateId);
+                params.put("confidence", newConfidence);
+                params.put("callSiteLine", c.get("callSiteLine"));
+                params.put("kind", c.get("kind"));
+                params.put("via", c.get("via"));
+                params.put("viaMethodReference", c.get("viaMethodReference"));
+                params.put("ambiguous", c.get("ambiguous"));
+                kuzu.write(
+                        "MATCH (caller:Node {id: $callerId}), (resolved:Node {id: $candidateId}) "
+                                + "MERGE (caller)-[r:CALLS]->(resolved) "
+                                + "SET r.confidence = $confidence, "
+                                + "    r.callSiteLine = $callSiteLine, "
+                                + "    r.kind = $kind, "
+                                + "    r.via = $via, "
+                                + "    r.viaMethodReference = $viaMethodReference, "
+                                + "    r.ambiguous = $ambiguous",
+                        params);
             }
+
+            // ONE bulk delete for every old caller→placeholder edge across every placeholder.
+            kuzu.write(
+                    "MATCH (caller)-[r:CALLS]->(p:Node) "
+                            + "WHERE p.id IN [" + idList + "] "
+                            + "DELETE r",
+                    Map.of());
+
             kuzu.write("COMMIT", Map.of());
         } catch (RuntimeException e) {
             try { kuzu.write("ROLLBACK", Map.of()); } catch (RuntimeException ignored) { /* roll-forward */ }
             throw e;
         }
-        return rewired;
+        return placeholdersWithCallers.size();
     }
 
     private static long parseArity(String fqName) {
@@ -129,55 +193,6 @@ public final class KuzuPostScan {
         if (colon < 0 || colon == fqName.length() - 1) return -1;
         try { return Long.parseLong(fqName.substring(colon + 1)); }
         catch (NumberFormatException e) { return -1; }
-    }
-
-    private static boolean rewireCallers(EmbeddedKuzu kuzu, String placeholderId, String candidateId) {
-        // Read every incoming CALLS edge with its column-by-column properties (Kuzu doesn't expose
-        // a properties() map projection like Neo4j does).
-        List<Map<String, Object>> callers = kuzu.read(
-                "MATCH (caller)-[r:CALLS]->(p:Node {id: $pid}) "
-                        + "RETURN caller.id AS callerId, "
-                        + "       r.confidence AS confidence, "
-                        + "       r.callSiteLine AS callSiteLine, "
-                        + "       r.kind AS kind, "
-                        + "       r.via AS via, "
-                        + "       r.viaMethodReference AS viaMethodReference, "
-                        + "       r.ambiguous AS ambiguous",
-                Map.of("pid", placeholderId));
-        if (callers.isEmpty()) return false;
-
-        for (Map<String, Object> c : callers) {
-            String callerId = (String) c.get("callerId");
-            double newConfidence = numericConfidence(c.get("confidence")) + 0.2;
-
-            Map<String, Object> params = new LinkedHashMap<>();
-            params.put("callerId", callerId);
-            params.put("candidateId", candidateId);
-            params.put("confidence", newConfidence);
-            params.put("callSiteLine", c.get("callSiteLine"));
-            params.put("kind", c.get("kind"));
-            params.put("via", c.get("via"));
-            params.put("viaMethodReference", c.get("viaMethodReference"));
-            params.put("ambiguous", c.get("ambiguous"));
-            // Merge a CALLS edge to the resolved candidate, carrying forward the original
-            // properties (bumped confidence as the only delta).
-            kuzu.write(
-                    "MATCH (caller:Node {id: $callerId}), (resolved:Node {id: $candidateId}) "
-                            + "MERGE (caller)-[r:CALLS]->(resolved) "
-                            + "SET r.confidence = $confidence, "
-                            + "    r.callSiteLine = $callSiteLine, "
-                            + "    r.kind = $kind, "
-                            + "    r.via = $via, "
-                            + "    r.viaMethodReference = $viaMethodReference, "
-                            + "    r.ambiguous = $ambiguous",
-                    params);
-        }
-
-        // Drop the old edges. Kuzu supports DELETE on relationships matched against a pattern.
-        kuzu.write(
-                "MATCH (caller)-[r:CALLS]->(p:Node {id: $pid}) DELETE r",
-                Map.of("pid", placeholderId));
-        return true;
     }
 
     private static double numericConfidence(Object v) {
@@ -189,8 +204,9 @@ public final class KuzuPostScan {
 
     private static void dropOrphanPlaceholders(EmbeddedKuzu kuzu, String projectId) {
         // Materialise orphan ids first (DETACH DELETE inside an OPTIONAL MATCH chain would mutate
-        // the rows we're iterating). Then delete in a single transaction so commit overhead is
-        // amortised across all orphans — used to be ~hundreds of separate auto-commits.
+        // the rows we're iterating), then issue ONE bulk delete with an inlined id list. Used to
+        // be a per-row delete loop — fine for tiny orphan sets but a ~5 ms × N JNI cost on bigger
+        // codebases.
         List<Map<String, Object>> orphans = kuzu.read(
                 "MATCH (p:Node) "
                         + "WHERE p.projectId = $pid AND p.label = 'Method' "
@@ -201,16 +217,14 @@ public final class KuzuPostScan {
                         + "RETURN p.id AS id",
                 Map.of("pid", projectId));
         if (orphans.isEmpty()) return;
-        kuzu.write("BEGIN TRANSACTION", Map.of());
-        try {
-            for (Map<String, Object> row : orphans) {
-                kuzu.write("MATCH (n:Node {id: $id}) DETACH DELETE n", Map.of("id", row.get("id")));
-            }
-            kuzu.write("COMMIT", Map.of());
-        } catch (RuntimeException e) {
-            try { kuzu.write("ROLLBACK", Map.of()); } catch (RuntimeException ignored) { /* roll-forward */ }
-            throw e;
+        StringBuilder ids = new StringBuilder();
+        for (int i = 0; i < orphans.size(); i++) {
+            if (i > 0) ids.append(", ");
+            String id = (String) orphans.get(i).get("id");
+            if (id == null) continue;
+            ids.append('\'').append(id.replace("'", "\\'")).append('\'');
         }
+        kuzu.write("MATCH (n:Node) WHERE n.id IN [" + ids + "] DETACH DELETE n", Map.of());
     }
 
     /**
@@ -256,33 +270,48 @@ public final class KuzuPostScan {
     }
 
     /**
-     * Delete scan-managed nodes whose {@code lastIngestedAt} is older than the cutoff (i.e. they
-     * weren't touched during the current scan). Returns the number of nodes removed.
+     * Delete scan-managed nodes whose id isn't in {@code touchedIds}. {@code touchedIds} is the
+     * snapshot of every node id the ingestor saw during the scan (written or skipped), as
+     * returned by {@code KuzuIngestor.touchedNodeIds()}. Replaces the prior lastIngestedAt-based
+     * stale detection, which required bulk-bumping a timestamp on every skipped row at flush —
+     * a 3-4 s cost on Windows. The trade-off: {@code lastIngestedAt} now reflects "when this row
+     * was last actually written" rather than "when this scan last touched the project", which is
+     * the more useful semantic for {@code cv_changes} anyway.
      */
-    public static int cleanupStale(EmbeddedKuzu kuzu, String projectId, String cutoffIso) {
-        List<String> labels = STALE_CANDIDATE_LABELS;
+    public static int cleanupStale(EmbeddedKuzu kuzu, String projectId, java.util.Set<String> touchedIds) {
         StringBuilder labelList = new StringBuilder();
-        for (int i = 0; i < labels.size(); i++) {
+        for (int i = 0; i < STALE_CANDIDATE_LABELS.size(); i++) {
             if (i > 0) labelList.append(", ");
-            labelList.append('\'').append(labels.get(i)).append('\'');
+            labelList.append('\'').append(STALE_CANDIDATE_LABELS.get(i)).append('\'');
         }
-        String matchClause =
-                "MATCH (n:Node) "
-                        + "WHERE n.projectId = $pid "
-                        + "AND n.label IN [" + labelList + "] "
-                        + "AND n.lastIngestedAt IS NOT NULL "
-                        + "AND n.lastIngestedAt < timestamp($cutoff) ";
 
-        List<Map<String, Object>> rows = kuzu.read(
-                matchClause + "RETURN count(n) AS c",
-                Map.of("pid", projectId, "cutoff", cutoffIso));
-        long count = rows.isEmpty() ? 0L : asLong(rows.get(0).get("c"));
-        if (count == 0) return 0;
+        // Materialise the candidate set first, then set-difference in Java. Kuzu's NOT n.id IN [N items]
+        // with thousands of inlined ids is brittle (Cypher length, parser perf); per-chunk delete
+        // by inverted IN-list is more predictable.
+        List<Map<String, Object>> candidates = kuzu.read(
+                "MATCH (n:Node) WHERE n.projectId = $pid AND n.label IN [" + labelList + "] "
+                        + "RETURN n.id AS id",
+                Map.of("pid", projectId));
+        if (candidates.isEmpty()) return 0;
+        List<String> stale = new java.util.ArrayList<>();
+        for (Map<String, Object> r : candidates) {
+            String id = (String) r.get("id");
+            if (id != null && !touchedIds.contains(id)) stale.add(id);
+        }
+        if (stale.isEmpty()) return 0;
 
-        // DETACH DELETE in a single statement — Kuzu handles fan-out across all REL tables.
-        kuzu.write(matchClause + "DETACH DELETE n",
-                Map.of("pid", projectId, "cutoff", cutoffIso));
-        return (int) count;
+        // Delete in chunks of 2000 so the inlined id list stays manageable.
+        final int chunkSize = 2000;
+        for (int from = 0; from < stale.size(); from += chunkSize) {
+            int to = Math.min(from + chunkSize, stale.size());
+            StringBuilder ids = new StringBuilder((to - from) * 18);
+            for (int i = from; i < to; i++) {
+                if (i > from) ids.append(", ");
+                ids.append('\'').append(stale.get(i).replace("'", "\\'")).append('\'');
+            }
+            kuzu.write("MATCH (n:Node) WHERE n.id IN [" + ids + "] DETACH DELETE n", Map.of());
+        }
+        return stale.size();
     }
 
     private static long asLong(Object v) {

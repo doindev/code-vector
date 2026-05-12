@@ -123,6 +123,7 @@ public class ScanCommand implements Callable<Integer> {
             String mode = empty ? "bulk" : "merge";
             System.out.println("ingest mode: " + mode + (empty ? " (empty DB → COPY FROM)" : " (incremental → MERGE)"));
 
+            java.util.Set<String> touchedNodeIds = null;
             try (GraphIngestor ingestor = empty
                     ? new KuzuBulkLoader(kuzu, scanStartInstant)
                     : new KuzuIngestor(kuzu, scanStartInstant)) {
@@ -138,6 +139,7 @@ public class ScanCommand implements Callable<Integer> {
                         stats.fileCount, stats.elapsedMs + flushMs, stats.elapsedMs, flushMs);
                 System.out.printf("nodes upserted: %d, edges upserted: %d%n",
                         ingestor.totalNodes(), ingestor.totalEdges());
+                if (ingestor instanceof KuzuIngestor ki) touchedNodeIds = ki.touchedNodeIds();
             }
 
             int linked = KuzuPostScan.resolveDeferredHandlers(kuzu, ctx.projectId());
@@ -146,11 +148,12 @@ public class ScanCommand implements Callable<Integer> {
             int rewired = KuzuPostScan.resolveUnresolvedCalls(kuzu, ctx.projectId());
             if (rewired > 0) System.out.printf("resolved %d cross-file call(s)%n", rewired);
 
-            // Bulk loader doesn't stamp lastIngestedAt the same way; only run cleanup on the merge path.
-            if (!noClean && !empty) {
-                String iso = scanStartInstant.atOffset(java.time.ZoneOffset.UTC)
-                        .format(java.time.format.DateTimeFormatter.ISO_LOCAL_DATE_TIME);
-                int removed = KuzuPostScan.cleanupStale(kuzu, ctx.projectId(), iso);
+            // Only run cleanup on the merge path; on the empty-DB bulk path everything is fresh by
+            // definition. cleanupStale now takes the ingestor's set of touched ids (every node it
+            // saw during the scan, written or skipped) rather than a timestamp cutoff — see
+            // KuzuPostScan.cleanupStale's javadoc for why.
+            if (!noClean && !empty && touchedNodeIds != null) {
+                int removed = KuzuPostScan.cleanupStale(kuzu, ctx.projectId(), touchedNodeIds);
                 if (removed > 0) System.out.printf("removed %d stale node(s) from prior scans%n", removed);
             }
         }
@@ -181,8 +184,13 @@ public class ScanCommand implements Callable<Integer> {
 
         AtomicInteger fileCount = new AtomicInteger();
         long startMs = System.currentTimeMillis();
+        // Parallel walk: parsers were audited for thread safety (each `parse()` keeps state local,
+        // class-level mutable caches use ConcurrentHashMap, JavaParser is held in a ThreadLocal).
+        // The sink (`Ingestor` / `KuzuIngestor`) serialises via `synchronized accept`, so concurrent
+        // emits are safe; the speedup comes from parallel AST construction across worker threads.
         try (Stream<Path> walk = Files.walk(scanRoot)) {
-            walk.filter(Files::isRegularFile)
+            walk.parallel()
+                    .filter(Files::isRegularFile)
                     .filter(ScanCommand::notInIgnored)
                     .forEach(file -> {
                         Parser p = dispatch(file, byExt, customAccepts);

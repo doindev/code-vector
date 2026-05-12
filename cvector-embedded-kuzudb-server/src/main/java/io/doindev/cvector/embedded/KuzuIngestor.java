@@ -70,7 +70,7 @@ public class KuzuIngestor implements GraphIngestor {
             "groupId", "artifactId", "version", "versionSource",
             "repository", "tag", "digest", "baseImage",
             "port", "protocol", "command", "rootPath",
-            "lastScanCommit"
+            "lastScanCommit", "contentHash"
     );
     /** Lookup set derived from {@link #NODE_PROPERTY_ORDER}. */
     static final Set<String> NODE_PROPERTY_NAMES = Set.copyOf(NODE_PROPERTY_ORDER);
@@ -109,18 +109,27 @@ public class KuzuIngestor implements GraphIngestor {
     private record EdgeKey(String fromId, String type, String toId) {}
 
     private final EmbeddedKuzu kuzu;
-    /** Scan start, stamped onto every node write as {@code lastIngestedAt} so {@link KuzuPostScan#cleanupStale} can identify nodes that survived from prior scans. */
+    /** Scan start, stamped onto every node write as {@code lastIngestedAt}. Skipped (unchanged) rows keep their old timestamp, which gives {@code cv_changes} semantically-correct "what actually changed" output. */
     private final String scanStartIso;
     /** Buffered nodes keyed by id; values carry the latest key + merged props. */
     private final Map<String, BufferedNode> nodeBuffer = new LinkedHashMap<>();
     /** Buffered edges keyed by (from,type,to); values are merged props. */
     private final Map<EdgeKey, Map<String, Object>> edgeBuffer = new LinkedHashMap<>();
+    /**
+     * Every node id we saw during the scan (written + skipped). Drives {@code cleanupStale}'s
+     * staleness check: any managed-label row whose id is <em>not</em> in this set is stale and
+     * gets removed. Replaces the prior lastIngestedAt-based scheme which required bulk-bumping
+     * timestamps on every skipped row.
+     */
+    private final java.util.Set<String> touchedNodeIds = new java.util.HashSet<>();
     private int totalNodes;
     private int totalEdges;
 
     private static final class BufferedNode {
         NodeKey key;
         final Map<String, Object> props = new HashMap<>();
+        /** Filled at flush time by {@link KuzuNodeHash}. Stored alongside the row so re-scans can skip unchanged data. */
+        String contentHash;
 
         BufferedNode(NodeKey key) { this.key = key; }
     }
@@ -144,6 +153,7 @@ public class KuzuIngestor implements GraphIngestor {
             buf.key = n.key();
             // last-write-wins on individual property keys, but absent props don't clobber
             if (n.props() != null) buf.props.putAll(n.props());
+            touchedNodeIds.add(n.key().id());
         } else if (event instanceof GraphEvent.EdgeUpsert e) {
             EdgeKey k = new EdgeKey(e.from().id(), e.type(), e.to().id());
             Map<String, Object> merged = edgeBuffer.computeIfAbsent(k, x -> new HashMap<>());
@@ -160,28 +170,135 @@ public class KuzuIngestor implements GraphIngestor {
         if (nodeBuffer.isEmpty()) return;
         List<BufferedNode> all = new ArrayList<>(nodeBuffer.values());
         nodeBuffer.clear();
-        for (int from = 0; from < all.size(); from += FLUSH_CHUNK) {
-            int to = Math.min(from + FLUSH_CHUNK, all.size());
-            List<BufferedNode> chunk = all.subList(from, to);
+
+        // Skip-unchanged optimisation: every buffered node carries a deterministic content hash
+        // (excluding lastIngestedAt). Pre-fetch existing (id, contentHash) pairs for every buffered
+        // id; if the existing hash matches the new one, the node hasn't changed and we skip the
+        // MERGE entirely. For a re-scan on stable source this drops ~14k writes to ~0.
+        Map<String, String> existingHashes = fetchExistingHashes(all);
+        List<BufferedNode> toWrite = new ArrayList<>(all.size());
+        List<String> skippedIds = new ArrayList<>(all.size());
+        for (BufferedNode b : all) {
+            b.contentHash = KuzuNodeHash.compute(b.key, b.props);
+            String existing = existingHashes.get(b.key.id());
+            if (existing != null && existing.equals(b.contentHash)) {
+                skippedIds.add(b.key.id());
+                continue;
+            }
+            toWrite.add(b);
+        }
+        totalNodes += all.size();  // surface to the user includes skipped (they're "ingested" logically)
+        log.debug("flushNodes: total={} skipped={} writing={}", all.size(), skippedIds.size(), toWrite.size());
+
+        if (toWrite.isEmpty()) return;
+        for (int from = 0; from < toWrite.size(); from += FLUSH_CHUNK) {
+            int to = Math.min(from + FLUSH_CHUNK, toWrite.size());
+            List<BufferedNode> chunk = toWrite.subList(from, to);
             runInTransaction(() -> {
                 for (BufferedNode b : chunk) writeNode(b);
             });
-            totalNodes += chunk.size();
         }
+    }
+
+    /**
+     * Snapshot of every node id this ingestor saw during the scan (written + skipped). Drives
+     * {@link KuzuPostScan#cleanupStale} — anything in the managed-label set that's <em>not</em>
+     * in this set is stale.
+     */
+    public synchronized java.util.Set<String> touchedNodeIds() {
+        return java.util.Set.copyOf(touchedNodeIds);
+    }
+
+    /**
+     * One bulk lookup of {@code (id, contentHash)} for every buffered node id, inlined as a Cypher
+     * list literal. Inlining avoids the list-of-strings parameter-binding limitation in Kuzu's
+     * Java client; for typical projects the literal is well under 1 MB.
+     */
+    private Map<String, String> fetchExistingHashes(List<BufferedNode> all) {
+        if (all.isEmpty()) return Map.of();
+        StringBuilder ids = new StringBuilder(all.size() * 18);
+        for (int i = 0; i < all.size(); i++) {
+            if (i > 0) ids.append(", ");
+            String id = all.get(i).key.id();
+            ids.append('\'').append(id.replace("'", "\\'")).append('\'');
+        }
+        Map<String, String> out = new HashMap<>(all.size() * 2);
+        try {
+            List<Map<String, Object>> rows = kuzu.read(
+                    "MATCH (n:Node) WHERE n.id IN [" + ids + "] "
+                            + "RETURN n.id AS id, n.contentHash AS hash");
+            for (Map<String, Object> r : rows) {
+                Object id = r.get("id");
+                Object hash = r.get("hash");
+                if (id != null && hash != null) out.put(id.toString(), hash.toString());
+            }
+        } catch (RuntimeException e) {
+            // Treat lookup failures as "nothing exists" — we'll fall back to writing everything.
+            log.debug("contentHash pre-fetch failed, will write all rows: {}", e.getMessage());
+        }
+        return out;
     }
 
     private void flushEdges() {
         if (edgeBuffer.isEmpty()) return;
         List<Map.Entry<EdgeKey, Map<String, Object>>> all = new ArrayList<>(edgeBuffer.entrySet());
         edgeBuffer.clear();
-        for (int from = 0; from < all.size(); from += FLUSH_CHUNK) {
-            int to = Math.min(from + FLUSH_CHUNK, all.size());
-            List<Map.Entry<EdgeKey, Map<String, Object>>> chunk = all.subList(from, to);
+
+        // Skip-unchanged for edges: edges have no content hash, but they're keyed on (from, type, to)
+        // and rarely change properties once created. Pre-fetch the set of existing (from, to) pairs
+        // per REL type and skip any edge whose pair already exists. Reduces ~10 k re-scan MERGEs
+        // to ~0 on a stable graph.
+        Map<String, java.util.Set<String>> existingPerType = fetchExistingEdgePairs(all);
+        List<Map.Entry<EdgeKey, Map<String, Object>>> toWrite = new ArrayList<>(all.size());
+        int skipped = 0;
+        for (Map.Entry<EdgeKey, Map<String, Object>> e : all) {
+            EdgeKey k = e.getKey();
+            java.util.Set<String> pairs = existingPerType.get(k.type());
+            if (pairs != null && pairs.contains(k.fromId() + "|" + k.toId())) {
+                skipped++;
+                continue;
+            }
+            toWrite.add(e);
+        }
+        totalEdges += all.size();
+        log.debug("flushEdges: total={} skipped={} writing={}", all.size(), skipped, toWrite.size());
+
+        if (toWrite.isEmpty()) return;
+        for (int from = 0; from < toWrite.size(); from += FLUSH_CHUNK) {
+            int to = Math.min(from + FLUSH_CHUNK, toWrite.size());
+            List<Map.Entry<EdgeKey, Map<String, Object>>> chunk = toWrite.subList(from, to);
             runInTransaction(() -> {
                 for (Map.Entry<EdgeKey, Map<String, Object>> e : chunk) writeEdge(e.getKey(), e.getValue());
             });
-            totalEdges += chunk.size();
         }
+    }
+
+    /**
+     * Per REL type, query all (from, to) pairs currently in the table. We only need to know which
+     * pairs already exist — property updates on existing edges are silently dropped, which matches
+     * the typical re-scan case where (from, type, to) is stable.
+     */
+    private Map<String, java.util.Set<String>> fetchExistingEdgePairs(
+            List<Map.Entry<EdgeKey, Map<String, Object>>> all) {
+        java.util.Set<String> typesNeeded = new java.util.HashSet<>();
+        for (Map.Entry<EdgeKey, Map<String, Object>> e : all) typesNeeded.add(e.getKey().type());
+        Map<String, java.util.Set<String>> out = new HashMap<>();
+        for (String type : typesNeeded) {
+            java.util.Set<String> pairs = new java.util.HashSet<>();
+            try {
+                List<Map<String, Object>> rows = kuzu.read(
+                        "MATCH (a:Node)-[r:" + type + "]->(b:Node) RETURN a.id AS src, b.id AS dst");
+                for (Map<String, Object> r : rows) {
+                    Object src = r.get("src");
+                    Object dst = r.get("dst");
+                    if (src != null && dst != null) pairs.add(src + "|" + dst);
+                }
+            } catch (RuntimeException ex) {
+                log.debug("existing-edge fetch failed for {}: {}", type, ex.getMessage());
+            }
+            out.put(type, pairs);
+        }
+        return out;
     }
 
     private void runInTransaction(Runnable body) {
@@ -206,6 +323,7 @@ public class KuzuIngestor implements GraphIngestor {
         params.put("label", key.label());
         params.put("fqName", key.fqName());
         params.put("lastIngestedAt", scanStartIso);
+        params.put("contentHash", buf.contentHash != null ? buf.contentHash : KuzuNodeHash.compute(key, raw));
         for (String prop : NODE_PROPERTY_ORDER) {
             if (NODE_KEY_COLUMNS.contains(prop)) continue;
             Object v = raw.get(prop);
@@ -241,6 +359,7 @@ public class KuzuIngestor implements GraphIngestor {
         StringBuilder sb = new StringBuilder("MERGE (n:Node {id: $id}) SET ");
         sb.append("n.projectId = $projectId, n.label = $label, n.fqName = $fqName");
         sb.append(", n.lastIngestedAt = timestamp($lastIngestedAt)");
+        sb.append(", n.contentHash = $contentHash");
         for (String prop : shape) {
             sb.append(", n.").append(prop).append(" = $").append(prop);
         }
