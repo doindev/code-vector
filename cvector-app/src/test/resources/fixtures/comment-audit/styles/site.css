@@ -1,0 +1,4 @@
+/* .commented-class { color: red; } */
+/* :root { --commented-token: red; } */
+.real-css-class { color: blue; }
+:root { --real-token: blue; }

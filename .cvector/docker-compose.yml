@@ -1,0 +1,15 @@
+services:
+  neo4j:
+    image: neo4j:5
+    container_name: cvector-neo4j
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      NEO4J_AUTH: neo4j/neo4jneo4j
+      NEO4J_dbms_memory_heap_initial__size: 512m
+      NEO4J_dbms_memory_heap_max__size: 2G
+    volumes:
+      - cvector_neo4j_data:/data
+volumes:
+  cvector_neo4j_data:

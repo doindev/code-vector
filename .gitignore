@@ -1,0 +1,133 @@
+# --- Build output ---
+target/
+build/
+out/
+*.class
+*.jar
+*.war
+*.ear
+*.nar
+hs_err_pid*
+replay_pid*
+
+# --- ANTLR generated sources (regenerated each build) ---
+**/generated-sources/
+**/generated-test-sources/
+*.tokens
+*.interp
+
+# --- Maven ---
+.mvn/
+.maven/
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+pom.xml.next
+release.properties
+dependency-reduced-pom.xml
+buildNumber.properties
+
+# --- Gradle (in case any subproject ever uses it) ---
+.gradle/
+
+# --- cvector workspace ---
+# Project config can be safely committed, but local Neo4j credentials and runtime
+# state should not. Adjust if your team prefers to track project.json directly.
+.cvector/project.json
+.cvector/mcp-server.log
+.cvector/*.snapshot.json
+.cvector/cache/
+
+# --- IDEs ---
+# IntelliJ IDEA
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# Eclipse
+.project
+.classpath
+.settings/
+.factorypath
+.apt_generated/
+.springBeans
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# JetBrains Rider / Fleet
+.fleet/
+
+# NetBeans
+nbproject/private/
+nbbuild/
+nbdist/
+.nb-gradle/
+
+# --- OS ---
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# --- Logs ---
+*.log
+logs/
+log/
+
+# --- Test artefacts ---
+surefire-reports/
+failsafe-reports/
+*.surefire
+testcontainers.properties.local
+
+# --- Node / npm (if any frontend creeps in) ---
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# --- Python (for any tooling scripts) ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+
+# --- Local secrets / scratch ---
+.env
+.env.local
+.env.*.local
+secrets/
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# --- Temp / scratch ---
+*.bak
+*.tmp
+*.orig
+*.rej
+.tmp/
+tmp/
+scratch/
+
+# --- Coverage ---
+.coverage
+coverage/
+jacoco.exec
+*.exec
+
+# --- macOS DS_Store recursive ---
+**/.DS_Store

@@ -1,0 +1,3 @@
+# commented.out.key: should-not-appear
+real:
+  key: real-value

@@ -1,0 +1,6 @@
+// $commented-line-var: red;
+// .commented-line-class {}
+/* $commented-block-var: red;
+   .commented-block-class {} */
+$real-scss-var: green;
+.real-scss-class { color: $real-scss-var; }

@@ -1,0 +1,30 @@
+# cvector architecture rules.
+# Tune thresholds below; disable built-in rules by name in `disable`.
+# Define project-specific rules under `custom` using Cypher.
+
+thresholds:
+  # Visitor-pattern parsers naturally have many small methods, so we keep the threshold
+  # relaxed for files/classes; long-method still catches the truly painful cases.
+  godFileMethods: 40
+  godClassMethods: 40
+  longMethodLines: 80
+  deepInheritance: 5
+
+disable: []
+#  - long-method
+#  - dead-code
+
+# Skip vendored ANTLR grammar code and generated sources.
+excludePaths:
+  - /internal/
+  - /target/
+  - /generated-sources/
+
+custom:
+#  - name: no-system-out-in-services
+#    description: Service classes should not print to System.out.
+#    severity: WARN
+#    cypher: |
+#      MATCH (c:Class {projectId: $pid, isService: true})-[:CONTAINS]->(m:Method)-[:CALLS]->(callee:Method)
+#      WHERE callee.fqName CONTAINS 'PrintStream.println'
+#      RETURN c.fqName AS subject, callee.fqName AS message

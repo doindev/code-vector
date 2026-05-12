@@ -1,0 +1,11 @@
+<?xml version="1.0"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+    <modelVersion>4.0.0</modelVersion>
+    <groupId>audit</groupId>
+    <artifactId>audit</artifactId>
+    <version>1.0</version>
+    <dependencies>
+        <!-- <dependency><groupId>commented.out</groupId><artifactId>fake-dep</artifactId><version>1.0</version></dependency> -->
+        <dependency><groupId>real.dep</groupId><artifactId>real-artifact</artifactId><version>2.0</version></dependency>
+    </dependencies>
+</project>

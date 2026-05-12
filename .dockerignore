@@ -1,0 +1,56 @@
+# Keep the build context small. Anything excluded here is invisible to the
+# Dockerfile COPY commands.
+
+# Build output
+**/target/
+**/build/
+**/out/
+**/generated-sources/
+
+# IDE / editor metadata
+.idea/
+.vscode/
+.fleet/
+*.iml
+*.iws
+*.ipr
+.project
+.classpath
+.settings/
+.factorypath
+.apt_generated/
+
+# Local workspace state (Neo4j password lives here)
+.cvector/
+
+# Version control
+.git/
+.gitignore
+.gitattributes
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Docs the image doesn't need
+*.md
+docs/
+
+# CI configs
+.github/
+.gitlab-ci.yml
+
+# Maven local cache (BuildKit cache mount handles this)
+.m2/
+
+# Logs / scratch
+*.log
+logs/
+tmp/
+scratch/
+*.bak
+*.tmp
+
+# The Dockerfile + compose files themselves don't need to be inside the build
+# context, but leaving them in is harmless.
