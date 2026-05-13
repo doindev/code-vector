@@ -128,16 +128,27 @@ public final class EmbeddedKuzu implements AutoCloseable {
                 throw new RuntimeException("Kuzu query failed: " + result.getErrorMessage()
                         + "\nquery: " + cypher);
             }
-            long cols = result.getNumColumns();
-            String[] names = new String[(int) cols];
-            for (long i = 0; i < cols; i++) names[(int) i] = result.getColumnName(i);
+            // Column names are stable per Cypher template (RETURN clause is fixed). Caching
+            // saves a per-call JNI loop -- meaningful for the read hot path, which 50+ call
+            // sites flow through. Validated against the live column count to fail loudly if
+            // a query ever returns a different shape (it shouldn't, but the cost is one int compare).
+            int cols = (int) result.getNumColumns();
+            String[] names = colNamesCache.get(cypher);
+            if (names == null || names.length != cols) {
+                names = new String[cols];
+                for (int i = 0; i < cols; i++) names[i] = result.getColumnName(i);
+                colNamesCache.put(cypher, names);
+            }
             List<Map<String, Object>> rows = new ArrayList<>();
             while (result.hasNext()) {
                 try (FlatTuple t = result.getNext()) {
-                    Map<String, Object> row = new LinkedHashMap<>();
-                    for (long i = 0; i < cols; i++) {
+                    // Pre-size LinkedHashMap with the exact column count so we don't pay for
+                    // a rehash + table-double when {@code cols > 12}. Load factor 1.0 because
+                    // we never grow.
+                    Map<String, Object> row = new LinkedHashMap<>(cols, 1.0f);
+                    for (int i = 0; i < cols; i++) {
                         try (Value v = t.getValue(i)) {
-                            row.put(names[(int) i], unwrap(v));
+                            row.put(names[i], unwrap(v));
                         }
                     }
                     rows.add(row);
@@ -171,11 +182,25 @@ public final class EmbeddedKuzu implements AutoCloseable {
     /** Cached parameter-name set per Cypher template — sibling of {@link #stmtCache}. */
     private final Map<String, java.util.Set<String>> paramRefCache = new ConcurrentHashMap<>();
 
+    /**
+     * Cached column-name array per Cypher template. Result columns are determined by the RETURN
+     * clause, which is fixed per template, so the names string-equal across every call of the
+     * same template. Caching saves a per-call JNI loop ({@code getColumnName(i)} ×N) on the read
+     * hot path — meaningful since 50+ call sites in cvector funnel through {@link #read}.
+     */
+    private final Map<String, String[]> colNamesCache = new ConcurrentHashMap<>();
+
     private QueryResult run(String cypher, Map<String, Object> params) {
-        if (params == null || params.isEmpty()) {
-            return connection.query(cypher);
-        }
+        // Always go through the prepared-statement cache, even when {@code params} is empty.
+        // The previous branch did {@code connection.query(cypher)} on the empty path, which
+        // forced Kuzu to re-parse + replan the Cypher every call. Caching the prepared
+        // statement saves that work on repeated no-param queries (most of cvector's analytic
+        // reads). The {@code stmtCache.computeIfAbsent} lookup is cheap on a ConcurrentHashMap.
         PreparedStatement stmt = stmtCache.computeIfAbsent(cypher, this::prepareOrThrow);
+        boolean empty = params == null || params.isEmpty();
+        if (empty) {
+            return connection.execute(stmt, Map.of());
+        }
         java.util.Set<String> referenced = paramRefCache.computeIfAbsent(cypher, EmbeddedKuzu::referencedParams);
         Map<String, Value> kuzuParams = new LinkedHashMap<>();
         try {

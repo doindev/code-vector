@@ -2,6 +2,7 @@ package io.doindev.cvector.rest;
 
 import io.doindev.cvector.core.store.GraphStore;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplication;
+import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
@@ -25,17 +26,17 @@ public class SchemaController {
 
     private final GraphStore store;
     private final ActiveProject project;
-    private final GraphReadCache cache;
+    private final JsonCache jsonCache;
 
-    public SchemaController(GraphStore restGraphStore, ActiveProject activeProject, GraphReadCache cache) {
+    public SchemaController(GraphStore restGraphStore, ActiveProject activeProject, JsonCache jsonCache) {
         this.store = restGraphStore;
         this.project = activeProject;
-        this.cache = cache;
+        this.jsonCache = jsonCache;
     }
 
-    @GetMapping("/schema")
-    public Map<String, Object> schema() {
-        return cache.memoize("graph-schema:" + project.projectId(), this::buildSchema);
+    @GetMapping(value = "/schema", produces = MediaType.APPLICATION_JSON_VALUE)
+    public byte[] schema() {
+        return jsonCache.memoize("graph-schema:" + project.projectId(), this::buildSchema);
     }
 
     private Map<String, Object> buildSchema() {

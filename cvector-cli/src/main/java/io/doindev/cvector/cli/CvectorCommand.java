@@ -9,8 +9,10 @@ import io.doindev.cvector.cli.commands.DashboardCommand;
 import io.doindev.cvector.cli.commands.DbCommand;
 import io.doindev.cvector.cli.commands.DiffCommand;
 import io.doindev.cvector.cli.commands.DoctorCommand;
+import io.doindev.cvector.cli.commands.DuplicatesCommand;
 import io.doindev.cvector.cli.commands.HostCommand;
 import io.doindev.cvector.cli.commands.McpCommand;
+import io.doindev.cvector.cli.commands.MigrateCommand;
 import io.doindev.cvector.cli.commands.ExplainCommand;
 import io.doindev.cvector.cli.commands.FlowsCommand;
 import io.doindev.cvector.cli.commands.GuardCommand;
@@ -68,6 +70,7 @@ import java.util.concurrent.Callable;
                 TestImpactCommand.class,
                 RenameCommand.class,
                 PrImpactCommand.class,
+                MigrateCommand.class,
                 RecentCommand.class,
                 ProjectCommand.class,
                 McpCommand.class,
@@ -81,6 +84,7 @@ import java.util.concurrent.Callable;
                 GuardCommand.class,
                 AuditCommand.class,
                 CommunitiesCommand.class,
+                DuplicatesCommand.class,
                 FlowsCommand.class,
                 ServiceLinksCommand.class,
                 DiffCommand.class,

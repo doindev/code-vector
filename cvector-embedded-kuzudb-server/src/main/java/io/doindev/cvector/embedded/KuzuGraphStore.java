@@ -31,8 +31,17 @@ import java.util.Map;
  */
 public final class KuzuGraphStore implements GraphStore {
 
-    private final EmbeddedKuzu kuzu;
-    private final String displayUri;
+    /**
+     * Volatile so the runtime project-switch path ({@link #swapToProject}) can atomically
+     * point the store at a different Kuzu DB while concurrent queries are in flight. Each
+     * query method reads the current reference once at the top and uses it for the duration
+     * of the call — a swap landing mid-method completes the older query against the older
+     * DB, which is the desired snapshot semantic.
+     */
+    private volatile EmbeddedKuzu kuzu;
+    private volatile String displayUri;
+    /** Guards {@link #swapToProject} so two concurrent switches don't both open new DBs. */
+    private final Object swapLock = new Object();
 
     public KuzuGraphStore(EmbeddedKuzu kuzu) {
         this.kuzu = kuzu;
@@ -40,6 +49,32 @@ public final class KuzuGraphStore implements GraphStore {
     }
 
     public EmbeddedKuzu kuzu() { return kuzu; }
+
+    @Override
+    public void swapToProject(String projectId) {
+        synchronized (swapLock) {
+            // Resolve the target DB path the same way CvectorRestConfig does on initial boot
+            // so existing-on-disk databases get reused (and freshly-created ones land in the
+            // standard location). The new EmbeddedKuzu opens, schema-bootstraps, then we
+            // flip the reference. Old DB is closed last so any concurrent query finishes
+            // against its snapshot before the file handle goes away.
+            java.nio.file.Path newPath = EmbeddedKuzu.defaultDbPath(projectId);
+            try {
+                EmbeddedKuzu next = new EmbeddedKuzu(newPath);
+                new KuzuSchemaBootstrap(next).bootstrap();
+                EmbeddedKuzu previous = this.kuzu;
+                this.kuzu = next;
+                this.displayUri = "kuzu://" + next.dbPath();
+                // Best-effort close of the previous handle. If a request is still draining
+                // results from the old DB it'll fail cleanly; the request layer surfaces that
+                // as a 500, which the dashboard's auto-retry covers.
+                try { previous.close(); } catch (RuntimeException ignored) { /* nothing actionable */ }
+            } catch (java.io.IOException e) {
+                throw new java.io.UncheckedIOException(
+                        "failed to swap embedded kuzu to project " + projectId + " at " + newPath, e);
+            }
+        }
+    }
 
     @Override
     public boolean ping() { return kuzu.ping(); }
@@ -785,6 +820,50 @@ public final class KuzuGraphStore implements GraphStore {
         }
         sb.append("]");
         return first ? null : sb.toString();
+    }
+
+    @Override
+    public List<Map<String, Object>> findDuplicates(String projectId, int minOccurrences) {
+        int min = Math.max(2, minOccurrences);
+        // Single query: group Methods by (name, paramCount, returnType, lineCount-bucket) and
+        // emit groups with count >= min. lineCount-bucket rounds to the nearest 5 so methods
+        // of "about the same size" group together even if one has a couple of extra lines.
+        // Exclude constructors (`<init>`) — they're trivially "duplicated" across every class.
+        List<Map<String, Object>> rows;
+        try {
+            rows = kuzu.read(
+                    "MATCH (m:Node) WHERE m.label = 'Method' "
+                            + "AND m.name IS NOT NULL AND m.name <> '<init>' "
+                            + "AND m.startLine IS NOT NULL AND m.endLine IS NOT NULL "
+                            + "AND (m.endLine - m.startLine) >= 5 "  // ignore one-liners; they're often legitimately repeated
+                            + "WITH m, m.name AS name, coalesce(m.paramCount, 0) AS pc, "
+                            + "     coalesce(m.returnType, '') AS rt, "
+                            + "     ((m.endLine - m.startLine) / 5) * 5 AS lineBucket "
+                            + "WITH name, pc, rt, lineBucket, "
+                            + "     count(m) AS occurrences, collect(m.fqName) AS fqNames "
+                            + "WHERE occurrences >= $min "
+                            + "RETURN name, pc AS paramCount, rt AS returnType, lineBucket, "
+                            + "       occurrences, fqNames "
+                            + "ORDER BY occurrences DESC, name LIMIT 100",
+                    Map.of("min", min));
+        } catch (RuntimeException ignored) {
+            return List.of();
+        }
+        // Flatten Kuzu's serialised list strings into proper Java lists if needed; the unwrap
+        // pass already handles LIST<STRING> but the embedded-shape needs a per-row touch.
+        List<Map<String, Object>> out = new ArrayList<>(rows.size());
+        for (Map<String, Object> r : rows) {
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("name", r.get("name"));
+            row.put("paramCount", r.get("paramCount"));
+            row.put("returnType", r.get("returnType"));
+            row.put("lineBucket", r.get("lineBucket"));
+            row.put("occurrences", r.get("occurrences"));
+            Object fq = r.get("fqNames");
+            row.put("members", fq == null ? List.of() : fq);
+            out.add(row);
+        }
+        return out;
     }
 
     @Override

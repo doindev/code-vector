@@ -528,6 +528,29 @@ public final class Neo4jGraphStore implements GraphStore {
     }
 
     @Override
+    public List<Map<String, Object>> findDuplicates(String projectId, int minOccurrences) {
+        int min = Math.max(2, minOccurrences);
+        Map<String, Object> params = new LinkedHashMap<>();
+        params.put("pid", projectId);
+        params.put("min", min);
+        List<Map<String, Object>> rows = queries.raw(
+                "MATCH (m:Method {projectId: $pid}) "
+                        + "WHERE m.name IS NOT NULL AND m.name <> '<init>' "
+                        + "AND m.startLine IS NOT NULL AND m.endLine IS NOT NULL "
+                        + "AND (m.endLine - m.startLine) >= 5 "
+                        + "WITH m.name AS name, coalesce(m.paramCount, 0) AS paramCount, "
+                        + "     coalesce(m.returnType, '') AS returnType, "
+                        + "     ((m.endLine - m.startLine) / 5) * 5 AS lineBucket, "
+                        + "     m.fqName AS fqName "
+                        + "WITH name, paramCount, returnType, lineBucket, "
+                        + "     count(*) AS occurrences, collect(fqName) AS members "
+                        + "WHERE occurrences >= $min "
+                        + "RETURN name, paramCount, returnType, lineBucket, occurrences, members "
+                        + "ORDER BY occurrences DESC, name LIMIT 100", params);
+        return rows;
+    }
+
+    @Override
     public Map<String, Object> nodeById(String projectId, String id) {
         if (id == null) return Map.of();
         List<Map<String, Object>> rows = queries.raw(

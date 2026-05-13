@@ -15,6 +15,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Writes {@link GraphEvent}s into a Kuzu database. Kuzu's Cypher dialect doesn't support
@@ -111,23 +112,34 @@ public class KuzuIngestor implements GraphIngestor {
     private final EmbeddedKuzu kuzu;
     /** Scan start, stamped onto every node write as {@code lastIngestedAt}. Skipped (unchanged) rows keep their old timestamp, which gives {@code cv_changes} semantically-correct "what actually changed" output. */
     private final String scanStartIso;
-    /** Buffered nodes keyed by id; values carry the latest key + merged props. */
-    private final Map<String, BufferedNode> nodeBuffer = new LinkedHashMap<>();
-    /** Buffered edges keyed by (from,type,to); values are merged props. */
-    private final Map<EdgeKey, Map<String, Object>> edgeBuffer = new LinkedHashMap<>();
+    /**
+     * Buffered nodes keyed by id; values carry the latest key + merged props. ConcurrentHashMap
+     * so {@link #accept} doesn't need a JVM monitor on the parallel scan hot path — earlier
+     * the synchronized accept() serialised every emit (up to ~18 k per scan on cvector itself)
+     * across all worker threads, defeating the {@code Files.walk().parallel()} speedup.
+     */
+    private final Map<String, BufferedNode> nodeBuffer = new ConcurrentHashMap<>();
+    /** Buffered edges keyed by (from,type,to); values are merged props. ConcurrentHashMap for the same reason as {@link #nodeBuffer}. */
+    private final Map<EdgeKey, Map<String, Object>> edgeBuffer = new ConcurrentHashMap<>();
     /**
      * Every node id we saw during the scan (written + skipped). Drives {@code cleanupStale}'s
      * staleness check: any managed-label row whose id is <em>not</em> in this set is stale and
-     * gets removed. Replaces the prior lastIngestedAt-based scheme which required bulk-bumping
-     * timestamps on every skipped row.
+     * gets removed. {@link ConcurrentHashMap#newKeySet()} so concurrent {@link #accept} adds
+     * don't need external synchronisation.
      */
-    private final java.util.Set<String> touchedNodeIds = new java.util.HashSet<>();
-    private int totalNodes;
-    private int totalEdges;
+    private final java.util.Set<String> touchedNodeIds = ConcurrentHashMap.newKeySet();
+    /** Counters live on AtomicInteger so the lockless accept path doesn't race them. */
+    private final java.util.concurrent.atomic.AtomicInteger totalNodes = new java.util.concurrent.atomic.AtomicInteger();
+    private final java.util.concurrent.atomic.AtomicInteger totalEdges = new java.util.concurrent.atomic.AtomicInteger();
 
     private static final class BufferedNode {
-        NodeKey key;
-        final Map<String, Object> props = new HashMap<>();
+        volatile NodeKey key;
+        /**
+         * ConcurrentHashMap so two parsers emitting NodeUpserts for the same id from different
+         * worker threads don't race on {@code putAll}. Per-key writes are last-write-wins which
+         * is the same semantics the prior synchronised version provided.
+         */
+        final Map<String, Object> props = new ConcurrentHashMap<>();
         /** Filled at flush time by {@link KuzuNodeHash}. Stored alongside the row so re-scans can skip unchanged data. */
         String contentHash;
 
@@ -147,7 +159,10 @@ public class KuzuIngestor implements GraphIngestor {
     public String scanStartIso() { return scanStartIso; }
 
     @Override
-    public synchronized void accept(GraphEvent event) {
+    public void accept(GraphEvent event) {
+        // Lockless on the hot path: the three buffers above are ConcurrentHashMaps, so concurrent
+        // emits from parallel parser threads don't need a JVM monitor. The only mutex-style work
+        // is {@link #flush}, which is rare (once per scan, single-threaded by the caller).
         if (event instanceof GraphEvent.NodeUpsert n) {
             BufferedNode buf = nodeBuffer.computeIfAbsent(n.key().id(), id -> new BufferedNode(n.key()));
             buf.key = n.key();
@@ -156,7 +171,7 @@ public class KuzuIngestor implements GraphIngestor {
             touchedNodeIds.add(n.key().id());
         } else if (event instanceof GraphEvent.EdgeUpsert e) {
             EdgeKey k = new EdgeKey(e.from().id(), e.type(), e.to().id());
-            Map<String, Object> merged = edgeBuffer.computeIfAbsent(k, x -> new HashMap<>());
+            Map<String, Object> merged = edgeBuffer.computeIfAbsent(k, x -> new ConcurrentHashMap<>());
             if (e.props() != null) merged.putAll(e.props());
         } else if (event instanceof GraphEvent.NodeRemove r) {
             // Drop any buffered upsert for this id first so the delete isn't immediately re-created
@@ -187,7 +202,7 @@ public class KuzuIngestor implements GraphIngestor {
             }
             toWrite.add(b);
         }
-        totalNodes += all.size();  // surface to the user includes skipped (they're "ingested" logically)
+        totalNodes.addAndGet(all.size());  // surface to the user includes skipped (they're "ingested" logically)
         log.debug("flushNodes: total={} skipped={} writing={}", all.size(), skippedIds.size(), toWrite.size());
 
         if (toWrite.isEmpty()) return;
@@ -205,7 +220,7 @@ public class KuzuIngestor implements GraphIngestor {
      * {@link KuzuPostScan#cleanupStale} — anything in the managed-label set that's <em>not</em>
      * in this set is stale.
      */
-    public synchronized java.util.Set<String> touchedNodeIds() {
+    public java.util.Set<String> touchedNodeIds() {
         return java.util.Set.copyOf(touchedNodeIds);
     }
 
@@ -260,7 +275,7 @@ public class KuzuIngestor implements GraphIngestor {
             }
             toWrite.add(e);
         }
-        totalEdges += all.size();
+        totalEdges.addAndGet(all.size());
         log.debug("flushEdges: total={} skipped={} writing={}", all.size(), skipped, toWrite.size());
 
         if (toWrite.isEmpty()) return;
@@ -418,8 +433,8 @@ public class KuzuIngestor implements GraphIngestor {
         flushEdges();
     }
 
-    public int totalNodes() { return totalNodes; }
-    public int totalEdges() { return totalEdges; }
+    public int totalNodes() { return totalNodes.get(); }
+    public int totalEdges() { return totalEdges.get(); }
 
     @Override
     public void close() {

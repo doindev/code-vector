@@ -21,6 +21,7 @@ const NAV: ReadonlyArray<NavSection> = [
     title: 'Workspace',
     items: [
       { label: 'Overview',   path: '/',         icon: 'bi-grid-1x2'        },
+      { label: 'Projects',   path: '/projects', icon: 'bi-collection'      },
       { label: 'Monitors',   path: '/monitors', icon: 'bi-eye'             },
       { label: 'Schedules',  path: '/schedules',icon: 'bi-clock-history'   },
       { label: 'Recent',     path: '/recent',   icon: 'bi-activity'        },
@@ -37,6 +38,7 @@ const NAV: ReadonlyArray<NavSection> = [
       { label: 'Flows',       path: '/flows',       icon: 'bi-signpost-split'     },
       { label: 'Audit',       path: '/audit',       icon: 'bi-shield-exclamation' },
       { label: 'Communities', path: '/communities', icon: 'bi-diagram-2'          },
+      { label: 'Duplicates',  path: '/duplicates',  icon: 'bi-files'              },
       { label: 'Wiki',        path: '/wiki',        icon: 'bi-journal-text'       },
     ],
   },
@@ -52,6 +54,7 @@ const NAV: ReadonlyArray<NavSection> = [
       { label: 'DB impact',path: '/db-impact',icon: 'bi-database'    },
       { label: 'Rename',   path: '/rename',   icon: 'bi-input-cursor-text' },
       { label: 'PR impact',path: '/pr-impact',icon: 'bi-git'           },
+      { label: 'Migrate',  path: '/migrate',  icon: 'bi-arrow-right-square' },
       { label: 'Diff',     path: '/diff',     icon: 'bi-arrow-left-right' },
     ],
   },

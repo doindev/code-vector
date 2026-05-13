@@ -34,14 +34,17 @@ public class DoctorController {
     private final GraphStore store;
     private final ActiveProject project;
     private final GraphReadCache cache;
+    private final JsonCache jsonCache;
     /** Read straight from the Spring Environment so we see whatever's actually wired (properties or system). */
     private final boolean virtualThreadsEnabled;
 
     public DoctorController(GraphStore restGraphStore, ActiveProject activeProject, GraphReadCache cache,
+                            JsonCache jsonCache,
                             @Value("${spring.threads.virtual.enabled:false}") boolean virtualThreadsEnabled) {
         this.store = restGraphStore;
         this.project = activeProject;
         this.cache = cache;
+        this.jsonCache = jsonCache;
         this.virtualThreadsEnabled = virtualThreadsEnabled;
     }
 
@@ -59,7 +62,8 @@ public class DoctorController {
         ));
         out.put("jvm", jvmInfo());
         out.put("cache", Map.of(
-                "entries", cache.size()
+                "objectEntries", cache.size(),
+                "jsonEntries", jsonCache.size()
         ));
         out.put("checks", runChecks());
         return out;

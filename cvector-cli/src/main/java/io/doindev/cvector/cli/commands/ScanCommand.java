@@ -260,16 +260,40 @@ public class ScanCommand implements Callable<Integer> {
      * milliseconds, two orders of magnitude faster than ANTLR parsing it. Returns null on read
      * failure so the caller can fall back to parsing without poisoning the skip cache.
      */
+    private static final char[] HEX_ALPHABET = "0123456789abcdef".toCharArray();
+
+    /**
+     * ThreadLocal MessageDigest skips the per-call JCA provider lookup — meaningful on the
+     * parallel scan path where this can be invoked once per file (355+ on cvector itself).
+     */
+    private static final ThreadLocal<java.security.MessageDigest> SHA256 =
+            ThreadLocal.withInitial(() -> {
+                try {
+                    return java.security.MessageDigest.getInstance("SHA-256");
+                } catch (java.security.NoSuchAlgorithmException e) {
+                    throw new IllegalStateException("SHA-256 not available", e);
+                }
+            });
+
+    /**
+     * Short content-hash for the per-file incremental-skip path. 16-hex-char = first 8 bytes of
+     * SHA-256 of the file's bytes. Inline hex encoding skips the {@code String.format("%02x",…)}
+     * cost; the ThreadLocal digest skips the JCA lookup. Together these shave noticeable time
+     * off a full scan since the function is on the parallel hot path.
+     */
     private static String fileContentHash(Path file) {
         try {
             byte[] bytes = Files.readAllBytes(file);
-            java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+            java.security.MessageDigest md = SHA256.get();
+            md.reset();
             byte[] digest = md.digest(bytes);
-            StringBuilder sb = new StringBuilder(16);
-            for (int i = 0; i < 8 && i < digest.length; i++) {
-                sb.append(String.format("%02x", digest[i] & 0xFF));
+            char[] out = new char[16];
+            for (int i = 0; i < 8; i++) {
+                int b = digest[i] & 0xFF;
+                out[i * 2]     = HEX_ALPHABET[b >>> 4];
+                out[i * 2 + 1] = HEX_ALPHABET[b & 0x0F];
             }
-            return sb.toString();
+            return new String(out);
         } catch (Exception e) {
             return null;
         }
@@ -411,29 +435,33 @@ public class ScanCommand implements Callable<Integer> {
 
                         String relPath = ctx.rootPath().relativize(file).toString().replace('\\', '/');
 
+                        // Compute the file's content hash exactly once per scan. Used by both the
+                        // skip-check (if a prior hash matches we don't re-parse) and the post-scan
+                        // stamp (so the NEXT scan can skip this file). Previously the function
+                        // was called twice per file — duplicated I/O + SHA-256 on a parallel hot
+                        // path. Single-call version saves the second read + digest.
+                        String currentHash = fileContentHash(file);
+
                         // Content-hash skip: if a prior scan recorded this exact bytes-hash for
                         // this file, the parser output would be byte-identical, so re-parsing is
                         // pure waste. Mark the prior nodes as still-alive and move on.
                         if (canSkip) {
                             FileSnapshot prior = existingFiles.get(relPath);
-                            if (prior != null && prior.contentHash() != null) {
-                                String currentHash = fileContentHash(file);
-                                if (currentHash != null && currentHash.equals(prior.contentHash())) {
-                                    skipTouchedIds.addAll(prior.nodeIds());
-                                    skipped.incrementAndGet();
-                                    fileCount.incrementAndGet();
-                                    return;
-                                }
+                            if (prior != null && prior.contentHash() != null
+                                    && currentHash != null && currentHash.equals(prior.contentHash())) {
+                                skipTouchedIds.addAll(prior.nodeIds());
+                                skipped.incrementAndGet();
+                                fileCount.incrementAndGet();
+                                return;
                             }
                         }
 
                         for (Parser p : ps) p.parse(file, ctx, sink);
-                        // After parsing, stamp the file's contentHash so the NEXT scan can skip
-                        // it. We piggyback on whichever File NodeKey the parsers produced -- all
-                        // parsers use the same identity (projectId, "File", relPath) by convention,
-                        // so this NodeUpsert merges into the existing record's property map.
-                        String currentHash = canSkip ? null : fileContentHash(file);
-                        if (currentHash == null) currentHash = fileContentHash(file);
+
+                        // Stamp the file's contentHash so the NEXT scan can skip it. We piggyback
+                        // on whichever File NodeKey the parsers produced — all parsers use the
+                        // same identity (projectId, "File", relPath) by convention, so this
+                        // NodeUpsert merges into the existing record's property map.
                         if (currentHash != null) {
                             NodeKey fk = new NodeKey(ctx.projectId(), "File", relPath);
                             Map<String, Object> hashProp = new HashMap<>();

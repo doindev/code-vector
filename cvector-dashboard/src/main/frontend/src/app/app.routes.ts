@@ -124,9 +124,24 @@ export const routes: Routes = [
           import('./views/pr-impact/pr-impact.component').then((m) => m.PrImpactComponent),
       },
       {
+        path: 'migrate',
+        loadComponent: () =>
+          import('./views/migrate/migrate.component').then((m) => m.MigrateComponent),
+      },
+      {
         path: 'diff',
         loadComponent: () =>
           import('./views/diff/diff.component').then((m) => m.DiffComponent),
+      },
+      {
+        path: 'duplicates',
+        loadComponent: () =>
+          import('./views/duplicates/duplicates.component').then((m) => m.DuplicatesComponent),
+      },
+      {
+        path: 'projects',
+        loadComponent: () =>
+          import('./views/projects/projects.component').then((m) => m.ProjectsComponent),
       },
       {
         path: 'settings',

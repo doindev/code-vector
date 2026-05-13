@@ -332,6 +332,28 @@ public interface GraphStore extends AutoCloseable {
     }
 
     /**
+     * Find groups of Method nodes that look like duplicates — same name, same paramCount,
+     * same returnType, and similar body length. Each group has at least {@code minOccurrences}
+     * members. The result is a list of group records:
+     * <pre>
+     *   {
+     *     name: "validateInput",
+     *     paramCount: 2,
+     *     returnType: "boolean",
+     *     occurrences: 3,
+     *     members: [{fqName, fileId, startLine, lineCount}, ...]
+     *   }
+     * </pre>
+     * Groups are ordered by descending {@code occurrences} so the biggest near-duplicates
+     * surface first. The detection is conservative — true duplicate-body finding would need
+     * source text, but methods with identical shape across multiple classes are a strong
+     * "candidate for extraction to a shared helper" signal.
+     */
+    default List<Map<String, Object>> findDuplicates(String projectId, int minOccurrences) {
+        return java.util.List.of();
+    }
+
+    /**
      * Bulk downstream-impact ids. For each source id, returns the set of distinct node ids
      * reachable within {@code depth} hops via {@code CALLS} (and {@code REFERENCES} where the
      * backend supports it). Used by pr-impact to collapse hundreds of per-symbol BFS calls
@@ -403,6 +425,22 @@ public interface GraphStore extends AutoCloseable {
      * Returns the number of nodes removed.
      */
     int deleteFileSubtree(String projectId, String path);
+
+    /**
+     * Swap the backing data store to a different project. Used by the runtime project-switch
+     * path so the dashboard / REST surface can flip workspaces without a restart.
+     *
+     * <p>Neo4j default: no-op — every query already filters by {@code projectId}, so flipping
+     * the active project's id is enough; nothing about the bolt connection needs to change.
+     *
+     * <p>Kuzu override: close the current embedded DB and open the one at
+     * {@code ~/.cvector/kuzu-data/<projectId>/graph.kuzu}. The schema gets re-bootstrapped
+     * idempotently. Concurrent queries during the swap are safe — the volatile reference flips
+     * atomically once the new DB is ready.
+     */
+    default void swapToProject(String projectId) {
+        // Default: no-op. Backends with per-project state should override.
+    }
 
     @Override
     void close();
