@@ -2,7 +2,10 @@ package io.doindev.cvector.rest;
 
 import io.doindev.cvector.core.store.GraphStore;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplication;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
@@ -26,6 +29,41 @@ public class QueryController {
         this.store = restGraphStore;
         this.project = activeProject;
         this.jsonCache = jsonCache;
+    }
+
+    /**
+     * Run arbitrary Cypher and return the rows. Used by the dashboard's Query view. We intentionally
+     * NOT cache these results — the user is iterating on queries and a stale answer would mislead.
+     *
+     * <p>Errors (bad syntax, unknown labels, etc.) come back as 400 with the backend's message
+     * instead of bubbling up as a 500 so the UI can render them inline.
+     *
+     * <p>The {@code projectId} param is auto-bound from the active project so the user's Cypher
+     * can reference {@code $pid} without having to know the value. Other named params can be
+     * passed alongside in the body, though the UI doesn't expose that yet.
+     */
+    @PostMapping("/query")
+    public ResponseEntity<?> runQuery(@RequestBody Map<String, Object> body) {
+        Object cypherObj = body == null ? null : body.get("cypher");
+        if (!(cypherObj instanceof String cypher) || cypher.isBlank()) {
+            return ResponseEntity.badRequest().body(Map.of("message", "missing 'cypher' string in request body"));
+        }
+        Map<String, Object> params = new LinkedHashMap<>();
+        params.put("pid", project.projectId());
+        if (body.get("params") instanceof Map<?, ?> userParams) {
+            for (Map.Entry<?, ?> e : userParams.entrySet()) {
+                if (e.getKey() != null) params.put(e.getKey().toString(), e.getValue());
+            }
+        }
+        try {
+            GraphStore.RawResult result = store.rawCypher(cypher, params);
+            // The UI expects a plain JSON array; deliver that for read results. For writes,
+            // we still return the rows array (often empty) so the UI's row-count badge works.
+            return ResponseEntity.ok(result.rows());
+        } catch (RuntimeException e) {
+            String msg = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+            return ResponseEntity.badRequest().body(Map.of("message", msg));
+        }
     }
 
     @GetMapping(value = "/search", produces = org.springframework.http.MediaType.APPLICATION_JSON_VALUE)

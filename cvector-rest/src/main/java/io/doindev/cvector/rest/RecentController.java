@@ -2,14 +2,13 @@ package io.doindev.cvector.rest;
 
 import io.doindev.cvector.core.store.GraphStore;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplication;
+import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.time.Duration;
-import java.util.List;
-import java.util.Map;
 
 /**
  * Recently-ingested nodes for the dashboard's "what changed since I last looked" panel.
@@ -26,18 +25,23 @@ public class RecentController {
 
     private final GraphStore store;
     private final ActiveProject project;
+    private final JsonCache jsonCache;
 
-    public RecentController(GraphStore restGraphStore, ActiveProject activeProject) {
+    public RecentController(GraphStore restGraphStore, ActiveProject activeProject, JsonCache jsonCache) {
         this.store = restGraphStore;
         this.project = activeProject;
+        this.jsonCache = jsonCache;
     }
 
-    @GetMapping("/recent")
-    public List<Map<String, Object>> recent(
+    @GetMapping(value = "/recent", produces = MediaType.APPLICATION_JSON_VALUE)
+    public byte[] recent(
             @RequestParam(value = "since", defaultValue = "24h") String since,
             @RequestParam(value = "limit", defaultValue = "25") int limit
     ) {
-        return store.recentlyChanged(project.projectId(), parseDuration(since), clamp(limit, 1, 250));
+        int safeLimit = clamp(limit, 1, 250);
+        String key = "recent:" + project.projectId() + ":" + since + ":" + safeLimit;
+        return jsonCache.memoize(key, () ->
+                store.recentlyChanged(project.projectId(), parseDuration(since), safeLimit));
     }
 
     /**

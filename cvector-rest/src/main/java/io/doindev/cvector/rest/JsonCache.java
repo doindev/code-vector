@@ -38,6 +38,9 @@ public class JsonCache {
 
     private final ObjectMapper mapper;
     private final ConcurrentMap<String, Entry> cache = new ConcurrentHashMap<>();
+    /** Hits + misses since last {@link #invalidateAll}. Same pattern as {@link GraphReadCache}. */
+    private final java.util.concurrent.atomic.AtomicLong hits = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong misses = new java.util.concurrent.atomic.AtomicLong();
 
     public JsonCache(ObjectMapper mapper) {
         this.mapper = mapper;
@@ -55,7 +58,11 @@ public class JsonCache {
     public byte[] memoize(String key, Duration ttl, Supplier<?> compute) {
         Instant now = Instant.now();
         Entry hit = cache.get(key);
-        if (hit != null && hit.expiresAt.isAfter(now)) return hit.bytes;
+        if (hit != null && hit.expiresAt.isAfter(now)) {
+            hits.incrementAndGet();
+            return hit.bytes;
+        }
+        misses.incrementAndGet();
         Object value = compute.get();
         byte[] bytes;
         try {
@@ -68,8 +75,14 @@ public class JsonCache {
         return bytes;
     }
 
+    /** Hit / miss counters reset on every {@link #invalidateAll}. */
+    public long hits() { return hits.get(); }
+    public long misses() { return misses.get(); }
+
     public void invalidateAll() {
         cache.clear();
+        hits.set(0);
+        misses.set(0);
     }
 
     /** {@link GraphMutatedEvent} clears the JSON cache so the next read recomputes. */

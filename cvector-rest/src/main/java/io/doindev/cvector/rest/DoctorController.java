@@ -61,12 +61,40 @@ public class DoctorController {
                 "uri", store.displayUri()
         ));
         out.put("jvm", jvmInfo());
-        out.put("cache", Map.of(
-                "objectEntries", cache.size(),
-                "jsonEntries", jsonCache.size()
-        ));
+        out.put("cache", buildCacheSummary());
         out.put("checks", runChecks());
         return out;
+    }
+
+    /**
+     * Roll up both cache layers' entries + hit/miss counters. Counters reset on every
+     * {@link GraphMutatedEvent}-driven invalidation (after each scan), so the surface here
+     * is "since the last scan" — which matches the time window operators usually care about.
+     */
+    private Map<String, Object> buildCacheSummary() {
+        Map<String, Object> obj = new LinkedHashMap<>();
+        obj.put("entries", cache.size());
+        obj.put("hits", cache.hits());
+        obj.put("misses", cache.misses());
+        obj.put("hitRate", hitRate(cache.hits(), cache.misses()));
+
+        Map<String, Object> json = new LinkedHashMap<>();
+        json.put("entries", jsonCache.size());
+        json.put("hits", jsonCache.hits());
+        json.put("misses", jsonCache.misses());
+        json.put("hitRate", hitRate(jsonCache.hits(), jsonCache.misses()));
+
+        Map<String, Object> all = new LinkedHashMap<>();
+        all.put("object", obj);
+        all.put("json", json);
+        return all;
+    }
+
+    private static double hitRate(long hits, long misses) {
+        long total = hits + misses;
+        if (total == 0) return 0.0;
+        // Two-decimal precision; the dashboard renders as a percentage so 0.81 = "81%".
+        return Math.round(((double) hits / total) * 100.0) / 100.0;
     }
 
     private List<Map<String, Object>> runChecks() {

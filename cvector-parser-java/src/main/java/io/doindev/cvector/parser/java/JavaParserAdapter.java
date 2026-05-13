@@ -12,13 +12,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Consumer;
-import java.util.stream.Stream;
 
 public class JavaParserAdapter implements Parser {
 
@@ -57,11 +55,18 @@ public class JavaParserAdapter implements Parser {
                 return;
             }
             CompilationUnit cu = result.getResult().get();
-            NodeKey fileKey = new NodeKey(ctx.projectId(), "File", ctx.rootPath().relativize(file).toString().replace('\\', '/'));
+            String relPath = ctx.rootPath().relativize(file).toString().replace('\\', '/');
+            NodeKey fileKey = new NodeKey(ctx.projectId(), "File", relPath);
             Map<String, Object> fileProps = new HashMap<>();
-            fileProps.put("path", ctx.rootPath().relativize(file).toString().replace('\\', '/'));
+            fileProps.put("path", relPath);
             fileProps.put("language", "java");
-            fileProps.put("lineCount", countLines(file));
+            // Use the parsed AST's end-of-file line position as the line count. Before, we
+            // re-read the entire file via {@code Files.lines(file).count()} which doubled
+            // I/O per Java file on the scan hot path (the parser already read the file).
+            // The AST range's end.line is effectively the line count for any non-empty file.
+            fileProps.put("lineCount", cu.getRange()
+                    .map(r -> (long) r.end.line)
+                    .orElse(0L));
             sink.accept(new GraphEvent.NodeUpsert(fileKey, fileProps));
 
             new CvectorJavaVisitor(ctx, fileKey, sink).visit(cu, null);
@@ -69,14 +74,6 @@ public class JavaParserAdapter implements Parser {
             log.warn("failed to read {}: {}", file, e.getMessage());
         } catch (RuntimeException e) {
             log.warn("failed to parse {}: {}", file, e.getMessage());
-        }
-    }
-
-    private static long countLines(Path file) {
-        try (Stream<String> lines = Files.lines(file)) {
-            return lines.count();
-        } catch (IOException e) {
-            return 0L;
         }
     }
 }

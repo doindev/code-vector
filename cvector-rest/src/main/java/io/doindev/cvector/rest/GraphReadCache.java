@@ -44,6 +44,9 @@ public class GraphReadCache {
     private static final int MAX_ENTRIES = 4096;
 
     private final ConcurrentMap<String, Entry> cache = new ConcurrentHashMap<>();
+    /** Hits + misses since last {@link #invalidateAll}. Surfaced on /api/doctor so operators can see if the cache is actually doing useful work. */
+    private final java.util.concurrent.atomic.AtomicLong hits = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong misses = new java.util.concurrent.atomic.AtomicLong();
 
     /** Memoise {@code compute} under {@code key} using the default TTL. */
     public <T> T memoize(String key, Supplier<T> compute) {
@@ -54,12 +57,20 @@ public class GraphReadCache {
     public <T> T memoize(String key, Duration ttl, Supplier<T> compute) {
         Instant now = Instant.now();
         Entry hit = cache.get(key);
-        if (hit != null && hit.expiresAt.isAfter(now)) return (T) hit.value;
+        if (hit != null && hit.expiresAt.isAfter(now)) {
+            hits.incrementAndGet();
+            return (T) hit.value;
+        }
+        misses.incrementAndGet();
         T value = compute.get();
         if (cache.size() >= MAX_ENTRIES) sweep(now);
         cache.put(key, new Entry(value, now.plus(ttl)));
         return value;
     }
+
+    /** Hit / miss counters reset on every {@link #invalidateAll} (i.e. after every scan). */
+    public long hits() { return hits.get(); }
+    public long misses() { return misses.get(); }
 
     /**
      * Two-pass eviction. First drop everything that already expired (cheap and correct).
@@ -83,6 +94,10 @@ public class GraphReadCache {
     /** Drop all cached entries. Used after a scan completes so views see fresh data immediately. */
     public void invalidateAll() {
         cache.clear();
+        // Reset counters too so hit rate reflects the post-scan window the operator is asking
+        // about, not pre-scan stats that no longer correspond to live data.
+        hits.set(0);
+        misses.set(0);
     }
 
     /**

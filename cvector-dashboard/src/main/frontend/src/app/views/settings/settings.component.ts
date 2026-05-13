@@ -60,10 +60,22 @@ interface SettingsPatch {
         </div>
       </div>
       <div class="d-flex gap-2 align-items-center">
-        @if (restartRequired()) {
+        @if (restartRequired() && !restarting()) {
+          <button class="btn btn-sm btn-warning" (click)="restartServer()">
+            <i class="bi bi-arrow-clockwise"></i>
+            Restart required — click to restart
+          </button>
+        }
+        @if (restarting()) {
           <span class="badge text-bg-warning">
-            <i class="bi bi-exclamation-triangle"></i>
-            Restart required
+            <i class="bi bi-arrow-repeat"></i>
+            Restarting… {{ restartElapsed() }}s
+          </span>
+        }
+        @if (restartError()) {
+          <span class="badge text-bg-danger" [title]="restartError()">
+            <i class="bi bi-exclamation-octagon"></i>
+            Restart failed
           </span>
         }
         @if (saved()) {
@@ -233,6 +245,9 @@ export class SettingsComponent implements OnInit {
   readonly data = signal<SettingsResponse | null>(null);
   readonly error = signal('');
   readonly restartRequired = signal(false);
+  readonly restarting = signal(false);
+  readonly restartError = signal('');
+  readonly restartElapsed = signal(0);
   readonly saved = signal(false);
 
   readonly backend = signal<Backend>('embedded');
@@ -327,5 +342,65 @@ export class SettingsComponent implements OnInit {
         },
         error: (err) => this.error.set(err?.error?.message ?? err?.message ?? 'Failed to save settings'),
       });
+  }
+
+  /**
+   * POST /api/dashboard/restart, then poll /api/health until the new JVM is reachable and
+   * reload the page. The server spawns a detached replacement before shutting itself down,
+   * so the URL stays the same — just need to wait for the new process to bind the port.
+   */
+  restartServer(): void {
+    this.restarting.set(true);
+    this.restartError.set('');
+    this.restartElapsed.set(0);
+    const startedAt = Date.now();
+    this.http.post<{ ok: boolean; reason?: string; message?: string }>(
+      '/api/dashboard/restart', null,
+    ).subscribe({
+      next: () => this.pollForRecovery(startedAt),
+      error: (err) => {
+        // Spring sends the 202 response then exits; the HttpClient may surface the dropped
+        // connection as an error AFTER the response was actually received. If we got that
+        // far, treat it as a successful kickoff and start polling.
+        if (err?.status === 0 || err?.status === 202) {
+          this.pollForRecovery(startedAt);
+          return;
+        }
+        this.restarting.set(false);
+        const reason = err?.error?.reason ?? err?.error?.message ?? err?.message;
+        this.restartError.set('Restart failed: ' + (reason ?? 'server error'));
+      },
+    });
+  }
+
+  private pollForRecovery(startedAt: number): void {
+    // Poll every 500 ms for up to 45 s. The new JVM typically binds the port within 5-10 s
+    // on a warm OS file cache; allow generous slack for cold boots / antivirus scans.
+    const intervalMs = 500;
+    const maxMs = 45_000;
+    const tick = () => {
+      const elapsed = Date.now() - startedAt;
+      this.restartElapsed.set(Math.round(elapsed / 1000));
+      if (elapsed > maxMs) {
+        this.restarting.set(false);
+        this.restartError.set('Restart timed out — check the terminal');
+        return;
+      }
+      // Wait at least 1 s before the first probe so the old JVM has a chance to release
+      // the port (otherwise the probe hits the dying old server and returns 200 falsely).
+      if (elapsed < 1500) {
+        setTimeout(tick, intervalMs);
+        return;
+      }
+      fetch('/api/health', { cache: 'no-store' })
+        .then((r) => (r.ok ? r.text() : Promise.reject(new Error('not-ok'))))
+        .then(() => {
+          // Reload to pick up any frontend bundle changes shipped by the new JVM and to
+          // re-fetch all view data fresh.
+          window.location.reload();
+        })
+        .catch(() => setTimeout(tick, intervalMs));
+    };
+    setTimeout(tick, 500);
   }
 }

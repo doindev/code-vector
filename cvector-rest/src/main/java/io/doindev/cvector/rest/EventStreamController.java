@@ -105,9 +105,15 @@ public class EventStreamController {
     }
 
     private void broadcast(String name, Object payload) {
+        // Pre-build the SseEventBuilder once and reuse for every emitter. Spring's
+        // SseEmitter#send turns the builder into wire bytes per emitter; the prior code
+        // also rebuilt the builder per iteration. With multiple dashboard tabs / clients
+        // open, the same payload was being assembled N times. Building once avoids the
+        // duplicate work; the builder is immutable enough to share across sends.
+        SseEmitter.SseEventBuilder event = SseEmitter.event().name(name).data(payload);
         for (SseEmitter emitter : emitters) {
             try {
-                emitter.send(SseEmitter.event().name(name).data(payload));
+                emitter.send(event);
             } catch (IOException e) {
                 emitters.remove(emitter);
                 try { emitter.completeWithError(e); } catch (RuntimeException ignored) { }

@@ -28,14 +28,17 @@ public class DashboardController {
     private final MonitorRunner monitors;
     private final ScanRunner scans;
     private final DiffRunner diffs;
+    private final RestartRunner restarts;
 
     public DashboardController(DashboardStore store, ScheduleRunner scheduler,
-                               MonitorRunner monitors, ScanRunner scans, DiffRunner diffs) {
+                               MonitorRunner monitors, ScanRunner scans, DiffRunner diffs,
+                               RestartRunner restarts) {
         this.store = store;
         this.scheduler = scheduler;
         this.monitors = monitors;
         this.scans = scans;
         this.diffs = diffs;
+        this.restarts = restarts;
     }
 
     // Monitors -----------------------------------------------------------------------
@@ -129,6 +132,26 @@ public class DashboardController {
     @GetMapping("/diff/status")
     public Map<String, Object> diffStatus() {
         return diffs.status();
+    }
+
+    // Restart ----------------------------------------------------------------------
+
+    /**
+     * Spawn a detached replacement JVM running {@code cvector dashboard} and gracefully shut
+     * the current one down ~700 ms later. The UI polls {@code /api/health} to know when the
+     * new process is reachable and reloads. Returns 202 Accepted on success; 409 Conflict
+     * if a restart is already in flight; 400 if no jar can be located (running from IDE).
+     */
+    @PostMapping("/restart")
+    public ResponseEntity<Map<String, Object>> restart() {
+        Map<String, Object> result = restarts.restart();
+        boolean ok = result.get("ok") instanceof Boolean b && b;
+        if (!ok) {
+            Object reason = result.get("reason");
+            if ("already-restarting".equals(reason)) return ResponseEntity.status(409).body(result);
+            return ResponseEntity.badRequest().body(result);
+        }
+        return ResponseEntity.accepted().body(result);
     }
 
     // Schedules ----------------------------------------------------------------------

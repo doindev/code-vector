@@ -651,6 +651,7 @@ public class ScanCommand implements Callable<Integer> {
                 case ".gradle":     // Gradle daemon cache
                 case ".idea":       // JetBrains IDE metadata
                 case ".vscode":     // VS Code metadata
+                case ".angular":    // Angular CLI .angular/cache
                 case ".git":
                 case ".cvector":
                     return false;
@@ -658,6 +659,14 @@ public class ScanCommand implements Callable<Integer> {
                     // continue scanning path components
             }
         }
+        // Path-substring rules for generated build outputs that live under {@code resources/}
+        // (Spring Boot's classpath:/static convention). The Angular-built dashboard SPA lands
+        // at {@code src/main/resources/static/dashboard/browser/} — minified hashed chunks
+        // that look like source to the TS/JS parser but produce nothing useful in the graph
+        // (and are wildly expensive to parse). Treat any path containing
+        // {@code /resources/static/} as build output regardless of where it lives.
+        String full = p.toString().replace('\\', '/');
+        if (full.contains("/resources/static/")) return false;
         return true;
     }
 }

@@ -59,6 +59,8 @@ class CvectorJavaVisitor extends VoidVisitorAdapter<Void> {
     private final Consumer<GraphEvent> sink;
     private NodeKey currentClass;
     private NodeKey currentMethod;
+    /** Synthetic {@code <clinit>} Method node for the current class, lazily created on the first static-field initialiser visit. Reset on every class entry so each class has its own. */
+    private NodeKey currentClinit;
     private String currentBasePath = "";
     private Map<String, String> classLocalMethods = Map.of();
 
@@ -131,12 +133,51 @@ class CvectorJavaVisitor extends VoidVisitorAdapter<Void> {
             com.github.javaparser.ast.body.TypeDeclaration<?> typeDecl, String typeFqName) {
         Map<String, String> out = new java.util.HashMap<>();
         for (MethodDeclaration m : typeDecl.getMethods()) {
-            String key = m.getNameAsString() + ":" + m.getParameters().size();
+            int paramCount = m.getParameters().size();
+            String name = m.getNameAsString();
+            String fqSignature = typeFqName + "." + m.getSignature().asString();
             // Avoid resolve() in this hot helper; the fallback signature matches what
             // visit(MethodDeclaration) emits for the Method node.
-            out.putIfAbsent(key, typeFqName + "." + m.getSignature().asString());
+            out.putIfAbsent(name + ":" + paramCount, fqSignature);
+            // Varargs entry: a method declared {@code foo(A, B... bs)} is callable with any
+            // arity ≥ paramCount-1 (the fixed-prefix count). Without this entry, calls like
+            // {@code foo(a, b1, b2, b3)} resolve to {@code unresolved.foo:4} and the dead-code
+            // detector falsely flags the varargs target as unused. The {@code @v<min>} suffix
+            // distinguishes varargs entries from exact-arity entries; the call-site visitor
+            // walks them when exact match fails.
+            if (paramCount > 0 && m.getParameter(paramCount - 1).isVarArgs()) {
+                out.putIfAbsent(name + "@v" + (paramCount - 1), fqSignature);
+            }
         }
         return out;
+    }
+
+    /**
+     * Two-phase lookup for same-class method calls. First try exact {@code name:arity}; if
+     * that misses, walk every varargs marker {@code name@v<min>} and accept the first whose
+     * {@code min} is ≤ the call's arity. This fixes the "varargs target falsely flagged dead"
+     * symptom we saw on {@code WikiController.row(Object...)}, {@code GitHelper.run(String...)},
+     * etc.
+     */
+    private String resolveLocalCall(String name, int arity) {
+        String exact = classLocalMethods.get(name + ":" + arity);
+        if (exact != null) return exact;
+        // Varargs fallback: try the widest minimum first (most-specific varargs win).
+        String best = null;
+        int bestMin = -1;
+        for (Map.Entry<String, String> e : classLocalMethods.entrySet()) {
+            String k = e.getKey();
+            int sep = k.indexOf("@v");
+            if (sep < 0) continue;
+            if (!k.regionMatches(0, name, 0, name.length()) || sep != name.length()) continue;
+            int min;
+            try { min = Integer.parseInt(k.substring(sep + 2)); } catch (NumberFormatException nfe) { continue; }
+            if (min <= arity && min > bestMin) {
+                best = e.getValue();
+                bestMin = min;
+            }
+        }
+        return best;
     }
 
     @Override
@@ -210,7 +251,50 @@ class CvectorJavaVisitor extends VoidVisitorAdapter<Void> {
             sink.accept(new GraphEvent.NodeUpsert(key, props));
             sink.accept(new GraphEvent.EdgeUpsert(currentClass, "CONTAINS", key, Map.of()));
         }
-        super.visit(n, arg);
+        // Attribute calls inside the initializer expression to a synthetic per-class
+        // {@code <clinit>} method node so static-field initialiser calls like
+        // {@code static final Map M = nodeColumns();} produce CALLS edges into the
+        // referenced helpers. Without this, the field-initialiser MethodCallExprs are
+        // visited but {@code currentMethod} is null and the call is dropped — which is
+        // exactly the false-positive "no incoming CALLS edges" pattern that {@code dead-code}
+        // flags on {@code KuzuSchemaBootstrap.nodeColumns()} / {@code .buildNodeDdl()}.
+        boolean hasInitializerCall = n.getVariables().stream()
+                .anyMatch(v -> v.getInitializer().isPresent());
+        if (hasInitializerCall) {
+            NodeKey synthetic = ensureClinit();
+            NodeKey saved = currentMethod;
+            currentMethod = synthetic;
+            try {
+                super.visit(n, arg);
+            } finally {
+                currentMethod = saved;
+            }
+        } else {
+            super.visit(n, arg);
+        }
+    }
+
+    /** Lazily create a {@code <clinit>} Method node for the current class. Cached on the class entry. */
+    private NodeKey ensureClinit() {
+        if (currentClass == null) return null;
+        if (currentClinit != null) return currentClinit;
+        String fqName = currentClass.fqName() + ".<clinit>()";
+        NodeKey key = new NodeKey(ctx.projectId(), "Method", fqName);
+        Map<String, Object> props = new HashMap<>();
+        props.put("name", "<clinit>");
+        props.put("fqName", fqName);
+        props.put("signature", "<clinit>()");
+        props.put("returnType", "void");
+        props.put("paramCount", 0);
+        props.put("isStatic", true);
+        props.put("isConstructor", false);
+        props.put("visibility", "PRIVATE");
+        props.put("fileId", fileKey.id());
+        props.put("classId", currentClass.id());
+        sink.accept(new GraphEvent.NodeUpsert(key, props));
+        sink.accept(new GraphEvent.EdgeUpsert(currentClass, "CONTAINS", key, Map.of()));
+        currentClinit = key;
+        return key;
     }
 
     @Override
@@ -226,7 +310,10 @@ class CvectorJavaVisitor extends VoidVisitorAdapter<Void> {
         double confidence;
         String calleeFq = null;
         if (n.getScope().isEmpty()) {
-            String local = classLocalMethods.get(name + ":" + arity);
+            // Two-phase: exact arity first, then varargs fallback. Without the second pass
+            // a call to {@code row("a", "b", "c")} doesn't resolve to a declared
+            // {@code row(Object...)} and the target lands in the dead-code report.
+            String local = resolveLocalCall(name, arity);
             if (local != null) {
                 calleeFq = local;
                 confidence = 0.8;
@@ -445,8 +532,13 @@ class CvectorJavaVisitor extends VoidVisitorAdapter<Void> {
 
     private void withinClass(NodeKey key, Runnable body) {
         NodeKey prev = currentClass;
+        NodeKey prevClinit = currentClinit;
         currentClass = key;
-        try { body.run(); } finally { currentClass = prev; }
+        currentClinit = null;  // each class gets its own lazily-created <clinit>
+        try { body.run(); } finally {
+            currentClass = prev;
+            currentClinit = prevClinit;
+        }
     }
 
     private void withinMethod(NodeKey key, Runnable body) {
