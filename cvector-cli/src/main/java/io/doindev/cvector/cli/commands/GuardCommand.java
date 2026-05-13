@@ -20,7 +20,7 @@ import java.util.Set;
 import java.util.concurrent.Callable;
 
 @Component
-@Command(name = "guard", description = "Quality gate: run rules and exit non-zero on violations (CI mode).")
+@Command(name = "guard", description = "Quality gate: run rules and exit non-zero on violations (CI mode).", mixinStandardHelpOptions = true)
 public class GuardCommand implements Callable<Integer> {
 
     @Option(names = "--ci", description = "Exit code 1 on any ERROR-severity violation.")

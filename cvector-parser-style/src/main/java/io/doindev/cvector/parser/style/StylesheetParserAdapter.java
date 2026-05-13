@@ -92,19 +92,43 @@ public class StylesheetParserAdapter implements Parser {
             log.warn("could not read {}: {}", file, e.getMessage());
             return;
         }
-        Dialect dialect = detectDialect(file);
+        parseSource(source, file, null, ctx, sink, true);
+    }
+
+    /**
+     * Parse a stylesheet source string. Used by the Vue SFC parser to pipe {@code <style>}
+     * block contents through the same collector chain without first writing to disk.
+     *
+     * @param source        the stylesheet text
+     * @param identityPath  path the resulting node identities derive from (the {@code File}
+     *                      NodeKey and CssClass/DesignToken fqNames are keyed off this). For Vue
+     *                      this is the .vue file path so nodes attribute back to the SFC.
+     * @param dialectHint   optional explicit dialect name ({@code "CSS"}, {@code "SCSS"},
+     *                      {@code "SASS"}, {@code "LESS"}, {@code "STYLUS"}). When null, derived
+     *                      from {@code identityPath}'s extension. Set this for Vue's
+     *                      {@code <style lang="scss">} since the .vue extension hides the dialect.
+     * @param emitFileNode  pass {@code false} when the caller has already emitted a File node
+     *                      for {@code identityPath}.
+     */
+    public void parseSource(String source, Path identityPath, String dialectHint,
+                            ProjectContext ctx, Consumer<GraphEvent> sink, boolean emitFileNode) {
+        Dialect dialect = (dialectHint != null)
+                ? Dialect.valueOf(dialectHint.toUpperCase(java.util.Locale.ROOT))
+                : detectDialect(identityPath);
         String stripped = stripComments(source, dialect.supportsLineComments);
-        String relPath = ctx.rootPath().relativize(file).toString().replace('\\', '/');
+        String relPath = ctx.rootPath().relativize(identityPath).toString().replace('\\', '/');
         String language = dialect.name().toLowerCase();
         boolean isModule = relPath.toLowerCase().contains(".module.");
 
         NodeKey fileKey = new NodeKey(ctx.projectId(), "File", relPath);
-        Map<String, Object> fileProps = new HashMap<>();
-        fileProps.put("path", relPath);
-        fileProps.put("language", language);
-        fileProps.put("lineCount", source.lines().count());
-        if (isModule) fileProps.put("cssModule", true);
-        sink.accept(new GraphEvent.NodeUpsert(fileKey, fileProps));
+        if (emitFileNode) {
+            Map<String, Object> fileProps = new HashMap<>();
+            fileProps.put("path", relPath);
+            fileProps.put("language", language);
+            fileProps.put("lineCount", source.lines().count());
+            if (isModule) fileProps.put("cssModule", true);
+            sink.accept(new GraphEvent.NodeUpsert(fileKey, fileProps));
+        }
 
         collectImports(stripped, ctx, fileKey, sink);
         collectCustomProperties(stripped, ctx, fileKey, sink);

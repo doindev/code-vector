@@ -12,7 +12,7 @@ import java.util.Map;
 import java.util.concurrent.Callable;
 
 @Component
-@Command(name = "service-links", description = "Cross-service dependencies via HTTP clients, queues, and topics.")
+@Command(name = "service-links", description = "Cross-service dependencies via HTTP clients, queues, and topics.", mixinStandardHelpOptions = true)
 public class ServiceLinksCommand implements Callable<Integer> {
 
     private final CvectorRuntime runtime;

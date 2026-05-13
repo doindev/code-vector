@@ -22,7 +22,7 @@ import java.util.Map;
 import java.util.concurrent.Callable;
 
 @Component
-@Command(name = "rules", description = "Evaluate architecture rules against the active project's graph.")
+@Command(name = "rules", description = "Evaluate architecture rules against the active project's graph.", mixinStandardHelpOptions = true)
 public class RulesCommand implements Callable<Integer> {
 
     @Option(names = "--init", description = "Write a template .cvector/rules.yml in the active project.")

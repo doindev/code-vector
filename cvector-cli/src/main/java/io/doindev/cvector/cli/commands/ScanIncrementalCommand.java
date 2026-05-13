@@ -21,7 +21,7 @@ import java.util.Optional;
 import java.util.concurrent.Callable;
 
 @Component
-@Command(name = "scan:incremental", description = "Re-parse only files changed since the last scan (git-diff-driven).")
+@Command(name = "scan:incremental", description = "Re-parse only files changed since the last scan (git-diff-driven).", mixinStandardHelpOptions = true)
 public class ScanIncrementalCommand implements Callable<Integer> {
 
     @Parameters(index = "0", arity = "0..1", description = "Project root (default: current directory).")

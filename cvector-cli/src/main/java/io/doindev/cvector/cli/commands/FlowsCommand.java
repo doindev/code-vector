@@ -12,7 +12,7 @@ import java.util.Map;
 import java.util.concurrent.Callable;
 
 @Component
-@Command(name = "flows", description = "Trace execution flows from entry points through the call graph.")
+@Command(name = "flows", description = "Trace execution flows from entry points through the call graph.", mixinStandardHelpOptions = true)
 public class FlowsCommand implements Callable<Integer> {
 
     @Option(names = "--max-depth", description = "Max BFS depth from each entry point (default 4).")

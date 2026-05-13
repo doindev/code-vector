@@ -16,10 +16,12 @@ public class StatsController {
 
     private final GraphStore store;
     private final ActiveProject project;
+    private final GraphReadCache cache;
 
-    public StatsController(GraphStore restGraphStore, ActiveProject activeProject) {
+    public StatsController(GraphStore restGraphStore, ActiveProject activeProject, GraphReadCache cache) {
         this.store = restGraphStore;
         this.project = activeProject;
+        this.cache = cache;
     }
 
     @GetMapping("/health")
@@ -36,12 +38,14 @@ public class StatsController {
 
     @GetMapping("/stats")
     public Map<String, Object> stats() {
-        Map<String, Object> out = new LinkedHashMap<>();
-        out.put("project", project.name());
-        out.put("projectId", project.projectId());
-        out.put("nodes", store.nodeCounts(project.projectId()));
-        out.put("edges", store.edgeCounts(project.projectId()));
-        return out;
+        return cache.memoize("stats:" + project.projectId(), () -> {
+            Map<String, Object> out = new LinkedHashMap<>();
+            out.put("project", project.name());
+            out.put("projectId", project.projectId());
+            out.put("nodes", store.nodeCounts(project.projectId()));
+            out.put("edges", store.edgeCounts(project.projectId()));
+            return out;
+        });
     }
 
     @GetMapping("/projects")

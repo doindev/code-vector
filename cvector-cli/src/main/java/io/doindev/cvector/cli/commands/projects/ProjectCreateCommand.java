@@ -16,7 +16,7 @@ import java.util.UUID;
 import java.util.concurrent.Callable;
 
 @Component
-@Command(name = "create", description = "Create a new project in the workspace.")
+@Command(name = "create", description = "Create a new project in the workspace.", mixinStandardHelpOptions = true)
 public class ProjectCreateCommand implements Callable<Integer> {
 
     @Parameters(index = "0", description = "Project name.")

@@ -12,7 +12,7 @@ import java.util.Map;
 import java.util.concurrent.Callable;
 
 @Component
-@Command(name = "onboard", description = "One-command codebase briefing from the active project's graph.")
+@Command(name = "onboard", description = "One-command codebase briefing from the active project's graph.", mixinStandardHelpOptions = true)
 public class OnboardCommand implements Callable<Integer> {
 
     private final CvectorRuntime runtime;

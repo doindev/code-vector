@@ -10,7 +10,7 @@ import java.util.Map;
 import java.util.concurrent.Callable;
 
 @Component
-@Command(name = "status", description = "Show project graph statistics.")
+@Command(name = "status", description = "Show project graph statistics.", mixinStandardHelpOptions = true)
 public class StatusCommand implements Callable<Integer> {
 
     private final CvectorRuntime runtime;

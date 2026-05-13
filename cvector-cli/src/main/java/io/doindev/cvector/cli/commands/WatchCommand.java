@@ -27,7 +27,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Stream;
 
 @Component
-@Command(name = "watch", description = "Live file watcher (default) or scheduled re-scan via --cron.")
+@Command(name = "watch", description = "Live file watcher (default) or scheduled re-scan via --cron.", mixinStandardHelpOptions = true)
 public class WatchCommand implements Callable<Integer> {
 
     @Parameters(index = "0", arity = "0..1", description = "Directory to watch (default: current directory).")

@@ -13,7 +13,7 @@ import java.util.Map;
 import java.util.concurrent.Callable;
 
 @Component
-@Command(name = "explain", description = "Show full context for a symbol: type, file, callers, callees.")
+@Command(name = "explain", description = "Show full context for a symbol: type, file, callers, callees.", mixinStandardHelpOptions = true)
 public class ExplainCommand implements Callable<Integer> {
 
     @Parameters(index = "0", description = "Symbol name (fully qualified or last segment).")

@@ -121,7 +121,11 @@ public final class KuzuBulkLoader implements GraphIngestor {
         } catch (IOException e) {
             throw new UncheckedIOException("failed writing nodes.csv", e);
         }
-        kuzu.write("COPY Node FROM '" + csv.toString().replace('\\', '/') + "'");
+        // PARALLEL=FALSE: cvector emits node properties that legitimately contain newlines and
+        // embedded quotes (config-key values pulled from Dockerfiles, YAML, shell snippets, etc.).
+        // Kuzu's parallel CSV reader rejects quoted newlines mid-record. Single-threaded read is
+        // slower but correct on heterogeneous source data.
+        kuzu.write("COPY Node FROM '" + csv.toString().replace('\\', '/') + "' (PARALLEL=FALSE)");
         totalNodes += nodeBuffer.size();
         nodeBuffer.clear();
     }
@@ -144,7 +148,7 @@ public final class KuzuBulkLoader implements GraphIngestor {
                 throw new UncheckedIOException("failed writing edges-" + type + ".csv", e);
             }
             try {
-                kuzu.write("COPY " + type + " FROM '" + csv.toString().replace('\\', '/') + "'");
+                kuzu.write("COPY " + type + " FROM '" + csv.toString().replace('\\', '/') + "' (PARALLEL=FALSE)");
             } catch (RuntimeException ex) {
                 // An edge whose endpoint isn't in the Node table after the COPY (rare — only
                 // happens if a parser emits an edge to/from a node it never declared) makes the

@@ -70,7 +70,7 @@ public class KuzuIngestor implements GraphIngestor {
             "groupId", "artifactId", "version", "versionSource",
             "repository", "tag", "digest", "baseImage",
             "port", "protocol", "command", "rootPath",
-            "lastScanCommit", "contentHash"
+            "lastScanCommit", "contentHash", "fileContentHash"
     );
     /** Lookup set derived from {@link #NODE_PROPERTY_ORDER}. */
     static final Set<String> NODE_PROPERTY_NAMES = Set.copyOf(NODE_PROPERTY_ORDER);

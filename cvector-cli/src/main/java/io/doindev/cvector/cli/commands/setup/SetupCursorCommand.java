@@ -9,7 +9,7 @@ import java.nio.file.Path;
 import java.util.concurrent.Callable;
 
 @Component
-@Command(name = "setup-cursor", description = "Register cvector as an MCP server in .cursor/mcp.json for this project.")
+@Command(name = "setup-cursor", description = "Register cvector as an MCP server in .cursor/mcp.json for this project.", mixinStandardHelpOptions = true)
 public class SetupCursorCommand implements Callable<Integer> {
 
     @Option(names = "--name", description = "Server entry name (default 'cvector').")

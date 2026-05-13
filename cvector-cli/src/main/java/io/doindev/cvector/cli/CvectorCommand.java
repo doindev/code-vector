@@ -24,6 +24,7 @@ import io.doindev.cvector.cli.commands.SearchCommand;
 import io.doindev.cvector.cli.commands.ServeCommand;
 import io.doindev.cvector.cli.commands.ServiceLinksCommand;
 import io.doindev.cvector.cli.commands.StatusCommand;
+import io.doindev.cvector.cli.commands.StopCommand;
 import io.doindev.cvector.cli.commands.WatchCommand;
 import io.doindev.cvector.cli.commands.WikiCommand;
 import io.doindev.cvector.cli.commands.embedded.EmbeddedCommand;
@@ -74,6 +75,7 @@ import java.util.concurrent.Callable;
                 CiCommand.class,
                 DashboardCommand.class,
                 ServeCommand.class,
+                StopCommand.class,
                 SetupClaudeCommand.class,
                 SetupCursorCommand.class,
                 SetupWindsurfCommand.class,

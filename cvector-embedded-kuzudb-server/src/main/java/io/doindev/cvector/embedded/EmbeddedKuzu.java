@@ -2,6 +2,7 @@ package io.doindev.cvector.embedded;
 
 import com.kuzudb.Connection;
 import com.kuzudb.Database;
+import com.kuzudb.DataTypeID;
 import com.kuzudb.FlatTuple;
 import com.kuzudb.PreparedStatement;
 import com.kuzudb.QueryResult;
@@ -222,12 +223,38 @@ public final class EmbeddedKuzu implements AutoCloseable {
 
     private static Object unwrap(Value v) {
         if (v == null || v.isNull()) return null;
+        // LIST/ARRAY values: Kuzu's typed getValue() throws (the templated <T> can't infer
+        // a container type), and toString() produces a single string like "[a, b, c]" that
+        // serialises poorly over JSON. Parse the toString form into a real Java list so
+        // controllers can return it as a JSON array.
+        DataTypeID kind = null;
+        try { kind = v.getDataType().getID(); } catch (RuntimeException ignored) { }
+        if (kind == DataTypeID.LIST || kind == DataTypeID.ARRAY) {
+            return parseKuzuListString(v.toString());
+        }
         try {
             return v.getValue();
         } catch (RuntimeException e) {
-            // Composite types (nodes, rels, structs, lists) fall back to their toString().
+            // Other composite types (nodes, rels, structs, maps) fall back to their toString().
             return v.toString();
         }
+    }
+
+    /**
+     * Parse Kuzu's list toString form — {@code [a,b,c]} with no quoting around elements — into
+     * a {@code List<String>}. Whitespace after the comma is tolerated since formats vary across
+     * Kuzu releases. Returns an empty list for the literal {@code []}.
+     */
+    private static List<String> parseKuzuListString(String s) {
+        if (s == null || s.length() < 2 || s.charAt(0) != '[' || s.charAt(s.length() - 1) != ']') {
+            return List.of();
+        }
+        String inner = s.substring(1, s.length() - 1).trim();
+        if (inner.isEmpty()) return List.of();
+        String[] parts = inner.split(",");
+        List<String> out = new ArrayList<>(parts.length);
+        for (String p : parts) out.add(p.trim());
+        return out;
     }
 
     @Override

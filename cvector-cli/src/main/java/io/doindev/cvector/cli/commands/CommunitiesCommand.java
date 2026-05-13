@@ -19,7 +19,7 @@ import java.util.Map;
 import java.util.concurrent.Callable;
 
 @Component
-@Command(name = "communities", description = "Detect functional clusters in the call graph.")
+@Command(name = "communities", description = "Detect functional clusters in the call graph.", mixinStandardHelpOptions = true)
 public class CommunitiesCommand implements Callable<Integer> {
 
     @Option(names = "--algorithm",

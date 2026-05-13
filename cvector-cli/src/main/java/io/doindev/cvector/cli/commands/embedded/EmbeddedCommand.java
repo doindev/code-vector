@@ -29,6 +29,7 @@ import java.util.stream.Stream;
 @Command(
         name = "embedded",
         description = "Manage the embedded KuzuDB store for the active project.",
+        mixinStandardHelpOptions = true,
         subcommands = {
                 EmbeddedCommand.Init.class,
                 EmbeddedCommand.Info.class,
@@ -54,7 +55,7 @@ public class EmbeddedCommand implements Callable<Integer> {
     }
 
     @Component
-    @Command(name = "init", description = "Create the embedded database directory and bootstrap its schema.")
+    @Command(name = "init", description = "Create the embedded database directory and bootstrap its schema.", mixinStandardHelpOptions = true)
     public static class Init implements Callable<Integer> {
         private final CvectorRuntime runtime;
         public Init(CvectorRuntime runtime) { this.runtime = runtime; }
@@ -71,7 +72,7 @@ public class EmbeddedCommand implements Callable<Integer> {
     }
 
     @Component
-    @Command(name = "info", description = "Show the embedded database path, size, and table inventory.")
+    @Command(name = "info", description = "Show the embedded database path, size, and table inventory.", mixinStandardHelpOptions = true)
     public static class Info implements Callable<Integer> {
         private final CvectorRuntime runtime;
         public Info(CvectorRuntime runtime) { this.runtime = runtime; }
@@ -106,7 +107,7 @@ public class EmbeddedCommand implements Callable<Integer> {
     }
 
     @Component
-    @Command(name = "query", description = "Run an ad-hoc Cypher query against the embedded database.")
+    @Command(name = "query", description = "Run an ad-hoc Cypher query against the embedded database.", mixinStandardHelpOptions = true)
     public static class Query implements Callable<Integer> {
         @Parameters(index = "0", description = "Cypher query to execute.")
         String cypher;
@@ -136,7 +137,7 @@ public class EmbeddedCommand implements Callable<Integer> {
     }
 
     @Component
-    @Command(name = "wipe", description = "Delete the embedded database directory for the active project.")
+    @Command(name = "wipe", description = "Delete the embedded database directory for the active project.", mixinStandardHelpOptions = true)
     public static class Wipe implements Callable<Integer> {
         private final CvectorRuntime runtime;
         public Wipe(CvectorRuntime runtime) { this.runtime = runtime; }

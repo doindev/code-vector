@@ -35,7 +35,8 @@ import java.util.stream.Stream;
 
 @Component
 @Command(name = "diff",
-        description = "Compare graph drift between two git commits: cvector diff <sha1> <sha2>.")
+        description = "Compare graph drift between two git commits: cvector diff <sha1> <sha2>.",
+        mixinStandardHelpOptions = true)
 public class DiffCommand implements Callable<Integer> {
 
     @Parameters(index = "0", description = "Base commit (older).")

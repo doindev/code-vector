@@ -16,7 +16,7 @@ import java.util.UUID;
 import java.util.concurrent.Callable;
 
 @Component
-@Command(name = "init", description = "Initialize cvector in the current directory.")
+@Command(name = "init", description = "Initialize cvector in the current directory.", mixinStandardHelpOptions = true)
 public class InitCommand implements Callable<Integer> {
 
     private static final String COMPOSE_TEMPLATE = """

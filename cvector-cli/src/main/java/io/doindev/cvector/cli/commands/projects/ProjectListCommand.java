@@ -8,7 +8,7 @@ import picocli.CommandLine.Command;
 import java.util.concurrent.Callable;
 
 @Component
-@Command(name = "list", description = "List all projects in the workspace.")
+@Command(name = "list", description = "List all projects in the workspace.", mixinStandardHelpOptions = true)
 public class ProjectListCommand implements Callable<Integer> {
 
     private final CvectorRuntime runtime;

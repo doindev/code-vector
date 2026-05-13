@@ -15,7 +15,7 @@ import java.util.Map;
 import java.util.concurrent.Callable;
 
 @Component
-@Command(name = "changelog", description = "Auto-generate a changelog from recent graph changes (uses lastIngestedAt).")
+@Command(name = "changelog", description = "Auto-generate a changelog from recent graph changes (uses lastIngestedAt).", mixinStandardHelpOptions = true)
 public class ChangelogCommand implements Callable<Integer> {
 
     @Option(names = "--since", description = "Time window: 24h, 7d, 30m, etc. (default 7d).")

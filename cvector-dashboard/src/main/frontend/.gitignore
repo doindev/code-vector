@@ -1,0 +1,13 @@
+# Angular CLI build output (frontend-maven-plugin produces this, not tracked)
+node_modules/
+dist/
+.angular/
+out-tsc/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

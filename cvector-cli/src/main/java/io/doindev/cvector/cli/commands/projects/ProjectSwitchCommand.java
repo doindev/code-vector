@@ -11,7 +11,7 @@ import java.nio.file.Path;
 import java.util.concurrent.Callable;
 
 @Component
-@Command(name = "switch", description = "Switch the active project.")
+@Command(name = "switch", description = "Switch the active project.", mixinStandardHelpOptions = true)
 public class ProjectSwitchCommand implements Callable<Integer> {
 
     @Parameters(index = "0", description = "Project name.")

@@ -15,7 +15,7 @@ import java.util.Map;
 import java.util.concurrent.Callable;
 
 @Component
-@Command(name = "query", description = "Execute a raw Cypher query against the active project.")
+@Command(name = "query", description = "Execute a raw Cypher query against the active project.", mixinStandardHelpOptions = true)
 public class QueryCommand implements Callable<Integer> {
 
     @Parameters(index = "0", description = "Cypher query (use $pid for the active project id).")

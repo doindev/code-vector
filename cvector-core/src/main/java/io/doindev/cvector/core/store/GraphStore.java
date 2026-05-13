@@ -48,6 +48,17 @@ public interface GraphStore extends AutoCloseable {
      */
     List<Map<String, Object>> searchByName(String projectId, String query, String label, int limit);
 
+    /**
+     * Schema-level connectivity for the dashboard's meta-graph view. One row per
+     * {@code (fromLabel, toLabel, edgeType)} triple, with {@code count} of edges in the
+     * graph that match that triple. Used to render "which node labels connect to which
+     * via which edge type". Returns at most a few hundred rows even on huge projects --
+     * combinatorial in the small set of distinct (label, type) values, not the data size.
+     */
+    default List<Map<String, Object>> schemaConnectivity(String projectId) {
+        return List.of();
+    }
+
     /** Methods that CALL the given node. Columns: fqName, name, callSiteLine, id. */
     List<Map<String, Object>> callers(String projectId, String id);
 

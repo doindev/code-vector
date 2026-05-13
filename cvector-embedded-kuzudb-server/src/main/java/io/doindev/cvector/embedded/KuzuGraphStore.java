@@ -90,6 +90,44 @@ public final class KuzuGraphStore implements GraphStore {
     }
 
     @Override
+    public List<Map<String, Object>> schemaConnectivity(String projectId) {
+        // One query per REL table. Kuzu's binder doesn't support a free-form edge-type
+        // variable, so we loop. Each query is a small aggregation; with ~14 edge types
+        // and the projectId filter pushing the row count down further, total wall time
+        // stays comfortably under a second even on large graphs.
+        List<Map<String, Object>> out = new ArrayList<>();
+        for (String type : KuzuSchemaBootstrap.EDGE_TYPES) {
+            List<Map<String, Object>> rows = kuzu.read(
+                    "MATCH (a:Node)-[r:" + type + "]->(b:Node) "
+                            + "WHERE a.projectId = $pid AND b.projectId = $pid "
+                            + "RETURN a.label AS fromLabel, b.label AS toLabel, count(r) AS edgeCount",
+                    Map.of("pid", projectId)
+            );
+            for (Map<String, Object> r : rows) {
+                long c = asLong(r.get("edgeCount"));
+                if (c <= 0) continue;
+                Map<String, Object> row = new LinkedHashMap<>();
+                row.put("from", String.valueOf(r.get("fromLabel")));
+                row.put("to", String.valueOf(r.get("toLabel")));
+                row.put("type", type);
+                row.put("count", c);
+                out.add(row);
+            }
+        }
+        // Stable order: heaviest connections first, then alphabetic on (from,to,type) for ties.
+        out.sort((a, b) -> {
+            int byCount = Long.compare(asLong(b.get("count")), asLong(a.get("count")));
+            if (byCount != 0) return byCount;
+            int byFrom = ((String) a.get("from")).compareTo((String) b.get("from"));
+            if (byFrom != 0) return byFrom;
+            int byTo = ((String) a.get("to")).compareTo((String) b.get("to"));
+            if (byTo != 0) return byTo;
+            return ((String) a.get("type")).compareTo((String) b.get("type"));
+        });
+        return out;
+    }
+
+    @Override
     public List<Map<String, Object>> findSymbol(String projectId, String symbol) {
         // Three candidate predicates: exact fqName, fqName ending in `.symbol`, or simple name.
         // Kuzu doesn't support Neo4j's `ENDS WITH '.' + $sym` string concat in the predicate, so
@@ -395,12 +433,30 @@ public final class KuzuGraphStore implements GraphStore {
     @Override
     public Map<String, List<Map<String, Object>>> serviceLinks(String projectId) {
         Map<String, List<Map<String, Object>>> out = new LinkedHashMap<>();
-        out.put("outgoingHttp", kuzu.read(
+        // Outgoing HTTP comes from two parser dialects:
+        //   (a) JVM: Method -[CALLS]-> Method where the callee fqName is a Spring/Java HTTP client
+        //       class. Captured by regex match on the callee fqName.
+        //   (b) JS/TS: File -[CALLS_HTTP]-> HttpCall, where the HttpCall node carries
+        //       httpMethod, url, and client (axios/fetch/etc.) properties. Emitted by the TS
+        //       parser when it sees a client-receiver call like axios.post('url', body).
+        // Two reads, normalised to the same column shape, then concatenated.
+        List<Map<String, Object>> jvmHttp = kuzu.read(
                 "MATCH (m:Node)-[:CALLS]->(callee:Node) "
                         + "WHERE m.label = 'Method' AND callee.label = 'Method' "
                         + "AND regexp_matches(callee.fqName, '(?i).*(RestTemplate|WebClient|HttpClient|FeignClient|OkHttpClient).*') "
                         + "RETURN m.fqName AS caller, callee.fqName AS target, count(*) AS calls "
-                        + "ORDER BY calls DESC LIMIT 50"));
+                        + "ORDER BY calls DESC LIMIT 50");
+        // HttpCall reuses the Node table's existing `path` column for the URL and `framework`
+        // for the client library (axios/fetch/...), mirroring how ApiEndpoint stores its data.
+        List<Map<String, Object>> jsHttp = kuzu.read(
+                "MATCH (f:Node)-[:CALLS_HTTP]->(h:Node) "
+                        + "WHERE f.label = 'File' AND h.label = 'HttpCall' "
+                        + "RETURN f.path AS caller, h.httpMethod AS method, h.path AS target, "
+                        + "h.framework AS client ORDER BY target");
+        List<Map<String, Object>> outgoingHttp = new ArrayList<>(jvmHttp.size() + jsHttp.size());
+        outgoingHttp.addAll(jvmHttp);
+        outgoingHttp.addAll(jsHttp);
+        out.put("outgoingHttp", outgoingHttp);
         out.put("outgoingMessaging", kuzu.read(
                 "MATCH (m:Node)-[:CALLS]->(callee:Node) "
                         + "WHERE m.label = 'Method' AND callee.label = 'Method' "
@@ -411,10 +467,33 @@ public final class KuzuGraphStore implements GraphStore {
                 "MATCH (m:Node) WHERE m.label = 'Method' "
                         + "AND coalesce(m.isQueueListener, false) = true "
                         + "RETURN m.fqName AS handler LIMIT 100"));
-        out.put("restEndpoints", kuzu.read(
+        // restEndpoints: endpoints come from File -[EXPOSES]-> ApiEndpoint (all parsers do this),
+        // and a Method handler comes from ApiEndpoint -[HANDLES]-> Method (only some parsers).
+        // Querying via HANDLES alone hides the 17+ Express/Vue endpoints that have no method link.
+        // Kuzu's binder rejects OPTIONAL MATCH chained from an outer MATCH here, so we read
+        // both relationships independently and join in Java.
+        List<Map<String, Object>> endpointRows = kuzu.read(
+                "MATCH (f:Node)-[:EXPOSES]->(e:Node) "
+                        + "WHERE f.label = 'File' AND e.label = 'ApiEndpoint' "
+                        + "RETURN e.fqName AS endpointKey, e.httpMethod AS method, e.path AS path, "
+                        + "e.framework AS framework, f.path AS file ORDER BY path");
+        List<Map<String, Object>> handlerRows = kuzu.read(
                 "MATCH (e:Node)-[:HANDLES]->(m:Node) "
                         + "WHERE e.label = 'ApiEndpoint' AND m.label = 'Method' "
-                        + "RETURN e.httpMethod AS method, e.path AS path, m.fqName AS handler ORDER BY path"));
+                        + "RETURN e.fqName AS endpointKey, m.fqName AS handler");
+        Map<Object, Object> handlerByEndpoint = new java.util.HashMap<>();
+        for (Map<String, Object> r : handlerRows) handlerByEndpoint.put(r.get("endpointKey"), r.get("handler"));
+        List<Map<String, Object>> endpoints = new ArrayList<>(endpointRows.size());
+        for (Map<String, Object> r : endpointRows) {
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("method", r.get("method"));
+            row.put("path", r.get("path"));
+            row.put("framework", r.get("framework"));
+            row.put("file", r.get("file"));
+            row.put("handler", handlerByEndpoint.getOrDefault(r.get("endpointKey"), ""));
+            endpoints.add(row);
+        }
+        out.put("restEndpoints", endpoints);
         // tablesTouched: we can't easily distinguish READS_TABLE vs WRITES_TABLE in a single MATCH
         // on Kuzu without rel-table union syntax. Issue two queries and tag the access type.
         List<Map<String, Object>> tables = new ArrayList<>();

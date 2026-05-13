@@ -16,7 +16,7 @@ import java.util.Map;
 import java.util.concurrent.Callable;
 
 @Component
-@Command(name = "wiki", description = "Generate Markdown documentation for the active project from the graph.")
+@Command(name = "wiki", description = "Generate Markdown documentation for the active project from the graph.", mixinStandardHelpOptions = true)
 public class WikiCommand implements Callable<Integer> {
 
     @Option(names = {"--out", "-o"}, required = true, description = "Output directory (created if missing).")

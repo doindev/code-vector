@@ -13,7 +13,7 @@ import java.util.Optional;
 import java.util.concurrent.Callable;
 
 @Component
-@Command(name = "ci", description = "Orchestrate scan + rules + guard + audit. Exits non-zero on any failure.")
+@Command(name = "ci", description = "Orchestrate scan + rules + guard + audit. Exits non-zero on any failure.", mixinStandardHelpOptions = true)
 public class CiCommand implements Callable<Integer> {
 
     @Option(names = "--skip-scan", description = "Skip scan if Project.lastScanCommit matches current git HEAD.")

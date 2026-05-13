@@ -11,7 +11,7 @@ import java.nio.file.Path;
 import java.util.concurrent.Callable;
 
 @Component
-@Command(name = "doctor", description = "Run full diagnostics on the cvector setup.")
+@Command(name = "doctor", description = "Run full diagnostics on the cvector setup.", mixinStandardHelpOptions = true)
 public class DoctorCommand implements Callable<Integer> {
 
     private final CvectorRuntime runtime;

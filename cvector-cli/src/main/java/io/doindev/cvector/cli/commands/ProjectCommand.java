@@ -15,6 +15,7 @@ import java.util.concurrent.Callable;
 @Command(
         name = "project",
         description = "Manage projects in the cvector workspace.",
+        mixinStandardHelpOptions = true,
         subcommands = {
                 ProjectListCommand.class,
                 ProjectCreateCommand.class,

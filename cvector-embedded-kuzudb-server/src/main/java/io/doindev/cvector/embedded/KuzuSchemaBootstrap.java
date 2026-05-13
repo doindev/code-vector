@@ -106,6 +106,11 @@ public final class KuzuSchemaBootstrap {
         m.put("lastScanCommit", "STRING");
         m.put("lastIngestedAt", "TIMESTAMP");
         m.put("contentHash", "STRING");
+        // fileContentHash is the SHA-256 of the file's raw bytes (only ever set on File nodes).
+        // Used by the re-scan incremental path to skip parsing files whose contents are
+        // byte-identical to the previous scan. Distinct from `contentHash` which is the
+        // per-node property-map hash used internally by the ingestor.
+        m.put("fileContentHash", "STRING");
         return m;
     }
 
@@ -125,7 +130,9 @@ public final class KuzuSchemaBootstrap {
             "CONTAINS", "CALLS", "EXTENDS", "IMPLEMENTS", "IMPORTS",
             "EXPOSES", "HANDLES", "DEPENDS_ON", "DECLARES",
             "READS_TABLE", "WRITES_TABLE", "READS_CONFIG",
-            "USES", "REFERENCES"
+            "USES", "REFERENCES",
+            "REFERENCES_COMPONENT",
+            "CALLS_HTTP"
     );
 
     private final EmbeddedKuzu kuzu;

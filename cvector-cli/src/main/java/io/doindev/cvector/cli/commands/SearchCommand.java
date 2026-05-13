@@ -14,7 +14,7 @@ import java.util.Map;
 import java.util.concurrent.Callable;
 
 @Component
-@Command(name = "search", description = "Search graph nodes by name (substring or wildcard).")
+@Command(name = "search", description = "Search graph nodes by name (substring or wildcard).", mixinStandardHelpOptions = true)
 public class SearchCommand implements Callable<Integer> {
 
     @Parameters(index = "0", description = "Query (substring; supports * wildcards).")

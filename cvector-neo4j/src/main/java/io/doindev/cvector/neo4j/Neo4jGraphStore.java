@@ -50,6 +50,23 @@ public final class Neo4jGraphStore implements GraphStore {
     public Map<String, Long> edgeCounts(String projectId) { return queries.edgeCounts(projectId); }
 
     @Override
+    public List<Map<String, Object>> schemaConnectivity(String projectId) {
+        // Single Cypher: aggregate all edges by (fromLabel, toLabel, edgeType). Neo4j stores
+        // each rel as its own type, so we project the first label of each endpoint (cvector
+        // emits nodes with exactly one label) plus type(r). Output sorted heaviest-first to
+        // match Kuzu's contract.
+        return queries.raw(
+                "MATCH (a)-[r]->(b) "
+                        + "WHERE a.projectId = $pid AND b.projectId = $pid "
+                        + "WITH labels(a)[0] AS f, labels(b)[0] AS t, type(r) AS k, count(r) AS c "
+                        + "WHERE c > 0 "
+                        + "RETURN f AS `from`, t AS `to`, k AS type, c AS count "
+                        + "ORDER BY count DESC, `from`, `to`, type",
+                Map.of("pid", projectId)
+        );
+    }
+
+    @Override
     public List<Map<String, Object>> findSymbol(String projectId, String symbol) {
         return queries.findSymbol(projectId, symbol);
     }
@@ -289,11 +306,16 @@ public final class Neo4jGraphStore implements GraphStore {
     @Override
     public Map<String, List<Map<String, Object>>> serviceLinks(String projectId) {
         Map<String, List<Map<String, Object>>> out = new java.util.LinkedHashMap<>();
+        // Outgoing HTTP from JVM patterns (CALLS to Spring/Java client classes) UNION the JS/TS
+        // pattern (File -[CALLS_HTTP]-> HttpCall) emitted by the TS parser for axios/fetch.
         out.put("outgoingHttp", queries.raw(
                 "MATCH (m:Method {projectId: $pid})-[:CALLS]->(callee:Method) "
                         + "WHERE callee.fqName =~ '(?i).*(RestTemplate|WebClient|HttpClient|FeignClient|OkHttpClient).*' "
-                        + "RETURN m.fqName AS caller, callee.fqName AS target, count(*) AS calls "
-                        + "ORDER BY calls DESC LIMIT 50",
+                        + "RETURN m.fqName AS caller, callee.fqName AS target, count(*) AS calls, null AS client, null AS method "
+                        + "UNION "
+                        + "MATCH (f:File {projectId: $pid})-[:CALLS_HTTP]->(h:HttpCall) "
+                        + "RETURN f.path AS caller, h.path AS target, 1 AS calls, h.framework AS client, h.httpMethod AS method "
+                        + "ORDER BY target",
                 Map.of("pid", projectId)));
         out.put("outgoingMessaging", queries.raw(
                 "MATCH (m:Method {projectId: $pid})-[:CALLS]->(callee:Method) "
@@ -305,9 +327,15 @@ public final class Neo4jGraphStore implements GraphStore {
                 "MATCH (m:Method {projectId: $pid}) WHERE coalesce(m.isQueueListener, false) = true "
                         + "RETURN m.fqName AS handler LIMIT 100",
                 Map.of("pid", projectId)));
+        // restEndpoints: every parser links File -[EXPOSES]-> ApiEndpoint; only some parsers
+        // (Java/Spring, Python/Django) add the HANDLES edge to a Method. Querying via HANDLES
+        // alone hides Express/Vue/etc. endpoints that have no method link. Use OPTIONAL MATCH
+        // so HANDLES-less endpoints still appear with an empty handler column.
         out.put("restEndpoints", queries.raw(
-                "MATCH (e:ApiEndpoint {projectId: $pid})-[:HANDLES]->(m:Method) "
-                        + "RETURN e.httpMethod AS method, e.path AS path, m.fqName AS handler ORDER BY path",
+                "MATCH (f:File {projectId: $pid})-[:EXPOSES]->(e:ApiEndpoint {projectId: $pid}) "
+                        + "OPTIONAL MATCH (e)-[:HANDLES]->(m:Method) "
+                        + "RETURN e.httpMethod AS method, e.path AS path, e.framework AS framework, "
+                        + "f.path AS file, coalesce(m.fqName, '') AS handler ORDER BY path",
                 Map.of("pid", projectId)));
         out.put("tablesTouched", queries.raw(
                 "MATCH (n)-[r:READS_TABLE|WRITES_TABLE]->(t:Table {projectId: $pid}) "

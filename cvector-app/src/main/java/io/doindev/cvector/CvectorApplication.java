@@ -29,9 +29,19 @@ public class CvectorApplication implements CommandLineRunner, ExitCodeGenerator 
     }
 
     public static void main(String[] args) {
-        String firstArg = args.length > 0 ? args[0] : "";
-        boolean webMode = WEB_COMMANDS.contains(firstArg);
-        boolean mcpMode = MCP_COMMANDS.contains(firstArg);
+        // Scan ALL args for a known command name, not just args[0]. Earlier this only
+        // looked at the first arg, which broke invocations like
+        // `java -jar cvector.jar --embedded dashboard` -- args[0] there is `--embedded`,
+        // so webMode flipped false and Tomcat never started. Skip-tokens-starting-with-dash
+        // so we don't accidentally pick up a `--port` value that happens to spell "dashboard".
+        String commandToken = "";
+        for (String a : args) {
+            if (a == null || a.startsWith("-")) continue;
+            commandToken = a;
+            break;
+        }
+        boolean webMode = WEB_COMMANDS.contains(commandToken);
+        boolean mcpMode = MCP_COMMANDS.contains(commandToken);
 
         SpringApplicationBuilder builder = new SpringApplicationBuilder(CvectorApplication.class)
                 .bannerMode(Banner.Mode.OFF)
@@ -43,7 +53,13 @@ public class CvectorApplication implements CommandLineRunner, ExitCodeGenerator 
                             "spring.main.web-application-type=servlet",
                             "server.port=2969",
                             // Virtual threads serve concurrent dashboard requests cheaply. No-op on JDK <21.
-                            "spring.threads.virtual.enabled=true"
+                            "spring.threads.virtual.enabled=true",
+                            // Gzip JSON responses over the wire. /api/wiki etc. are ~60 KB raw
+                            // and compress 6-10x on text-heavy graph payloads. 1 KB floor avoids
+                            // overhead on tiny health-check responses.
+                            "server.compression.enabled=true",
+                            "server.compression.mime-types=application/json,application/javascript,text/css,text/html,text/javascript",
+                            "server.compression.min-response-size=1024"
                     );
         } else if (mcpMode) {
             builder.web(WebApplicationType.NONE)

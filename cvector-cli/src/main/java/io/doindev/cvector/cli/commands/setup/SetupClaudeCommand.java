@@ -9,7 +9,7 @@ import java.nio.file.Path;
 import java.util.concurrent.Callable;
 
 @Component
-@Command(name = "setup-claude", description = "Register cvector as an MCP server in Claude Desktop's config.")
+@Command(name = "setup-claude", description = "Register cvector as an MCP server in Claude Desktop's config.", mixinStandardHelpOptions = true)
 public class SetupClaudeCommand implements Callable<Integer> {
 
     @Option(names = "--name", description = "Server entry name (default 'cvector').")

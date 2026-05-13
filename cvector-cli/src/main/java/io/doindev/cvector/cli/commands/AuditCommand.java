@@ -22,7 +22,7 @@ import java.util.Map;
 import java.util.concurrent.Callable;
 
 @Component
-@Command(name = "audit", description = "Dependency vulnerability audit (OSV) cross-referenced with the graph.")
+@Command(name = "audit", description = "Dependency vulnerability audit (OSV) cross-referenced with the graph.", mixinStandardHelpOptions = true)
 public class AuditCommand implements Callable<Integer> {
 
     private static final String OSV_URL = "https://api.osv.dev/v1/query";

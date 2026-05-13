@@ -14,7 +14,7 @@ import java.util.Map;
 import java.util.concurrent.Callable;
 
 @Component
-@Command(name = "impact", description = "Show downstream impact of changing a symbol.")
+@Command(name = "impact", description = "Show downstream impact of changing a symbol.", mixinStandardHelpOptions = true)
 public class ImpactCommand implements Callable<Integer> {
 
     @Parameters(index = "0", description = "Symbol name (fully qualified or last segment).")

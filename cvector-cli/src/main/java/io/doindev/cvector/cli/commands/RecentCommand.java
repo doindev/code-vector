@@ -14,7 +14,7 @@ import java.util.Map;
 import java.util.concurrent.Callable;
 
 @Component
-@Command(name = "recent", description = "Show recently-ingested graph nodes.")
+@Command(name = "recent", description = "Show recently-ingested graph nodes.", mixinStandardHelpOptions = true)
 public class RecentCommand implements Callable<Integer> {
 
     @Option(names = "--since", description = "Time window (e.g. 24h, 7d, 30m, 1d). Default: 24h.")

@@ -26,7 +26,7 @@ import java.util.Map;
 import java.util.concurrent.Callable;
 
 @Component
-@Command(name = "badge", description = "Generate README health badges (shields.io) from the graph.")
+@Command(name = "badge", description = "Generate README health badges (shields.io) from the graph.", mixinStandardHelpOptions = true)
 public class BadgeCommand implements Callable<Integer> {
 
     private static final String MARKER_START = "<!-- cvector:badges-start -->";

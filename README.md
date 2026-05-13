@@ -90,6 +90,26 @@ java -jar /path/to/cvector.jar rules
 
 The fat jar at `cvector-app/target/cvector.jar` is the single executable for **CLI**, **dashboard**, and **MCP server** modes — the first argument selects the mode.
 
+### Option C — Standalone Windows distributable (no JDK required)
+
+```bash
+# Build a self-contained directory with cvector.exe + bundled JRE
+mvn -Pdist -DskipTests install
+```
+
+Output lands at `cvector-app/target/dist/cvector/`:
+
+```
+cvector/
+├── cvector.exe       # entry point — runs without JAVA_HOME
+├── app/cvector.jar   # the fat jar
+└── runtime/          # trimmed JRE (java.base, java.management, java.naming, …)
+```
+
+Zip the `cvector/` directory and hand it to anyone on Windows — they unzip, run `cvector.exe`, no JDK install needed. Every subcommand supports `--help` / `-h` (`cvector scan --help`, `cvector embedded query --help`, …).
+
+The plugin is `org.panteleyev:jpackage-maven-plugin`, bound to the `verify` phase under the `dist` profile so a normal `mvn package` skips it. Builds for the host OS only — to produce a Linux or macOS distributable, run the same `mvn -Pdist` on that host.
+
 ---
 
 ## Configuration
@@ -176,6 +196,10 @@ custom:
 | Flag | Effect |
 |---|---|
 | `--embedded` | Use the embedded KuzuDB store (no Neo4j required). Inherited by every subcommand. |
+
+### Network exposure
+
+The dashboard / REST API (`cvector dashboard`) is bound to **`127.0.0.1` only** by default (set in `application.properties` as `server.address=127.0.0.1`). Remote hosts cannot reach the embedded web server. To expose it on a trusted network, override with `--server.address=0.0.0.0`. The `cvector serve` (MCP) transport is stdio, so it never opens a network socket.
 
 ---
 
@@ -265,6 +289,14 @@ Invoke as `java -jar cvector.jar <command> [args]`.
 ## REST API
 
 Started by `cvector dashboard`. Default port **2969**.
+
+**Bound to loopback only by default.** The embedded web server only accepts connections from `127.0.0.1` / `::1` — requests from other hosts on the network are refused at the socket layer. To expose the dashboard externally (e.g. for a team dashboard on a trusted LAN), start it with `--server.address=0.0.0.0`:
+
+```bash
+cvector dashboard --server.address=0.0.0.0
+```
+
+The bind address is plain Spring Boot config (`server.address` in `application.properties`), so anything Spring accepts works (`192.168.1.10`, a specific NIC IP, etc.). Pair with a reverse proxy and auth if you go off-loopback.
 
 | Method | Path | Description | Query params |
 |---|---|---|---|
