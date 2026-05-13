@@ -34,9 +34,19 @@ export const routes: Routes = [
           import('./views/recent/recent.component').then((m) => m.RecentComponent),
       },
       {
+        path: 'changelog',
+        loadComponent: () =>
+          import('./views/changelog/changelog.component').then((m) => m.ChangelogComponent),
+      },
+      {
         path: 'guard',
         loadComponent: () =>
           import('./views/guard/guard.component').then((m) => m.GuardComponent),
+      },
+      {
+        path: 'rules',
+        loadComponent: () =>
+          import('./views/rules/rules.component').then((m) => m.RulesComponent),
       },
       {
         path: 'wiki',
@@ -92,6 +102,31 @@ export const routes: Routes = [
         path: 'impact',
         loadComponent: () =>
           import('./views/impact/impact.component').then((m) => m.ImpactComponent),
+      },
+      {
+        path: 'trace',
+        loadComponent: () =>
+          import('./views/trace/trace.component').then((m) => m.TraceComponent),
+      },
+      {
+        path: 'db-impact',
+        loadComponent: () =>
+          import('./views/db-impact/db-impact.component').then((m) => m.DbImpactComponent),
+      },
+      {
+        path: 'rename',
+        loadComponent: () =>
+          import('./views/rename/rename.component').then((m) => m.RenameComponent),
+      },
+      {
+        path: 'pr-impact',
+        loadComponent: () =>
+          import('./views/pr-impact/pr-impact.component').then((m) => m.PrImpactComponent),
+      },
+      {
+        path: 'diff',
+        loadComponent: () =>
+          import('./views/diff/diff.component').then((m) => m.DiffComponent),
       },
       {
         path: 'settings',

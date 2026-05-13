@@ -433,45 +433,68 @@ public final class KuzuGraphStore implements GraphStore {
     @Override
     public Map<String, List<Map<String, Object>>> serviceLinks(String projectId) {
         Map<String, List<Map<String, Object>>> out = new LinkedHashMap<>();
-        // Outgoing HTTP comes from two parser dialects:
-        //   (a) JVM: Method -[CALLS]-> Method where the callee fqName is a Spring/Java HTTP client
-        //       class. Captured by regex match on the callee fqName.
-        //   (b) JS/TS: File -[CALLS_HTTP]-> HttpCall, where the HttpCall node carries
-        //       httpMethod, url, and client (axios/fetch/etc.) properties. Emitted by the TS
-        //       parser when it sees a client-receiver call like axios.post('url', body).
-        // Two reads, normalised to the same column shape, then concatenated.
-        List<Map<String, Object>> jvmHttp = kuzu.read(
+        out.put("outgoingHttp", readOutgoingHttp());
+        out.put("outgoingMessaging", readOutgoingMessaging());
+        out.put("incomingConsumers", readIncomingConsumers());
+        out.put("restEndpoints", readRestEndpoints());
+        out.put("tablesTouched", readTablesTouched());
+        return out;
+    }
+
+    /**
+     * Outgoing HTTP from two parser dialects:
+     * <ul>
+     *   <li>JVM: {@code Method -[CALLS]-> Method} where the callee is a Spring/Java HTTP client
+     *       class. Captured by regex match on the callee fqName.</li>
+     *   <li>JS/TS: {@code File -[CALLS_HTTP]-> HttpCall}, where the HttpCall node carries
+     *       {@code httpMethod}, {@code path} (= url), and {@code framework} (axios/fetch/...)
+     *       properties. Emitted when the TS parser sees a client-receiver call like
+     *       {@code axios.post('url', body)}.</li>
+     * </ul>
+     */
+    private List<Map<String, Object>> readOutgoingHttp() {
+        List<Map<String, Object>> jvm = kuzu.read(
                 "MATCH (m:Node)-[:CALLS]->(callee:Node) "
                         + "WHERE m.label = 'Method' AND callee.label = 'Method' "
                         + "AND regexp_matches(callee.fqName, '(?i).*(RestTemplate|WebClient|HttpClient|FeignClient|OkHttpClient).*') "
                         + "RETURN m.fqName AS caller, callee.fqName AS target, count(*) AS calls "
                         + "ORDER BY calls DESC LIMIT 50");
-        // HttpCall reuses the Node table's existing `path` column for the URL and `framework`
-        // for the client library (axios/fetch/...), mirroring how ApiEndpoint stores its data.
-        List<Map<String, Object>> jsHttp = kuzu.read(
+        List<Map<String, Object>> js = kuzu.read(
                 "MATCH (f:Node)-[:CALLS_HTTP]->(h:Node) "
                         + "WHERE f.label = 'File' AND h.label = 'HttpCall' "
                         + "RETURN f.path AS caller, h.httpMethod AS method, h.path AS target, "
                         + "h.framework AS client ORDER BY target");
-        List<Map<String, Object>> outgoingHttp = new ArrayList<>(jvmHttp.size() + jsHttp.size());
-        outgoingHttp.addAll(jvmHttp);
-        outgoingHttp.addAll(jsHttp);
-        out.put("outgoingHttp", outgoingHttp);
-        out.put("outgoingMessaging", kuzu.read(
+        List<Map<String, Object>> all = new ArrayList<>(jvm.size() + js.size());
+        all.addAll(jvm);
+        all.addAll(js);
+        return all;
+    }
+
+    private List<Map<String, Object>> readOutgoingMessaging() {
+        return kuzu.read(
                 "MATCH (m:Node)-[:CALLS]->(callee:Node) "
                         + "WHERE m.label = 'Method' AND callee.label = 'Method' "
                         + "AND regexp_matches(callee.fqName, '(?i).*(KafkaTemplate|RabbitTemplate|JmsTemplate|StreamBridge|SqsTemplate|SnsTemplate).*') "
                         + "RETURN m.fqName AS caller, callee.fqName AS target, count(*) AS calls "
-                        + "ORDER BY calls DESC LIMIT 50"));
-        out.put("incomingConsumers", kuzu.read(
+                        + "ORDER BY calls DESC LIMIT 50");
+    }
+
+    private List<Map<String, Object>> readIncomingConsumers() {
+        return kuzu.read(
                 "MATCH (m:Node) WHERE m.label = 'Method' "
                         + "AND coalesce(m.isQueueListener, false) = true "
-                        + "RETURN m.fqName AS handler LIMIT 100"));
-        // restEndpoints: endpoints come from File -[EXPOSES]-> ApiEndpoint (all parsers do this),
-        // and a Method handler comes from ApiEndpoint -[HANDLES]-> Method (only some parsers).
-        // Querying via HANDLES alone hides the 17+ Express/Vue endpoints that have no method link.
-        // Kuzu's binder rejects OPTIONAL MATCH chained from an outer MATCH here, so we read
-        // both relationships independently and join in Java.
+                        + "RETURN m.fqName AS handler LIMIT 100");
+    }
+
+    /**
+     * REST endpoints + their handlers. Endpoints come from {@code File -[EXPOSES]-> ApiEndpoint}
+     * (every parser does this), and a Method handler comes from
+     * {@code ApiEndpoint -[HANDLES]-> Method} (only some parsers do this). Querying via HANDLES
+     * alone hides the 17+ Express/Vue endpoints that have no method link, and Kuzu's binder
+     * rejects {@code OPTIONAL MATCH} chained from an outer MATCH here, so we read both
+     * relationships independently and join in Java.
+     */
+    private List<Map<String, Object>> readRestEndpoints() {
         List<Map<String, Object>> endpointRows = kuzu.read(
                 "MATCH (f:Node)-[:EXPOSES]->(e:Node) "
                         + "WHERE f.label = 'File' AND e.label = 'ApiEndpoint' "
@@ -493,9 +516,15 @@ public final class KuzuGraphStore implements GraphStore {
             row.put("handler", handlerByEndpoint.getOrDefault(r.get("endpointKey"), ""));
             endpoints.add(row);
         }
-        out.put("restEndpoints", endpoints);
-        // tablesTouched: we can't easily distinguish READS_TABLE vs WRITES_TABLE in a single MATCH
-        // on Kuzu without rel-table union syntax. Issue two queries and tag the access type.
+        return endpoints;
+    }
+
+    /**
+     * Tables touched, tagged by access kind. Kuzu can't union {@code READS_TABLE | WRITES_TABLE}
+     * in a single MATCH on the polymorphic Node table, so we issue one query per relationship
+     * type and tag each result row with its {@code access} kind.
+     */
+    private List<Map<String, Object>> readTablesTouched() {
         List<Map<String, Object>> tables = new ArrayList<>();
         for (String rel : List.of("READS_TABLE", "WRITES_TABLE")) {
             List<Map<String, Object>> rows = kuzu.read(
@@ -508,8 +537,7 @@ public final class KuzuGraphStore implements GraphStore {
                 tables.add(tagged);
             }
         }
-        out.put("tablesTouched", tables);
-        return out;
+        return tables;
     }
 
     @Override
@@ -613,6 +641,347 @@ public final class KuzuGraphStore implements GraphStore {
                         + "RETURN t.fqName AS test, t.fileId AS fileId, depth "
                         + "ORDER BY depth ASC LIMIT 200",
                 Map.of("id", id));
+    }
+
+    @Override
+    public Map<String, String> bulkFilesByPath(String projectId, List<String> paths) {
+        Map<String, String> out = new LinkedHashMap<>();
+        if (paths == null || paths.isEmpty()) return out;
+        // Kuzu's Java SDK doesn't expose a clean LIST<STRING> param constructor — passing a
+        // java.util.List binds as its toString() representation, which UNWIND rejects. So we
+        // build an inline IN clause with each path single-quote-escaped. Path strings come
+        // from git diff output and node graph paths — both controlled inputs — but we still
+        // escape defensively in case a filename contains an apostrophe.
+        StringBuilder inList = new StringBuilder("[");
+        boolean first = true;
+        for (String p : paths) {
+            if (p == null || p.isBlank()) continue;
+            if (!first) inList.append(",");
+            first = false;
+            inList.append("'").append(p.replace("'", "''")).append("'");
+        }
+        inList.append("]");
+        if (first) return out; // all paths were blank
+        try {
+            List<Map<String, Object>> rows = kuzu.read(
+                    "MATCH (f:Node) WHERE f.label = 'File' AND f.path IN " + inList
+                            + " RETURN f.path AS path, f.id AS id");
+            for (Map<String, Object> r : rows) {
+                Object p = r.get("path");
+                Object id = r.get("id");
+                if (p != null && id != null) out.put(p.toString(), id.toString());
+            }
+            return out;
+        } catch (RuntimeException ignored) {
+            return GraphStore.super.bulkFilesByPath(projectId, paths);
+        }
+    }
+
+    @Override
+    public Map<String, List<Map<String, Object>>> bulkContains(String projectId, List<String> fileIds, int limitPerFile) {
+        Map<String, List<Map<String, Object>>> out = new LinkedHashMap<>();
+        if (fileIds == null || fileIds.isEmpty()) return out;
+        // Same inline-list shape as bulkFilesByPath; file ids are 16 hex chars (NodeKey hash)
+        // so no escaping is required. One round trip vs N replaces the dominant cost of the
+        // PR-impact endpoint on big PRs.
+        StringBuilder inList = new StringBuilder("[");
+        boolean first = true;
+        for (String fid : fileIds) {
+            if (fid == null || fid.isBlank()) continue;
+            if (!first) inList.append(",");
+            first = false;
+            inList.append("'").append(fid.replace("'", "''")).append("'");
+        }
+        inList.append("]");
+        if (first) return out;
+        try {
+            List<Map<String, Object>> rows = kuzu.read(
+                    "MATCH (f:Node)-[:CONTAINS]->(c:Node) WHERE f.id IN " + inList
+                            + " RETURN f.id AS fileId, c.label AS label, c.fqName AS fqName, c.id AS id");
+            for (String fid : fileIds) out.put(fid, new ArrayList<>());
+            for (Map<String, Object> r : rows) {
+                Object fid = r.get("fileId");
+                if (fid == null) continue;
+                List<Map<String, Object>> bucket = out.get(fid.toString());
+                if (bucket == null) continue;
+                if (bucket.size() >= limitPerFile) continue;
+                Map<String, Object> child = new LinkedHashMap<>();
+                child.put("label", r.get("label"));
+                child.put("fqName", r.get("fqName"));
+                child.put("id", r.get("id"));
+                bucket.add(child);
+            }
+            return out;
+        } catch (RuntimeException ignored) {
+            return GraphStore.super.bulkContains(projectId, fileIds, limitPerFile);
+        }
+    }
+
+    @Override
+    public Map<String, Long> bulkCallerCounts(String projectId, List<String> ids) {
+        Map<String, Long> out = new LinkedHashMap<>();
+        if (ids == null || ids.isEmpty()) return out;
+        String inList = quoteListOrEmpty(ids);
+        if (inList == null) return out;
+        try {
+            List<Map<String, Object>> rows = kuzu.read(
+                    "MATCH (caller:Node)-[:CALLS]->(callee:Node) "
+                            + "WHERE callee.id IN " + inList + " AND caller.label = 'Method' "
+                            + "RETURN callee.id AS targetId, count(caller) AS cnt");
+            for (String id : ids) out.put(id, 0L);
+            for (Map<String, Object> r : rows) {
+                Object tid = r.get("targetId");
+                if (tid == null) continue;
+                long cnt = (r.get("cnt") instanceof Number n) ? n.longValue() : 0L;
+                out.put(tid.toString(), cnt);
+            }
+            return out;
+        } catch (RuntimeException ignored) {
+            return GraphStore.super.bulkCallerCounts(projectId, ids);
+        }
+    }
+
+    @Override
+    public Map<String, java.util.Set<String>> bulkImpactedIds(String projectId, List<String> ids, int depth) {
+        Map<String, java.util.Set<String>> out = new LinkedHashMap<>();
+        if (ids == null || ids.isEmpty()) return out;
+        int safeDepth = Math.max(1, Math.min(depth, 8));
+        String inList = quoteListOrEmpty(ids);
+        if (inList == null) return out;
+        for (String id : ids) if (id != null && !id.isBlank()) out.put(id, new java.util.LinkedHashSet<>());
+        // Two queries (CALLS and REFERENCES) instead of 2 × N. Each returns (source, impacted)
+        // pairs; we group in Java to keep the Cypher trivial.
+        for (String rel : List.of("CALLS", "REFERENCES")) {
+            try {
+                List<Map<String, Object>> rows = kuzu.read(
+                        "MATCH (start:Node)-[:" + rel + "*1.." + safeDepth + "]->(impacted:Node) "
+                                + "WHERE start.id IN " + inList + " "
+                                + "RETURN DISTINCT start.id AS source, impacted.id AS impacted");
+                for (Map<String, Object> r : rows) {
+                    Object src = r.get("source");
+                    Object imp = r.get("impacted");
+                    if (src == null || imp == null) continue;
+                    java.util.Set<String> bucket = out.get(src.toString());
+                    if (bucket != null) bucket.add(imp.toString());
+                }
+            } catch (RuntimeException ignored) {
+                // Some Kuzu builds reject the variable-length path on REFERENCES edges that
+                // don't exist in the project — skip that branch instead of falling back to
+                // per-id loop (which would re-hit the same issue).
+            }
+        }
+        return out;
+    }
+
+    /** Build a Cypher list literal from {@code ids}, or null if the list contains no non-blank entries. */
+    private static String quoteListOrEmpty(List<String> ids) {
+        StringBuilder sb = new StringBuilder("[");
+        boolean first = true;
+        for (String id : ids) {
+            if (id == null || id.isBlank()) continue;
+            if (!first) sb.append(",");
+            first = false;
+            sb.append("'").append(id.replace("'", "''")).append("'");
+        }
+        sb.append("]");
+        return first ? null : sb.toString();
+    }
+
+    @Override
+    public Map<String, Object> nodeById(String projectId, String id) {
+        if (id == null) return Map.of();
+        List<Map<String, Object>> rows = kuzu.read(
+                "MATCH (n:Node {id: $id}) "
+                        + "RETURN n.label AS label, n.fqName AS fqName, n.name AS name LIMIT 1",
+                Map.of("id", id));
+        return rows.isEmpty() ? Map.of() : new LinkedHashMap<>(rows.get(0));
+    }
+
+    @Override
+    public Map<String, Object> shortestPath(String projectId, String fromId, String toId, int maxDepth) {
+        if (fromId == null || toId == null) return emptyPathResult();
+        int safeDepth = Math.max(1, Math.min(maxDepth, 12));
+        if (fromId.equals(toId)) return zeroLengthPath();
+
+        // Two-phase: ask Kuzu for the shortest hop count via min(length(p)), then reconstruct
+        // the ordered path with a depth-bounded BFS in Java. The Java step is unavoidable
+        // because Kuzu path values don't round-trip through EmbeddedKuzu.unwrap into a stable
+        // JSON shape; the Cypher pre-flight at least lets us cap the BFS depth tightly.
+        Integer depthHit = probeShortestDepth(fromId, toId, safeDepth);
+        if (depthHit == null) return emptyPathResult();
+
+        List<String> orderedIds = bfsPath(projectId, fromId, toId, depthHit);
+        if (orderedIds == null) return emptyPathResult();
+        return buildPathResult(projectId, orderedIds);
+    }
+
+    private static Map<String, Object> emptyPathResult() {
+        Map<String, Object> empty = new LinkedHashMap<>();
+        empty.put("found", false);
+        empty.put("depth", -1);
+        empty.put("nodes", List.of());
+        empty.put("edges", List.of());
+        return empty;
+    }
+
+    private static Map<String, Object> zeroLengthPath() {
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("found", true);
+        result.put("depth", 0);
+        result.put("nodes", List.of());
+        result.put("edges", List.of());
+        return result;
+    }
+
+    /** Returns the shortest path length in hops, or null when no path within {@code safeDepth} exists. */
+    private Integer probeShortestDepth(String fromId, String toId, int safeDepth) {
+        try {
+            List<Map<String, Object>> rows = kuzu.read(
+                    "MATCH p = (a:Node {id: $from})-[:CALLS*1.." + safeDepth + "]->(b:Node {id: $to}) "
+                            + "RETURN min(length(p)) AS d LIMIT 1",
+                    Map.of("from", fromId, "to", toId));
+            if (rows.isEmpty()) return null;
+            Object d = rows.get(0).get("d");
+            return d instanceof Number n ? n.intValue() : null;
+        } catch (RuntimeException ignored) {
+            return null;
+        }
+    }
+
+    /** Depth-bounded BFS via callees; returns the ordered id list from from→to, or null if unreachable. */
+    private List<String> bfsPath(String projectId, String fromId, String toId, int depthHit) {
+        Map<String, String> parent = new LinkedHashMap<>();
+        Map<String, Integer> depth = new java.util.HashMap<>();
+        java.util.Deque<String> frontier = new java.util.ArrayDeque<>();
+        depth.put(fromId, 0);
+        frontier.add(fromId);
+        String found = null;
+        outer:
+        while (!frontier.isEmpty()) {
+            String cur = frontier.poll();
+            int d = depth.get(cur);
+            if (d >= depthHit) continue;
+            for (Map<String, Object> nb : callees(projectId, cur)) {
+                Object idObj = nb.get("id");
+                if (idObj == null) continue;
+                String nbId = idObj.toString();
+                if (depth.containsKey(nbId)) continue;
+                depth.put(nbId, d + 1);
+                parent.put(nbId, cur);
+                if (nbId.equals(toId)) { found = nbId; break outer; }
+                frontier.add(nbId);
+            }
+        }
+        if (found == null) return null;
+        java.util.LinkedList<String> ids = new java.util.LinkedList<>();
+        for (String n = found; n != null; n = parent.get(n)) {
+            ids.addFirst(n);
+            if (n.equals(fromId)) break;
+        }
+        return ids;
+    }
+
+    /** Builds the user-facing {nodes, edges, depth, found} response from an ordered id chain. */
+    private Map<String, Object> buildPathResult(String projectId, List<String> ids) {
+        List<Map<String, Object>> nodes = new ArrayList<>(ids.size());
+        for (String id : ids) {
+            Map<String, Object> meta = nodeById(projectId, id);
+            Map<String, Object> n = new LinkedHashMap<>();
+            n.put("id", id);
+            n.put("label", meta.getOrDefault("label", ""));
+            n.put("name", meta.getOrDefault("name", ""));
+            n.put("fqName", meta.getOrDefault("fqName", ""));
+            nodes.add(n);
+        }
+        List<Map<String, Object>> edges = new ArrayList<>(Math.max(0, ids.size() - 1));
+        for (int i = 0; i + 1 < ids.size(); i++) {
+            Map<String, Object> e = new LinkedHashMap<>();
+            e.put("from", ids.get(i));
+            e.put("to", ids.get(i + 1));
+            e.put("type", "CALLS");
+            edges.add(e);
+        }
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("found", true);
+        result.put("depth", ids.size() - 1);
+        result.put("nodes", nodes);
+        result.put("edges", edges);
+        return result;
+    }
+
+    @Override
+    public Map<String, List<Map<String, Object>>> dbImpact(String projectId, String table, String column) {
+        Map<String, List<Map<String, Object>>> out = new LinkedHashMap<>();
+        if (table == null || table.isBlank()) {
+            out.put("readers", List.of());
+            out.put("writers", List.of());
+            return out;
+        }
+        // Readers / writers: methods that have READS_TABLE / WRITES_TABLE → table-by-name.
+        // Kuzu's binder gets confused by multi-variable WHERE clauses on a single polymorphic
+        // Node table — the empirically-working shape is a simple MATCH with one variable
+        // filtered inline, plus a downstream WHERE on the *other* variable. The DISTINCT +
+        // dedup happens in Java to sidestep another binder quirk where DISTINCT projection
+        // doesn't pick up imported aliases. Param key is $tbl (not $table) because Kuzu's
+        // parser treats TABLE as a reserved word.
+        List<Map<String, Object>> readers = dedupByFqName(kuzu.read(
+                "MATCH (m:Node)-[:READS_TABLE]->(t:Node {label: 'Table', name: $tbl}) "
+                        + "WHERE m.label = 'Method' "
+                        + "RETURN m.fqName AS fqName, m.fileId AS fileId, m.startLine AS line LIMIT 500",
+                Map.of("tbl", table)));
+        List<Map<String, Object>> writers = dedupByFqName(kuzu.read(
+                "MATCH (m:Node)-[:WRITES_TABLE]->(t:Node {label: 'Table', name: $tbl}) "
+                        + "WHERE m.label = 'Method' "
+                        + "RETURN m.fqName AS fqName, m.fileId AS fileId, m.startLine AS line LIMIT 500",
+                Map.of("tbl", table)));
+        if (column != null && !column.isBlank()) {
+            // Narrow by column. READS_COLUMN / WRITES_COLUMN aren't always in the schema
+            // (older snapshots, parsers that don't emit them), so wrap each branch and fall
+            // back to the table-level set when the rel type isn't recognised.
+            List<Map<String, Object>> colReaders = readColumnUsage(table, column, "READS_COLUMN");
+            List<Map<String, Object>> colWriters = readColumnUsage(table, column, "WRITES_COLUMN");
+            // Intersect (column-scope is a refinement of the table set). Keep entries that
+            // appear in BOTH the table-level set and the column-level set so a method that
+            // only touches a different column on the same table doesn't bleed through.
+            if (colReaders != null) readers = intersectByFqName(readers, colReaders);
+            if (colWriters != null) writers = intersectByFqName(writers, colWriters);
+        }
+        out.put("readers", readers);
+        out.put("writers", writers);
+        return out;
+    }
+
+    private static List<Map<String, Object>> intersectByFqName(List<Map<String, Object>> a, List<Map<String, Object>> b) {
+        java.util.Set<Object> keysB = new java.util.HashSet<>();
+        for (Map<String, Object> r : b) keysB.add(r.get("fqName"));
+        List<Map<String, Object>> out = new ArrayList<>(Math.min(a.size(), b.size()));
+        for (Map<String, Object> r : a) if (keysB.contains(r.get("fqName"))) out.add(r);
+        return out;
+    }
+
+    /** Returns column-scoped usage or null if the rel type isn't in the current schema. */
+    private List<Map<String, Object>> readColumnUsage(String table, String column, String rel) {
+        try {
+            return dedupByFqName(kuzu.read(
+                    "MATCH (m:Node)-[:" + rel + "]->(c:Node {label: 'Column', name: $col})"
+                            + "<-[:CONTAINS]-(t:Node {label: 'Table', name: $tbl}) "
+                            + "WHERE m.label = 'Method' "
+                            + "RETURN m.fqName AS fqName, m.fileId AS fileId, m.startLine AS line LIMIT 500",
+                    Map.of("tbl", table, "col", column)));
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    private static List<Map<String, Object>> dedupByFqName(List<Map<String, Object>> rows) {
+        Map<Object, Map<String, Object>> seen = new LinkedHashMap<>();
+        for (Map<String, Object> r : rows) {
+            Object k = r.get("fqName");
+            if (k != null) seen.putIfAbsent(k, r);
+        }
+        List<Map<String, Object>> out = new ArrayList<>(seen.values());
+        out.sort((a, b) -> String.valueOf(a.get("fqName")).compareTo(String.valueOf(b.get("fqName"))));
+        return out;
     }
 
     @Override

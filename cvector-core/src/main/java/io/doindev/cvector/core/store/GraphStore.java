@@ -166,6 +166,193 @@ public interface GraphStore extends AutoCloseable {
     List<Map<String, Object>> testReach(String projectId, String id, int maxDepth);
 
     /**
+     * Shortest directed path from {@code fromId} to {@code toId} via outgoing {@code CALLS}
+     * edges, up to {@code maxDepth} hops. Default implementation runs BFS via
+     * {@link #callees(String, String)} so it works on both Neo4j and Kuzu without needing a
+     * native {@code shortestPath}. Backends with a faster native path may override.
+     *
+     * <p>Returns columns:
+     * <ul>
+     *   <li>{@code found} — boolean, true when a path exists within maxDepth.</li>
+     *   <li>{@code depth} — number of hops (0 when from == to).</li>
+     *   <li>{@code nodes} — ordered list of {@code {id, label, fqName, name}} starting at
+     *       {@code fromId} and ending at {@code toId}.</li>
+     *   <li>{@code edges} — list of {@code {from, to, type}} entries for each hop. Empty when
+     *       {@code depth == 0}.</li>
+     * </ul>
+     */
+    default Map<String, Object> shortestPath(String projectId, String fromId, String toId, int maxDepth) {
+        java.util.Map<String, Object> empty = new java.util.LinkedHashMap<>();
+        empty.put("found", false);
+        empty.put("depth", -1);
+        empty.put("nodes", java.util.List.of());
+        empty.put("edges", java.util.List.of());
+        if (fromId == null || toId == null) return empty;
+        int safeDepth = Math.max(1, Math.min(maxDepth, 12));
+        if (fromId.equals(toId)) {
+            Map<String, Object> result = new java.util.LinkedHashMap<>();
+            result.put("found", true);
+            result.put("depth", 0);
+            result.put("nodes", java.util.List.of());
+            result.put("edges", java.util.List.of());
+            return result;
+        }
+        // BFS: parent map records the predecessor of each visited node so we can reconstruct
+        // the path after we find the target. Bounded by an explicit node-visit cap so a
+        // pathological hub (millions of edges) can't fan out unbounded.
+        int maxVisited = 5000;
+        java.util.Map<String, String> parent = new java.util.LinkedHashMap<>();
+        java.util.Map<String, Integer> depth = new java.util.HashMap<>();
+        java.util.Deque<String> frontier = new java.util.ArrayDeque<>();
+        depth.put(fromId, 0);
+        frontier.add(fromId);
+        String found = null;
+        while (!frontier.isEmpty() && depth.size() <= maxVisited) {
+            String cur = frontier.poll();
+            int d = depth.get(cur);
+            if (d >= safeDepth) continue;
+            for (Map<String, Object> nb : callees(projectId, cur)) {
+                Object idObj = nb.get("id");
+                if (idObj == null) continue;
+                String nbId = idObj.toString();
+                if (depth.containsKey(nbId)) continue;
+                depth.put(nbId, d + 1);
+                parent.put(nbId, cur);
+                if (nbId.equals(toId)) { found = nbId; break; }
+                frontier.add(nbId);
+            }
+            if (found != null) break;
+        }
+        if (found == null) return empty;
+        // Reconstruct path from target back to source.
+        java.util.LinkedList<String> ids = new java.util.LinkedList<>();
+        for (String n = found; n != null; n = parent.get(n)) {
+            ids.addFirst(n);
+            if (n.equals(fromId)) break;
+        }
+        // Fetch label/fqName for each node so the dashboard can render without follow-up calls.
+        java.util.List<Map<String, Object>> nodes = new java.util.ArrayList<>(ids.size());
+        for (String id : ids) {
+            Map<String, Object> meta = nodeById(projectId, id);
+            Map<String, Object> n = new java.util.LinkedHashMap<>();
+            n.put("id", id);
+            n.put("label", meta.getOrDefault("label", ""));
+            n.put("name", meta.getOrDefault("name", ""));
+            n.put("fqName", meta.getOrDefault("fqName", ""));
+            nodes.add(n);
+        }
+        java.util.List<Map<String, Object>> edges = new java.util.ArrayList<>(Math.max(0, ids.size() - 1));
+        for (int i = 0; i + 1 < ids.size(); i++) {
+            Map<String, Object> e = new java.util.LinkedHashMap<>();
+            e.put("from", ids.get(i));
+            e.put("to", ids.get(i + 1));
+            e.put("type", "CALLS");
+            edges.add(e);
+        }
+        Map<String, Object> result = new java.util.LinkedHashMap<>();
+        result.put("found", true);
+        result.put("depth", ids.size() - 1);
+        result.put("nodes", nodes);
+        result.put("edges", edges);
+        return result;
+    }
+
+    /**
+     * Fetch a node's display metadata by id. Default implementation returns an empty map;
+     * backends should override to return {@code {id, label, fqName, name}} cheaply for the
+     * symbol pivots in {@link #shortestPath}.
+     */
+    default Map<String, Object> nodeById(String projectId, String id) {
+        return java.util.Map.of();
+    }
+
+    /**
+     * Database-impact analysis: callers reading from or writing to a given table (and
+     * optional column). Returns the keys {@code readers} and {@code writers}; each value is
+     * a list of {@code {fqName, fileId, line}} rows for methods that touch the table.
+     * Optional {@code column} narrows to method↔column edges.
+     */
+    default Map<String, List<Map<String, Object>>> dbImpact(String projectId, String table, String column) {
+        java.util.Map<String, List<Map<String, Object>>> empty = new java.util.LinkedHashMap<>();
+        empty.put("readers", java.util.List.of());
+        empty.put("writers", java.util.List.of());
+        return empty;
+    }
+
+    /**
+     * Bulk path → fileId resolution. Given a list of File paths (relative or absolute as the
+     * graph stored them), return a {@code path → fileId} map for every path that matches a
+     * File node. Default implementation falls back to {@link #searchByName} per entry; backends
+     * should override with a single {@code UNWIND}-style query for the per-PR pr-impact case
+     * where we resolve 100+ paths at a time.
+     */
+    default Map<String, String> bulkFilesByPath(String projectId, List<String> paths) {
+        Map<String, String> out = new java.util.LinkedHashMap<>();
+        if (paths == null || paths.isEmpty()) return out;
+        for (String p : paths) {
+            if (p == null || p.isBlank()) continue;
+            List<Map<String, Object>> hits = searchByName(projectId, p, "File", 1);
+            if (!hits.isEmpty()) {
+                Object id = hits.get(0).get("id");
+                if (id != null) out.put(p, id.toString());
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Bulk {@code CONTAINS} children resolution. For each fileId, return the list of direct
+     * children (methods, classes, fields …). Default implementation loops via
+     * {@link #contains}; backends override with a single {@code UNWIND}-batched query so the
+     * pr-impact controller doesn't pay an N-round-trip penalty on big PRs.
+     */
+    default Map<String, List<Map<String, Object>>> bulkContains(String projectId, List<String> fileIds, int limitPerFile) {
+        Map<String, List<Map<String, Object>>> out = new java.util.LinkedHashMap<>();
+        if (fileIds == null || fileIds.isEmpty()) return out;
+        for (String fid : fileIds) {
+            if (fid == null || fid.isBlank()) continue;
+            out.put(fid, contains(projectId, fid, limitPerFile));
+        }
+        return out;
+    }
+
+    /**
+     * Bulk incoming-CALLS counter. Returns {@code id → caller-count} for every id in the
+     * input. Default loops via {@link #callers}; backends override with a single grouped
+     * COUNT query so pr-impact doesn't issue one round trip per symbol.
+     */
+    default Map<String, Long> bulkCallerCounts(String projectId, List<String> ids) {
+        Map<String, Long> out = new java.util.LinkedHashMap<>();
+        if (ids == null || ids.isEmpty()) return out;
+        for (String id : ids) {
+            if (id == null || id.isBlank()) continue;
+            out.put(id, (long) callers(projectId, id).size());
+        }
+        return out;
+    }
+
+    /**
+     * Bulk downstream-impact ids. For each source id, returns the set of distinct node ids
+     * reachable within {@code depth} hops via {@code CALLS} (and {@code REFERENCES} where the
+     * backend supports it). Used by pr-impact to collapse hundreds of per-symbol BFS calls
+     * into one or two queries. Default loops via {@link #impactDownstream}.
+     */
+    default Map<String, java.util.Set<String>> bulkImpactedIds(String projectId, List<String> ids, int depth) {
+        Map<String, java.util.Set<String>> out = new java.util.LinkedHashMap<>();
+        if (ids == null || ids.isEmpty()) return out;
+        for (String id : ids) {
+            if (id == null || id.isBlank()) continue;
+            java.util.Set<String> set = new java.util.LinkedHashSet<>();
+            for (Map<String, Object> r : impactDownstream(projectId, id, depth)) {
+                Object impId = r.get("id");
+                if (impId != null) set.add(impId.toString());
+            }
+            out.put(id, set);
+        }
+        return out;
+    }
+
+    /**
      * Backend identifier — {@code "neo4j"} or {@code "kuzu"}. Callers can branch when a particular
      * query is only supported on one side (e.g. {@code shortestPath()}, regex {@code =~}).
      */

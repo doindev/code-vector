@@ -23,19 +23,37 @@ import java.util.Map;
 @RequestMapping("/api")
 public class FlowsController {
 
+    private static final int MAX_DEPTH = 8;
+    private static final int MAX_LIMIT = 500;
+
     private final GraphStore store;
     private final ActiveProject project;
+    private final JsonCache jsonCache;
 
-    public FlowsController(GraphStore restGraphStore, ActiveProject activeProject) {
+    public FlowsController(GraphStore restGraphStore, ActiveProject activeProject, JsonCache jsonCache) {
         this.store = restGraphStore;
         this.project = activeProject;
+        this.jsonCache = jsonCache;
     }
 
-    @GetMapping("/flows")
-    public Map<String, Object> flows(
+    @GetMapping(value = "/flows", produces = org.springframework.http.MediaType.APPLICATION_JSON_VALUE)
+    public byte[] flows(
             @RequestParam(value = "kind", defaultValue = "all") String kind,
             @RequestParam(value = "depth", defaultValue = "3") int depth,
             @RequestParam(value = "limit", defaultValue = "50") int limit) {
+        // BFS over the call graph is the most expensive query the dashboard runs by far —
+        // a 3-hop walk from every REST handler can read thousands of edges. Cache the
+        // pre-serialised response so repeat polls hit byte[] without re-walking the graph
+        // or re-running Jackson.
+        String safeKind = sanitiseKind(kind);
+        int effectiveDepth = clamp(depth, 1, MAX_DEPTH);
+        int effectiveLimit = clamp(limit, 1, MAX_LIMIT);
+        String key = "flows:" + project.projectId() + ":" + safeKind
+                + ":d=" + effectiveDepth + ":l=" + effectiveLimit;
+        return jsonCache.memoize(key, () -> build(safeKind, effectiveDepth, effectiveLimit));
+    }
+
+    private Map<String, Object> build(String kind, int depth, int limit) {
         Map<String, List<Map<String, Object>>> flows = store.traceFlows(
                 project.projectId(), kind, depth, limit);
         Map<String, Object> out = new LinkedHashMap<>();
@@ -50,5 +68,17 @@ public class FlowsController {
         out.put("main", flows.getOrDefault("main", List.of()));
         out.put("test", flows.getOrDefault("test", List.of()));
         return out;
+    }
+
+    private static String sanitiseKind(String kind) {
+        if (kind == null) return "all";
+        return switch (kind.toLowerCase()) {
+            case "rest", "main", "test", "all" -> kind.toLowerCase();
+            default -> "all";
+        };
+    }
+
+    private static int clamp(int v, int min, int max) {
+        return Math.max(min, Math.min(max, v));
     }
 }

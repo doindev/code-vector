@@ -27,7 +27,7 @@ public class DoctorCommand implements Callable<Integer> {
         Path cwd = runtime.workingDir();
         Path configRoot = svc.findConfigRoot(cwd);
         if (configRoot == null) {
-            fail("config missing: no .cvector/project.json found from " + cwd);
+            fail("config missing: no .cvector/settings.json (or legacy project.json) found from " + cwd);
             return 1;
         }
         pass("config found: " + svc.configPath(configRoot));

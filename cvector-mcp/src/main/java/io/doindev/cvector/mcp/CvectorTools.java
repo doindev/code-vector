@@ -356,6 +356,130 @@ public class CvectorTools {
         return new LinkedHashMap<>(store.serviceLinks(project.projectId()));
     }
 
+    @Tool(name = "cv_trace",
+            description = "Shortest dependency chain between two symbols over CALLS edges (names only). Returns a flat fqName chain ordered from source to target.")
+    public Map<String, Object> trace(
+            @ToolParam(description = "Source symbol (fully-qualified or last segment).") String from,
+            @ToolParam(description = "Target symbol (fully-qualified or last segment).") String to,
+            @ToolParam(description = "Max BFS depth (default 6, hard cap 12).", required = false) Integer depth) {
+        return tracePath(from, to, depth, /*detailed=*/ false);
+    }
+
+    @Tool(name = "cv_path",
+            description = "Detailed shortest path between two symbols: each hop's node label, fqName, and the edge type leading to the next node.")
+    public Map<String, Object> path(
+            @ToolParam(description = "Source symbol.") String from,
+            @ToolParam(description = "Target symbol.") String to,
+            @ToolParam(description = "Max BFS depth (default 6, hard cap 12).", required = false) Integer depth) {
+        return tracePath(from, to, depth, /*detailed=*/ true);
+    }
+
+    private Map<String, Object> tracePath(String from, String to, Integer depth, boolean detailed) {
+        int d = depth == null ? 6 : Math.max(1, Math.min(depth, 12));
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("from", from);
+        out.put("to", to);
+        out.put("depth", d);
+        List<Map<String, Object>> sources = store.findSymbol(project.projectId(), from);
+        List<Map<String, Object>> targets = store.findSymbol(project.projectId(), to);
+        if (sources.isEmpty() || targets.isEmpty()) {
+            out.put("found", false);
+            out.put("reason", sources.isEmpty() ? "source-not-found" : "target-not-found");
+            return out;
+        }
+        Map<String, Object> source = sources.get(0);
+        Map<String, Object> target = targets.get(0);
+        out.put("source", source);
+        out.put("target", target);
+        Map<String, Object> p = store.shortestPath(project.projectId(),
+                (String) source.get("id"), (String) target.get("id"), d);
+        boolean found = Boolean.TRUE.equals(p.get("found"));
+        out.put("found", found);
+        if (!found) {
+            out.put("reason", "no-path");
+            return out;
+        }
+        out.put("pathDepth", p.get("depth"));
+        if (detailed) {
+            out.put("nodes", p.get("nodes"));
+            out.put("edges", p.get("edges"));
+        } else {
+            @SuppressWarnings("unchecked")
+            List<Map<String, Object>> nodes = (List<Map<String, Object>>) p.get("nodes");
+            List<Object> chain = new ArrayList<>(nodes.size());
+            for (Map<String, Object> n : nodes) chain.add(n.getOrDefault("fqName", n.getOrDefault("name", "")));
+            out.put("chain", chain);
+        }
+        return out;
+    }
+
+    @Tool(name = "cv_db_impact",
+            description = "Database blast radius: methods that read from or write to a given table (optionally narrowed to a column).")
+    public Map<String, Object> dbImpact(
+            @ToolParam(description = "Table name.") String table,
+            @ToolParam(description = "Optional column name to narrow the result.", required = false) String column) {
+        Map<String, List<Map<String, Object>>> impact = store.dbImpact(project.projectId(), table, column);
+        List<Map<String, Object>> readers = impact.getOrDefault("readers", List.of());
+        List<Map<String, Object>> writers = impact.getOrDefault("writers", List.of());
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("table", table);
+        out.put("column", column);
+        out.put("readerCount", readers.size());
+        out.put("writerCount", writers.size());
+        out.put("readers", readers);
+        out.put("writers", writers);
+        return out;
+    }
+
+    @Tool(name = "cv_guard",
+            description = "Quality gate snapshot: per-rule pass/fail and the worst-offender breakdown (god files, dead code, etc).")
+    public Map<String, Object> guard() {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("projectId", project.projectId());
+        out.putAll(store.guardSummary(project.projectId()));
+        return out;
+    }
+
+    @Tool(name = "cv_diff_start",
+            description = "Start an async git diff between two commits (or refs like HEAD~3 / branch names). Returns immediately with {ok, shaA, shaB}; poll cv_diff_status until running=false. The underlying command checks out two worktrees and runs full scans, so it can take minutes — only one diff may run at a time.")
+    public Map<String, Object> diffStart(
+            @ToolParam(description = "Base commit / ref (older).") String shaA,
+            @ToolParam(description = "Target commit / ref (newer).") String shaB,
+            @ToolParam(description = "Also diff CALLS edges (heavier query).", required = false) Boolean includeCalls,
+            @ToolParam(description = "Keep snapshot data after diff (default false).", required = false) Boolean keep) {
+        boolean inc = includeCalls != null && includeCalls;
+        boolean k = keep != null && keep;
+        return CvectorDiffSubprocess.start(shaA, shaB, inc, k);
+    }
+
+    @Tool(name = "cv_diff_status",
+            description = "Poll the status of the most recent cv_diff_start. Returns {running, startedAt, elapsedMillis, shaA, shaB, partialOutput, last:{output, exitCode}} when a diff is in flight or has completed.")
+    public Map<String, Object> diffStatus() {
+        return CvectorDiffSubprocess.status();
+    }
+
+    @Tool(name = "cv_wiki",
+            description = "Structured documentation snapshot: file index, top classes, REST endpoints, tables, config keys, dependencies.")
+    public Map<String, Object> wiki() {
+        String pid = project.projectId();
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("projectId", pid);
+        out.put("projectName", project.name());
+        Map<String, Long> nodes = store.nodeCounts(pid);
+        Map<String, Long> edges = store.edgeCounts(pid);
+        out.put("totals", Map.of(
+                "nodes", nodes.values().stream().mapToLong(Long::longValue).sum(),
+                "edges", edges.values().stream().mapToLong(Long::longValue).sum()
+        ));
+        out.put("nodes", nodes);
+        out.put("edges", edges);
+        out.put("files", store.fileInventory(pid));
+        out.putAll(store.onboardSummary(pid));
+        out.putAll(store.infrastructureSummary(pid));
+        out.put("dependencies", store.mavenDependencies(pid));
+        return out;
+    }
+
     @Tool(name = "cv_audit",
             description = "Dependency vulnerability check via OSV.dev for every MavenDependency in the graph. Network call may take several seconds.")
     public Map<String, Object> audit() {

@@ -35,7 +35,8 @@ public class CvectorRuntime {
         Path root = configService.findConfigRoot(workingDir());
         if (root == null) {
             throw new IllegalStateException(
-                    "No .cvector/project.json found in " + workingDir() + " or any parent. Run `cvector init` first.");
+                    "No .cvector/settings.json (or legacy project.json) found in " + workingDir()
+                            + " or any parent. Run `cvector init` first.");
         }
         return root;
     }
@@ -71,7 +72,8 @@ public class CvectorRuntime {
      * {@code CREATE NODE TABLE IF NOT EXISTS} is idempotent).
      */
     public GraphStore openGraphStore(CvectorConfig cfg) {
-        if (isEmbeddedRequested()) {
+        String backend = resolveBackend(cfg);
+        if (CvectorConfig.BACKEND_EMBEDDED.equals(backend)) {
             CvectorConfig.ProjectEntry entry = requireActiveProject(cfg);
             Path db = EmbeddedKuzu.defaultDbPath(entry.projectId());
             try {
@@ -86,14 +88,34 @@ public class CvectorRuntime {
     }
 
     /**
-     * True when the operator asked for the embedded KuzuDB backend instead of Neo4j. Set by the
-     * {@code --embedded} CLI flag (which writes the system property) or by exporting
-     * {@code CVECTOR_EMBEDDED=true}.
+     * Backend selection precedence:
+     * <ol>
+     *   <li>{@code cvector.embedded=true} (legacy override — still wins).</li>
+     *   <li>{@code CVECTOR_EMBEDDED=true} env var.</li>
+     *   <li>{@code cvector.backend} system property ({@code embedded} | {@code remote} | {@code docker}).</li>
+     *   <li>{@code settings.json} backend field.</li>
+     *   <li>Default: {@code embedded}.</li>
+     * </ol>
+     */
+    public static String resolveBackend(CvectorConfig cfg) {
+        if (Boolean.getBoolean("cvector.embedded")) return CvectorConfig.BACKEND_EMBEDDED;
+        String env = System.getenv("CVECTOR_EMBEDDED");
+        if (env != null && env.equalsIgnoreCase("true")) return CvectorConfig.BACKEND_EMBEDDED;
+        String override = System.getProperty("cvector.backend");
+        if (override != null && !override.isBlank()) return override.toLowerCase();
+        return cfg == null ? CvectorConfig.BACKEND_EMBEDDED : cfg.backendOrDefault();
+    }
+
+    /**
+     * Back-compat shim for callers that pre-date the backend field. Returns true when the
+     * effective backend is {@code embedded}.
      */
     public static boolean isEmbeddedRequested() {
         if (Boolean.getBoolean("cvector.embedded")) return true;
         String env = System.getenv("CVECTOR_EMBEDDED");
-        return env != null && env.equalsIgnoreCase("true");
+        if (env != null && env.equalsIgnoreCase("true")) return true;
+        String override = System.getProperty("cvector.backend");
+        return override == null || override.isBlank() || override.equalsIgnoreCase(CvectorConfig.BACKEND_EMBEDDED);
     }
 
     public ProjectContext projectContext(CvectorConfig cfg) {

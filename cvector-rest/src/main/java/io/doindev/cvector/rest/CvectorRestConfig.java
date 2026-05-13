@@ -28,16 +28,31 @@ import java.nio.file.Paths;
 @ConditionalOnWebApplication
 public class CvectorRestConfig {
 
-    private static boolean embeddedRequested() {
-        if (Boolean.getBoolean("cvector.embedded")) return true;
+    /**
+     * Backend selection precedence:
+     * <ol>
+     *   <li>{@code cvector.embedded=true} system property (legacy opt-in, still wins for back-compat).</li>
+     *   <li>{@code CVECTOR_EMBEDDED=true} env var (legacy opt-in).</li>
+     *   <li>{@code settings.json} {@code backend} field — {@code embedded} | {@code remote} | {@code docker}.</li>
+     *   <li>Default: {@code embedded}.</li>
+     * </ol>
+     * The CLI's {@code --remote} / {@code --docker} flags translate into the settings.json field
+     * (or a one-shot system property override) rather than going through their own boot path.
+     */
+    private static String resolveBackend(CvectorConfig cfg) {
+        if (Boolean.getBoolean("cvector.embedded")) return CvectorConfig.BACKEND_EMBEDDED;
         String env = System.getenv("CVECTOR_EMBEDDED");
-        return env != null && env.equalsIgnoreCase("true");
+        if (env != null && env.equalsIgnoreCase("true")) return CvectorConfig.BACKEND_EMBEDDED;
+        String override = System.getProperty("cvector.backend");
+        if (override != null && !override.isBlank()) return override.toLowerCase();
+        return cfg.backendOrDefault();
     }
 
     @Bean(destroyMethod = "close")
     public GraphStore restGraphStore(CvectorConfigService configService, ActiveProject activeProject) {
         CvectorConfig cfg = loadConfig(configService);
-        if (embeddedRequested()) {
+        String backend = resolveBackend(cfg);
+        if (CvectorConfig.BACKEND_EMBEDDED.equals(backend)) {
             Path db = EmbeddedKuzu.defaultDbPath(activeProject.projectId());
             try {
                 EmbeddedKuzu kuzu = new EmbeddedKuzu(db);
@@ -47,6 +62,18 @@ public class CvectorRestConfig {
                 throw new UncheckedIOException("failed to open embedded kuzu at " + db, e);
             }
         }
+        if (CvectorConfig.BACKEND_DOCKER.equals(backend)) {
+            // Best-effort container bring-up. We don't block REST startup on docker compose
+            // failure — the user can fix Docker and restart — but waiting for bolt readiness
+            // before opening the driver avoids a confusing "connection refused" race.
+            Path root = Paths.get("").toAbsolutePath();
+            Path configRoot = configService.findConfigRoot(root);
+            if (configRoot != null) {
+                DockerNeo4jBackend.ensureRunning(configService, configRoot, cfg.dockerOrDefault());
+            }
+        }
+        // Both "remote" and "docker" connect through the Neo4j driver — the difference is that
+        // "docker" implies the app is responsible for the container lifecycle (handled above).
         CvectorConfig.Neo4jConfig n = cfg.neo4j() != null ? cfg.neo4j() : CvectorConfig.Neo4jConfig.defaults();
         return new Neo4jGraphStore(new Neo4jClient(n.uri(), n.user(), n.password()));
     }

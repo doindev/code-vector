@@ -39,14 +39,16 @@ public class GraphSliceController {
 
     private final GraphStore store;
     private final ActiveProject project;
+    private final JsonCache jsonCache;
 
-    public GraphSliceController(GraphStore restGraphStore, ActiveProject activeProject) {
+    public GraphSliceController(GraphStore restGraphStore, ActiveProject activeProject, JsonCache jsonCache) {
         this.store = restGraphStore;
         this.project = activeProject;
+        this.jsonCache = jsonCache;
     }
 
-    @GetMapping("/slice")
-    public Map<String, Object> slice(
+    @GetMapping(value = "/slice", produces = org.springframework.http.MediaType.APPLICATION_JSON_VALUE)
+    public byte[] slice(
             @RequestParam("symbol") String symbol,
             @RequestParam(value = "depth", defaultValue = "1") int depth,
             @RequestParam(value = "max", defaultValue = "200") int max,
@@ -54,8 +56,19 @@ public class GraphSliceController {
     ) {
         int effectiveDepth = clamp(depth, 1, MAX_DEPTH);
         int effectiveMax = clamp(max, 1, HARD_MAX);
-        boolean traverseIn = !"out".equalsIgnoreCase(direction);
-        boolean traverseOut = !"in".equalsIgnoreCase(direction);
+        String dirKey = "in".equalsIgnoreCase(direction) ? "in"
+                : "out".equalsIgnoreCase(direction) ? "out" : "both";
+        // Repeated navigation back to the same symbol (the dashboard's Graph view) re-fires
+        // the same BFS. Cache by every dimension that changes the result so jumping between
+        // depths or directions still re-queries.
+        String key = "slice:" + project.projectId() + ":" + symbol + ":d=" + effectiveDepth
+                + ":m=" + effectiveMax + ":" + dirKey;
+        return jsonCache.memoize(key, () -> computeSlice(symbol, effectiveDepth, effectiveMax, dirKey));
+    }
+
+    private Map<String, Object> computeSlice(String symbol, int effectiveDepth, int effectiveMax, String direction) {
+        boolean traverseIn = !"out".equals(direction);
+        boolean traverseOut = !"in".equals(direction);
         String pid = project.projectId();
 
         List<Map<String, Object>> seeds = store.findSymbol(pid, symbol);

@@ -2,10 +2,12 @@ package io.doindev.cvector.mcp;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.doindev.cvector.core.store.GraphStore;
+import io.doindev.cvector.core.util.LouvainCommunityDetector;
 import io.modelcontextprotocol.server.McpServerFeatures;
 import io.modelcontextprotocol.spec.McpSchema;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -56,6 +58,9 @@ public class CvectorResources {
         out.add(resource("cvector://guard", "guard",
                 "Quality gate snapshot: severity totals and whether the build would block.",
                 req -> readGuard()));
+        out.add(resource("cvector://communities", "communities",
+                "Functional clusters in the call graph (Louvain) with size and a top-fqName sample per cluster.",
+                req -> readCommunities()));
         return out;
     }
 
@@ -141,6 +146,47 @@ public class CvectorResources {
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("projectId", project.projectId());
         out.putAll(store.guardSummary(project.projectId()));
+        return out;
+    }
+
+    /**
+     * Compute Louvain communities over the method call graph and return per-cluster summaries:
+     * size, modularity contribution if known, plus the top-5 fqNames as a peek. We cap the
+     * returned cluster count to keep the JSON payload bounded; clients that want everything
+     * should call {@code cv_communities} with a higher limit.
+     */
+    private Map<String, Object> readCommunities() {
+        String pid = project.projectId();
+        GraphStore.MethodCallGraph g = store.methodCallGraph(pid);
+        String[] fqNames = g.fqNames();
+        List<int[]> edges = g.edges();
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("projectId", pid);
+        out.put("methodCount", fqNames.length);
+        out.put("edgeCount", edges.size());
+        if (fqNames.length == 0) {
+            out.put("communities", List.of());
+            return out;
+        }
+        int[] assignments = LouvainCommunityDetector.detect(fqNames.length, edges).community();
+        Map<Integer, List<String>> byCluster = new LinkedHashMap<>();
+        for (int i = 0; i < assignments.length; i++) {
+            byCluster.computeIfAbsent(assignments[i], k -> new ArrayList<>()).add(fqNames[i]);
+        }
+        List<Map<String, Object>> clusters = new ArrayList<>();
+        // Sort clusters by descending size; cap to 50 to avoid mega payloads.
+        byCluster.entrySet().stream()
+                .sorted(Comparator.<Map.Entry<Integer, List<String>>>comparingInt(e -> e.getValue().size()).reversed())
+                .limit(50)
+                .forEach(e -> {
+                    List<String> members = e.getValue();
+                    Map<String, Object> row = new LinkedHashMap<>();
+                    row.put("clusterId", e.getKey());
+                    row.put("size", members.size());
+                    row.put("members", members.subList(0, Math.min(5, members.size())));
+                    clusters.add(row);
+                });
+        out.put("communities", clusters);
         return out;
     }
 }

@@ -2,6 +2,7 @@ package io.doindev.cvector.rest;
 
 import io.doindev.cvector.core.store.GraphStore;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplication;
+import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
@@ -25,17 +26,22 @@ public class OnboardController {
 
     private final GraphStore store;
     private final ActiveProject project;
-    private final GraphReadCache cache;
+    private final JsonCache jsonCache;
 
-    public OnboardController(GraphStore restGraphStore, ActiveProject activeProject, GraphReadCache cache) {
+    public OnboardController(GraphStore restGraphStore, ActiveProject activeProject, JsonCache jsonCache) {
         this.store = restGraphStore;
         this.project = activeProject;
-        this.cache = cache;
+        this.jsonCache = jsonCache;
     }
 
-    @GetMapping("/onboard")
-    public Map<String, Object> onboard() {
-        return cache.memoize("onboard:" + project.projectId(), this::buildOnboard);
+    /**
+     * Returns pre-serialised JSON bytes on a cache hit so Spring writes the payload to the
+     * response directly, skipping the per-request Jackson round trip. Onboard's payload is
+     * ~50-100 KB on a medium-sized project; pre-serialising saves the bulk of the warm latency.
+     */
+    @GetMapping(value = "/onboard", produces = MediaType.APPLICATION_JSON_VALUE)
+    public byte[] onboard() {
+        return jsonCache.memoize("onboard:" + project.projectId(), this::buildOnboard);
     }
 
     private Map<String, Object> buildOnboard() {

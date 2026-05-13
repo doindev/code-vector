@@ -27,13 +27,15 @@ public class DashboardController {
     private final ScheduleRunner scheduler;
     private final MonitorRunner monitors;
     private final ScanRunner scans;
+    private final DiffRunner diffs;
 
     public DashboardController(DashboardStore store, ScheduleRunner scheduler,
-                               MonitorRunner monitors, ScanRunner scans) {
+                               MonitorRunner monitors, ScanRunner scans, DiffRunner diffs) {
         this.store = store;
         this.scheduler = scheduler;
         this.monitors = monitors;
         this.scans = scans;
+        this.diffs = diffs;
     }
 
     // Monitors -----------------------------------------------------------------------
@@ -100,6 +102,33 @@ public class DashboardController {
     @GetMapping("/scans/status")
     public Map<String, Object> scansStatus() {
         return scans.status();
+    }
+
+    // Diff --------------------------------------------------------------------------
+
+    @PostMapping("/diff")
+    public ResponseEntity<Map<String, Object>> runDiff(@RequestBody Map<String, Object> body) {
+        if (body == null) body = Map.of();
+        String shaA = String.valueOf(body.getOrDefault("shaA", "")).trim();
+        String shaB = String.valueOf(body.getOrDefault("shaB", "")).trim();
+        boolean includeCalls = body.get("includeCalls") instanceof Boolean b && b;
+        boolean keep = body.get("keep") instanceof Boolean k && k;
+        if (shaA.isEmpty() || shaB.isEmpty()) {
+            return ResponseEntity.badRequest().body(Map.of("ok", false, "reason", "missing-shas"));
+        }
+        Map<String, Object> result = diffs.start(shaA, shaB, includeCalls, keep);
+        boolean ok = result.get("ok") instanceof Boolean b && b;
+        if (!ok) {
+            Object reason = result.get("reason");
+            if ("already-running".equals(reason)) return ResponseEntity.status(409).body(result);
+            return ResponseEntity.badRequest().body(result);
+        }
+        return ResponseEntity.accepted().body(result);
+    }
+
+    @GetMapping("/diff/status")
+    public Map<String, Object> diffStatus() {
+        return diffs.status();
     }
 
     // Schedules ----------------------------------------------------------------------

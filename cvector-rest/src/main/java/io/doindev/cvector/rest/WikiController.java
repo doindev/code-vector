@@ -31,21 +31,38 @@ public class WikiController {
 
     private final GraphStore store;
     private final ActiveProject project;
-    private final GraphReadCache cache;
+    private final JsonCache jsonCache;
 
-    public WikiController(GraphStore restGraphStore, ActiveProject activeProject, GraphReadCache cache) {
+    public WikiController(GraphStore restGraphStore, ActiveProject activeProject, JsonCache jsonCache) {
         this.store = restGraphStore;
         this.project = activeProject;
-        this.cache = cache;
+        this.jsonCache = jsonCache;
     }
 
-    @GetMapping("/wiki")
-    public Map<String, Object> wiki() {
-        return cache.memoize("wiki:" + project.projectId(), this::buildWiki);
+    /** Pre-serialised JSON bytes; wiki is the heaviest read endpoint (~60 KB raw on cvector itself). */
+    @GetMapping(value = "/wiki", produces = org.springframework.http.MediaType.APPLICATION_JSON_VALUE)
+    public byte[] wiki() {
+        return jsonCache.memoize("wiki:" + project.projectId(), this::buildWiki);
     }
 
     private Map<String, Object> buildWiki() {
         String pid = project.projectId();
+        Map<String, Long> nodes = store.nodeCounts(pid);
+        Map<String, Long> edges = store.edgeCounts(pid);
+        Map<String, List<Map<String, Object>>> onboard = store.onboardSummary(pid);
+        Map<String, List<Map<String, Object>>> infra = store.infrastructureSummary(pid);
+
+        List<Map<String, Object>> sections = new ArrayList<>();
+        sections.add(graphNodesSection(nodes));
+        sections.add(graphEdgesSection(edges));
+        sections.add(filesSection(pid));
+        sections.add(topClassesSection(onboard));
+        sections.add(restEndpointsSection(onboard));
+        sections.add(databaseTablesSection(onboard));
+        sections.add(configKeysSection(infra));
+        sections.add(envVarsSection(infra));
+        sections.add(mavenDependenciesSection(pid));
+
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("project", Map.of(
                 "projectId", pid,
@@ -54,29 +71,32 @@ public class WikiController {
                 "backend", store.backend()
         ));
         out.put("generatedAt", ZonedDateTime.now().toString());
-
-        Map<String, Long> nodes = store.nodeCounts(pid);
-        Map<String, Long> edges = store.edgeCounts(pid);
         out.put("totals", Map.of(
                 "nodes", nodes.values().stream().mapToLong(Long::longValue).sum(),
                 "edges", edges.values().stream().mapToLong(Long::longValue).sum()
         ));
+        out.put("sections", sections);
+        return out;
+    }
 
-        Map<String, List<Map<String, Object>>> onboard = store.onboardSummary(pid);
-        Map<String, List<Map<String, Object>>> infra = store.infrastructureSummary(pid);
-
-        List<Map<String, Object>> sections = new ArrayList<>();
-        sections.add(tableSection("graph-nodes", "Graph nodes",
+    private Map<String, Object> graphNodesSection(Map<String, Long> nodes) {
+        return tableSection("graph-nodes", "Graph nodes",
                 List.of("Label", "Count"),
                 nodes.entrySet().stream()
                         .map(e -> row("Label", e.getKey(), "Count", e.getValue()))
-                        .toList()));
-        sections.add(tableSection("graph-edges", "Graph edges",
+                        .toList());
+    }
+
+    private Map<String, Object> graphEdgesSection(Map<String, Long> edges) {
+        return tableSection("graph-edges", "Graph edges",
                 List.of("Type", "Count"),
                 edges.entrySet().stream()
                         .map(e -> row("Type", e.getKey(), "Count", e.getValue()))
-                        .toList()));
-        sections.add(tableSection("files", "Files",
+                        .toList());
+    }
+
+    private Map<String, Object> filesSection(String pid) {
+        return tableSection("files", "Files",
                 List.of("Path", "Language", "Methods", "Last ingested"),
                 store.fileInventory(pid).stream()
                         .map(r -> row(
@@ -85,16 +105,22 @@ public class WikiController {
                                 "Methods", r.getOrDefault("methodCount", 0),
                                 "Last ingested", r.get("lastIngestedAt")
                         ))
-                        .toList()));
-        sections.add(tableSection("classes", "Top classes",
+                        .toList());
+    }
+
+    private Map<String, Object> topClassesSection(Map<String, List<Map<String, Object>>> onboard) {
+        return tableSection("classes", "Top classes",
                 List.of("Class", "Methods"),
                 onboard.getOrDefault("topClasses", List.of()).stream()
                         .map(r -> row(
                                 "Class", r.get("fqName"),
                                 "Methods", r.getOrDefault("methodCount", 0)
                         ))
-                        .toList()));
-        sections.add(tableSection("endpoints", "REST endpoints",
+                        .toList());
+    }
+
+    private Map<String, Object> restEndpointsSection(Map<String, List<Map<String, Object>>> onboard) {
+        return tableSection("endpoints", "REST endpoints",
                 List.of("Method", "Path", "Framework"),
                 onboard.getOrDefault("restEndpoints", List.of()).stream()
                         .map(r -> row(
@@ -102,29 +128,41 @@ public class WikiController {
                                 "Path", r.get("path"),
                                 "Framework", r.get("framework")
                         ))
-                        .toList()));
-        sections.add(tableSection("tables", "Database tables",
+                        .toList());
+    }
+
+    private Map<String, Object> databaseTablesSection(Map<String, List<Map<String, Object>>> onboard) {
+        return tableSection("tables", "Database tables",
                 List.of("Table", "Columns"),
                 onboard.getOrDefault("tables", List.of()).stream()
                         .map(r -> row(
                                 "Table", r.get("table"),
                                 "Columns", r.getOrDefault("columns", 0)
                         ))
-                        .toList()));
-        sections.add(tableSection("config", "Config keys",
+                        .toList());
+    }
+
+    private Map<String, Object> configKeysSection(Map<String, List<Map<String, Object>>> infra) {
+        return tableSection("config", "Config keys",
                 List.of("Key"),
                 infra.getOrDefault("configKeys", List.of()).stream()
                         .map(r -> row("Key", r.get("fqName")))
-                        .toList()));
-        sections.add(tableSection("env", "Environment variables",
+                        .toList());
+    }
+
+    private Map<String, Object> envVarsSection(Map<String, List<Map<String, Object>>> infra) {
+        return tableSection("env", "Environment variables",
                 List.of("Name", "Value"),
                 infra.getOrDefault("envVars", List.of()).stream()
                         .map(r -> row(
                                 "Name", r.get("fqName"),
                                 "Value", r.get("value")
                         ))
-                        .toList()));
-        sections.add(tableSection("dependencies", "Maven dependencies",
+                        .toList());
+    }
+
+    private Map<String, Object> mavenDependenciesSection(String pid) {
+        return tableSection("dependencies", "Maven dependencies",
                 List.of("Group", "Artifact", "Version", "Scope"),
                 store.mavenDependencies(pid).stream()
                         .map(r -> row(
@@ -133,10 +171,7 @@ public class WikiController {
                                 "Version", r.get("version"),
                                 "Scope", r.get("scope")
                         ))
-                        .toList()));
-
-        out.put("sections", sections);
-        return out;
+                        .toList());
     }
 
     private static Map<String, Object> tableSection(String id, String title,

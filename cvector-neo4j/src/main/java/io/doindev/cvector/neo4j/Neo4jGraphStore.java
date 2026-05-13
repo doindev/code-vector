@@ -7,6 +7,8 @@ import io.doindev.cvector.neo4j.repo.GraphQueries;
 import java.time.Duration;
 import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -431,6 +433,205 @@ public final class Neo4jGraphStore implements GraphStore {
                         + "RETURN DISTINCT t.fqName AS test, t.fileId AS fileId, length(p) AS depth "
                         + "ORDER BY depth ASC LIMIT 200",
                 Map.of("pid", projectId, "id", id));
+    }
+
+    @Override
+    public Map<String, String> bulkFilesByPath(String projectId, List<String> paths) {
+        Map<String, String> out = new LinkedHashMap<>();
+        if (paths == null || paths.isEmpty()) return out;
+        Map<String, Object> params = new LinkedHashMap<>();
+        params.put("pid", projectId);
+        params.put("paths", paths);
+        List<Map<String, Object>> rows = queries.raw(
+                "UNWIND $paths AS p "
+                        + "MATCH (f:File {projectId: $pid, path: p}) "
+                        + "RETURN f.path AS path, f.id AS id",
+                params);
+        for (Map<String, Object> r : rows) {
+            Object p = r.get("path");
+            Object id = r.get("id");
+            if (p != null && id != null) out.put(p.toString(), id.toString());
+        }
+        return out;
+    }
+
+    @Override
+    public Map<String, List<Map<String, Object>>> bulkContains(String projectId, List<String> fileIds, int limitPerFile) {
+        Map<String, List<Map<String, Object>>> out = new LinkedHashMap<>();
+        if (fileIds == null || fileIds.isEmpty()) return out;
+        Map<String, Object> params = new LinkedHashMap<>();
+        params.put("pid", projectId);
+        params.put("ids", fileIds);
+        List<Map<String, Object>> rows = queries.raw(
+                "UNWIND $ids AS fid "
+                        + "MATCH (f {id: fid, projectId: $pid})-[:CONTAINS]->(c {projectId: $pid}) "
+                        + "RETURN fid AS fileId, labels(c)[0] AS label, c.fqName AS fqName, c.id AS id",
+                params);
+        for (String fid : fileIds) out.put(fid, new ArrayList<>());
+        for (Map<String, Object> r : rows) {
+            Object fid = r.get("fileId");
+            if (fid == null) continue;
+            List<Map<String, Object>> bucket = out.get(fid.toString());
+            if (bucket == null) continue;
+            if (bucket.size() >= limitPerFile) continue;
+            Map<String, Object> child = new LinkedHashMap<>();
+            child.put("label", r.get("label"));
+            child.put("fqName", r.get("fqName"));
+            child.put("id", r.get("id"));
+            bucket.add(child);
+        }
+        return out;
+    }
+
+    @Override
+    public Map<String, Long> bulkCallerCounts(String projectId, List<String> ids) {
+        Map<String, Long> out = new LinkedHashMap<>();
+        if (ids == null || ids.isEmpty()) return out;
+        Map<String, Object> params = new LinkedHashMap<>();
+        params.put("pid", projectId);
+        params.put("ids", ids);
+        List<Map<String, Object>> rows = queries.raw(
+                "MATCH (caller:Method {projectId: $pid})-[:CALLS]->(callee {projectId: $pid}) "
+                        + "WHERE callee.id IN $ids "
+                        + "RETURN callee.id AS targetId, count(caller) AS cnt", params);
+        for (String id : ids) out.put(id, 0L);
+        for (Map<String, Object> r : rows) {
+            Object tid = r.get("targetId");
+            if (tid == null) continue;
+            long cnt = (r.get("cnt") instanceof Number n) ? n.longValue() : 0L;
+            out.put(tid.toString(), cnt);
+        }
+        return out;
+    }
+
+    @Override
+    public Map<String, java.util.Set<String>> bulkImpactedIds(String projectId, List<String> ids, int depth) {
+        Map<String, java.util.Set<String>> out = new LinkedHashMap<>();
+        if (ids == null || ids.isEmpty()) return out;
+        int d = Math.max(1, depth);
+        for (String id : ids) if (id != null && !id.isBlank()) out.put(id, new java.util.LinkedHashSet<>());
+        Map<String, Object> params = new LinkedHashMap<>();
+        params.put("pid", projectId);
+        params.put("ids", ids);
+        List<Map<String, Object>> rows = queries.raw(
+                "MATCH (start {projectId: $pid})-[:CALLS|REFERENCES*1.." + d + "]->(impacted {projectId: $pid}) "
+                        + "WHERE start.id IN $ids "
+                        + "RETURN DISTINCT start.id AS source, impacted.id AS impacted", params);
+        for (Map<String, Object> r : rows) {
+            Object src = r.get("source");
+            Object imp = r.get("impacted");
+            if (src == null || imp == null) continue;
+            java.util.Set<String> bucket = out.get(src.toString());
+            if (bucket != null) bucket.add(imp.toString());
+        }
+        return out;
+    }
+
+    @Override
+    public Map<String, Object> nodeById(String projectId, String id) {
+        if (id == null) return Map.of();
+        List<Map<String, Object>> rows = queries.raw(
+                "MATCH (n {id: $id, projectId: $pid}) "
+                        + "RETURN labels(n)[0] AS label, n.fqName AS fqName, n.name AS name LIMIT 1",
+                Map.of("id", id, "pid", projectId));
+        return rows.isEmpty() ? Map.of() : new LinkedHashMap<>(rows.get(0));
+    }
+
+    @Override
+    public Map<String, Object> shortestPath(String projectId, String fromId, String toId, int maxDepth) {
+        Map<String, Object> empty = new LinkedHashMap<>();
+        empty.put("found", false);
+        empty.put("depth", -1);
+        empty.put("nodes", List.of());
+        empty.put("edges", List.of());
+        if (fromId == null || toId == null) return empty;
+        int safeDepth = Math.max(1, Math.min(maxDepth, 12));
+        if (fromId.equals(toId)) {
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("found", true);
+            result.put("depth", 0);
+            result.put("nodes", List.of());
+            result.put("edges", List.of());
+            return result;
+        }
+        // Neo4j has shortestPath, so we let the planner do the heavy lifting and then unwrap
+        // the path's nodes / relationship types into the same JSON shape the Kuzu backend
+        // returns. UNWIND emits the path in order; relationship types preserve direction
+        // (we only follow outgoing CALLS).
+        List<Map<String, Object>> rows = queries.raw(
+                "MATCH (a {id: $from, projectId: $pid}), (b {id: $to, projectId: $pid}) "
+                        + "MATCH p = shortestPath((a)-[:CALLS*1.." + safeDepth + "]->(b)) "
+                        + "WITH p, nodes(p) AS ns, [r IN relationships(p) | type(r)] AS types "
+                        + "RETURN [n IN ns | {id: n.id, label: labels(n)[0], fqName: n.fqName, name: n.name}] AS nodes, "
+                        + "       types AS edgeTypes, length(p) AS depth LIMIT 1",
+                Map.of("pid", projectId, "from", fromId, "to", toId));
+        if (rows.isEmpty()) return empty;
+        Map<String, Object> r = rows.get(0);
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> nodes = (List<Map<String, Object>>) r.getOrDefault("nodes", List.of());
+        @SuppressWarnings("unchecked")
+        List<Object> types = (List<Object>) r.getOrDefault("edgeTypes", List.of());
+        List<Map<String, Object>> edges = new ArrayList<>(Math.max(0, nodes.size() - 1));
+        for (int i = 0; i + 1 < nodes.size(); i++) {
+            Map<String, Object> e = new LinkedHashMap<>();
+            e.put("from", nodes.get(i).get("id"));
+            e.put("to", nodes.get(i + 1).get("id"));
+            e.put("type", i < types.size() ? String.valueOf(types.get(i)) : "CALLS");
+            edges.add(e);
+        }
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("found", true);
+        result.put("depth", asLong(r.get("depth")));
+        result.put("nodes", nodes);
+        result.put("edges", edges);
+        return result;
+    }
+
+    @Override
+    public Map<String, List<Map<String, Object>>> dbImpact(String projectId, String table, String column) {
+        Map<String, List<Map<String, Object>>> out = new LinkedHashMap<>();
+        if (table == null || table.isBlank()) {
+            out.put("readers", List.of());
+            out.put("writers", List.of());
+            return out;
+        }
+        Map<String, Object> params = new LinkedHashMap<>();
+        params.put("pid", projectId);
+        params.put("table", table);
+        List<Map<String, Object>> readers = queries.raw(
+                "MATCH (m:Method {projectId: $pid})-[:READS_TABLE]->(t:Table {projectId: $pid, name: $table}) "
+                        + "RETURN DISTINCT m.fqName AS fqName, m.fileId AS fileId, m.startLine AS line "
+                        + "ORDER BY m.fqName LIMIT 500", params);
+        List<Map<String, Object>> writers = queries.raw(
+                "MATCH (m:Method {projectId: $pid})-[:WRITES_TABLE]->(t:Table {projectId: $pid, name: $table}) "
+                        + "RETURN DISTINCT m.fqName AS fqName, m.fileId AS fileId, m.startLine AS line "
+                        + "ORDER BY m.fqName LIMIT 500", params);
+        if (column != null && !column.isBlank()) {
+            params.put("col", column);
+            List<Map<String, Object>> colReaders = queries.raw(
+                    "MATCH (t:Table {projectId: $pid, name: $table})-[:CONTAINS]->(c:Column {projectId: $pid, name: $col})"
+                            + "<-[:READS_COLUMN]-(m:Method {projectId: $pid}) "
+                            + "RETURN DISTINCT m.fqName AS fqName, m.fileId AS fileId, m.startLine AS line "
+                            + "ORDER BY m.fqName LIMIT 500", params);
+            List<Map<String, Object>> colWriters = queries.raw(
+                    "MATCH (t:Table {projectId: $pid, name: $table})-[:CONTAINS]->(c:Column {projectId: $pid, name: $col})"
+                            + "<-[:WRITES_COLUMN]-(m:Method {projectId: $pid}) "
+                            + "RETURN DISTINCT m.fqName AS fqName, m.fileId AS fileId, m.startLine AS line "
+                            + "ORDER BY m.fqName LIMIT 500", params);
+            readers = intersectByFqName(readers, colReaders);
+            writers = intersectByFqName(writers, colWriters);
+        }
+        out.put("readers", readers);
+        out.put("writers", writers);
+        return out;
+    }
+
+    private static List<Map<String, Object>> intersectByFqName(List<Map<String, Object>> a, List<Map<String, Object>> b) {
+        java.util.Set<Object> keysB = new java.util.HashSet<>();
+        for (Map<String, Object> r : b) keysB.add(r.get("fqName"));
+        List<Map<String, Object>> out = new ArrayList<>(Math.min(a.size(), b.size()));
+        for (Map<String, Object> r : a) if (keysB.contains(r.get("fqName"))) out.add(r);
+        return out;
     }
 
     @Override

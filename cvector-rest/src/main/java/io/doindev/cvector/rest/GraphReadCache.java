@@ -35,6 +35,14 @@ public class GraphReadCache {
     /** Default TTL. Polling cadences are 2/3/10/30 s; 30 s lets the 10 s pollers cache-hit ~2/3 of the time. */
     public static final Duration DEFAULT_TTL = Duration.ofSeconds(30);
 
+    /**
+     * Soft cap on entries. Symbol-keyed endpoints (search/explain/impact/slice) can produce
+     * one entry per unique navigation, so without a cap the cache grows with user activity.
+     * On insert past this size we sweep expired entries first, then drop the oldest-by-expiry
+     * to keep the cache bounded. 4096 ≈ a few MB of small JSON maps; cheap.
+     */
+    private static final int MAX_ENTRIES = 4096;
+
     private final ConcurrentMap<String, Entry> cache = new ConcurrentHashMap<>();
 
     /** Memoise {@code compute} under {@code key} using the default TTL. */
@@ -48,8 +56,28 @@ public class GraphReadCache {
         Entry hit = cache.get(key);
         if (hit != null && hit.expiresAt.isAfter(now)) return (T) hit.value;
         T value = compute.get();
+        if (cache.size() >= MAX_ENTRIES) sweep(now);
         cache.put(key, new Entry(value, now.plus(ttl)));
         return value;
+    }
+
+    /**
+     * Two-pass eviction. First drop everything that already expired (cheap and correct).
+     * If we're still over the cap, drop the entries whose TTL is closest to expiring.
+     * Not perfect LRU but bounded and cheap: the cache exists to absorb burst polling,
+     * not to be a long-term memoiser.
+     */
+    private void sweep(Instant now) {
+        cache.values().removeIf(e -> e.expiresAt.isBefore(now));
+        if (cache.size() < MAX_ENTRIES) return;
+        // Drop ~25% of the soonest-to-expire entries so subsequent inserts don't immediately
+        // trigger another sweep.
+        int toRemove = Math.max(1, cache.size() / 4);
+        cache.entrySet().stream()
+                .sorted((a, b) -> a.getValue().expiresAt.compareTo(b.getValue().expiresAt))
+                .limit(toRemove)
+                .map(java.util.Map.Entry::getKey)
+                .forEach(cache::remove);
     }
 
     /** Drop all cached entries. Used after a scan completes so views see fresh data immediately. */

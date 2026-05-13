@@ -1,0 +1,31 @@
+{
+  "activeProject" : "code-vector",
+  "projects" : {
+    "code-vector" : {
+      "projectId" : "0d357370-80be-423e-9f79-c7ffc496eed3",
+      "name" : "code-vector",
+      "rootPath" : "C:\\Users\\timhj\\eclipse-workspace\\code-vector"
+    }
+  },
+  "neo4j" : {
+    "uri" : "bolt://localhost:7687",
+    "user" : "neo4j",
+    "password" : "neo4j_admin"
+  },
+  "backend" : "embedded",
+  "rest" : {
+    "port" : 2969,
+    "host" : "127.0.0.1"
+  },
+  "mcp" : {
+    "url" : "http://127.0.0.1:2969/mcp",
+    "transport" : "http"
+  },
+  "docker" : {
+    "image" : "neo4j",
+    "containerName" : "cvector-neo4j",
+    "neo4jVersion" : "5",
+    "boltPort" : 7687,
+    "httpPort" : 7474
+  }
+}

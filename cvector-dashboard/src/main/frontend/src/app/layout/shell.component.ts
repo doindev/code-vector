@@ -24,12 +24,14 @@ const NAV: ReadonlyArray<NavSection> = [
       { label: 'Monitors',   path: '/monitors', icon: 'bi-eye'             },
       { label: 'Schedules',  path: '/schedules',icon: 'bi-clock-history'   },
       { label: 'Recent',     path: '/recent',   icon: 'bi-activity'        },
+      { label: 'Changelog',  path: '/changelog',icon: 'bi-journal-arrow-up'},
     ],
   },
   {
     title: 'Analysis',
     items: [
       { label: 'Guard',       path: '/guard',       icon: 'bi-shield-check'       },
+      { label: 'Rules',       path: '/rules',       icon: 'bi-clipboard-check'    },
       { label: 'Health',      path: '/health',      icon: 'bi-heart-pulse'        },
       { label: 'Services',    path: '/services',    icon: 'bi-hdd-network'        },
       { label: 'Flows',       path: '/flows',       icon: 'bi-signpost-split'     },
@@ -46,6 +48,11 @@ const NAV: ReadonlyArray<NavSection> = [
       { label: 'Graph',    path: '/graph',    icon: 'bi-share'       },
       { label: 'Explain',  path: '/explain',  icon: 'bi-info-circle' },
       { label: 'Impact',   path: '/impact',   icon: 'bi-bullseye'    },
+      { label: 'Trace',    path: '/trace',    icon: 'bi-signpost-2'  },
+      { label: 'DB impact',path: '/db-impact',icon: 'bi-database'    },
+      { label: 'Rename',   path: '/rename',   icon: 'bi-input-cursor-text' },
+      { label: 'PR impact',path: '/pr-impact',icon: 'bi-git'           },
+      { label: 'Diff',     path: '/diff',     icon: 'bi-arrow-left-right' },
     ],
   },
   {

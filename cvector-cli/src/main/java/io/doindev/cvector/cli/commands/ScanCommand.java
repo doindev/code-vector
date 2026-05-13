@@ -65,7 +65,8 @@ public class ScanCommand implements Callable<Integer> {
                 System.err.println("project '" + project + "' not found in config");
                 return 1;
             }
-            cfg = new CvectorConfig(project, cfg.projects(), cfg.neo4j());
+            cfg = new CvectorConfig(project, cfg.projects(), cfg.neo4j(),
+                    cfg.backend(), cfg.rest(), cfg.mcp(), cfg.docker());
         }
         ProjectContext ctx = runtime.projectContext(cfg);
         Path scanRoot = path.toAbsolutePath().normalize();
@@ -361,10 +362,6 @@ public class ScanCommand implements Callable<Integer> {
      */
     record IncrementalState(Map<String, FileSnapshot> fileSnapshots, java.util.Set<String> sharedNodeIds) {
         static IncrementalState empty() { return new IncrementalState(Map.of(), java.util.Set.of()); }
-    }
-
-    private ScanStats runParsers(ProjectContext ctx, Path scanRoot, Consumer<GraphEvent> sink) throws Exception {
-        return runParsers(ctx, scanRoot, sink, Map.of(), null);
     }
 
     /**

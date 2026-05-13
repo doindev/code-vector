@@ -16,12 +16,12 @@ public class StatsController {
 
     private final GraphStore store;
     private final ActiveProject project;
-    private final GraphReadCache cache;
+    private final JsonCache jsonCache;
 
-    public StatsController(GraphStore restGraphStore, ActiveProject activeProject, GraphReadCache cache) {
+    public StatsController(GraphStore restGraphStore, ActiveProject activeProject, JsonCache jsonCache) {
         this.store = restGraphStore;
         this.project = activeProject;
-        this.cache = cache;
+        this.jsonCache = jsonCache;
     }
 
     @GetMapping("/health")
@@ -36,9 +36,9 @@ public class StatsController {
         return out;
     }
 
-    @GetMapping("/stats")
-    public Map<String, Object> stats() {
-        return cache.memoize("stats:" + project.projectId(), () -> {
+    @GetMapping(value = "/stats", produces = org.springframework.http.MediaType.APPLICATION_JSON_VALUE)
+    public byte[] stats() {
+        return jsonCache.memoize("stats:" + project.projectId(), () -> {
             Map<String, Object> out = new LinkedHashMap<>();
             out.put("project", project.name());
             out.put("projectId", project.projectId());

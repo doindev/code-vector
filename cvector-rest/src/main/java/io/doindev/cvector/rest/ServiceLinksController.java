@@ -24,17 +24,17 @@ public class ServiceLinksController {
 
     private final GraphStore store;
     private final ActiveProject project;
-    private final GraphReadCache cache;
+    private final JsonCache jsonCache;
 
-    public ServiceLinksController(GraphStore restGraphStore, ActiveProject activeProject, GraphReadCache cache) {
+    public ServiceLinksController(GraphStore restGraphStore, ActiveProject activeProject, JsonCache jsonCache) {
         this.store = restGraphStore;
         this.project = activeProject;
-        this.cache = cache;
+        this.jsonCache = jsonCache;
     }
 
-    @GetMapping("/service-links")
-    public Map<String, Object> serviceLinks() {
-        return cache.memoize("service-links:" + project.projectId(), this::buildServiceLinks);
+    @GetMapping(value = "/service-links", produces = org.springframework.http.MediaType.APPLICATION_JSON_VALUE)
+    public byte[] serviceLinks() {
+        return jsonCache.memoize("service-links:" + project.projectId(), this::buildServiceLinks);
     }
 
     private Map<String, Object> buildServiceLinks() {

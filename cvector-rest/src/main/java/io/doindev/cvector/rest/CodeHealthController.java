@@ -23,17 +23,17 @@ public class CodeHealthController {
 
     private final GraphStore store;
     private final ActiveProject project;
-    private final GraphReadCache cache;
+    private final JsonCache jsonCache;
 
-    public CodeHealthController(GraphStore restGraphStore, ActiveProject activeProject, GraphReadCache cache) {
+    public CodeHealthController(GraphStore restGraphStore, ActiveProject activeProject, JsonCache jsonCache) {
         this.store = restGraphStore;
         this.project = activeProject;
-        this.cache = cache;
+        this.jsonCache = jsonCache;
     }
 
-    @GetMapping("/code-health")
-    public Map<String, Object> codeHealth() {
-        return cache.memoize("code-health:" + project.projectId(), () -> {
+    @GetMapping(value = "/code-health", produces = org.springframework.http.MediaType.APPLICATION_JSON_VALUE)
+    public byte[] codeHealth() {
+        return jsonCache.memoize("code-health:" + project.projectId(), () -> {
             Map<String, List<Map<String, Object>>> rollup = store.healthRollup(project.projectId());
             Map<String, Object> out = new LinkedHashMap<>();
             out.put("project", Map.of(
