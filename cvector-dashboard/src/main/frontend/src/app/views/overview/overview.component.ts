@@ -292,7 +292,7 @@ export class OverviewComponent implements OnInit {
   ngOnInit(): void {
     this.api
       .health()
-      .pipe(takeUntilDestroyed(), catchError(() => of(null)))
+      .pipe(takeUntilDestroyed(this.destroyRef), catchError(() => of(null)))
       .subscribe((res) => this.status.set(!!res));
 
     this.loadOnboard();

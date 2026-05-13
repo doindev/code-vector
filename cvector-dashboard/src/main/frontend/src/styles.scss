@@ -7,17 +7,18 @@
 @import 'bootstrap/scss/bootstrap';
 
 :root {
-  // Brand accent (cvector orange, mirrors the explorer/Kuzu palette).
-  --cv-accent: #e0592d;
-  --cv-accent-hover: #c64a23;
+  // Brand accent (cvector blue).
+  --cv-accent: #333dcc;
+  --cv-accent-hover: #2a33b3;
   --cv-sidebar-bg: var(--bs-body-bg);
   --cv-sidebar-border: var(--bs-border-color);
   --cv-content-pad: 1.5rem;
 }
 
 [data-bs-theme="dark"] {
-  --cv-accent: #e4693e;
-  --cv-accent-hover: #f07c52;
+  // Slightly lifted on dark backgrounds so the blue still reads as an accent.
+  --cv-accent: #5862e3;
+  --cv-accent-hover: #6f78ea;
   --cv-sidebar-bg: #1a1d20;
   --cv-sidebar-border: #2a2d30;
 }

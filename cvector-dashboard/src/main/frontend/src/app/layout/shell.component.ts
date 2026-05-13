@@ -20,9 +20,9 @@ interface NavSection {
 /**
  * Four root sections — the prior flat list scrolled because there are 28+ routes. Each root
  * tile shows just an icon + label; the section's items reveal in a flyout when the user
- * hovers the tile. The flyout stays open as long as the cursor is over the tile or the
- * flyout panel itself, plus a brief 250 ms grace period to forgive a fast diagonal cursor
- * jump from tile to flyout.
+ * clicks the tile. The flyout auto-closes after a short grace period once the cursor
+ * leaves both the tile and the flyout panel, or when the user clicks elsewhere / selects
+ * a sub-item / clicks the tile again. Hover alone never opens — that's click-only.
  */
 const NAV: ReadonlyArray<NavSection> = [
   {
@@ -79,8 +79,8 @@ const NAV: ReadonlyArray<NavSection> = [
   },
 ];
 
-/** How long the flyout stays open after the cursor leaves both the tile and the flyout. */
-const HIDE_DELAY_MS = 250;
+/** Grace period after the cursor leaves the section before the flyout auto-closes. */
+const HIDE_DELAY_MS = 400;
 
 @Component({
   selector: 'cv-shell',
@@ -97,20 +97,17 @@ const HIDE_DELAY_MS = 250;
         <nav class="cv-nav">
           @for (section of nav; track section.title) {
             <div class="cv-nav-section"
-                 (mouseenter)="onTileEnter(section.title)"
-                 (mouseleave)="onTileLeave()">
+                 (mouseenter)="onSectionEnter()"
+                 (mouseleave)="onSectionLeave()">
               <button class="cv-nav-tile"
                       [class.cv-nav-tile--active]="isSectionActive(section)"
                       [class.cv-nav-tile--open]="openSection() === section.title"
-                      (click)="toggleSection(section.title)"
-                      (focus)="onTileEnter(section.title)">
+                      (click)="toggleSection(section.title)">
                 <i class="bi" [ngClass]="section.icon"></i>
                 <span class="cv-nav-tile-label">{{ section.title }}</span>
               </button>
               @if (openSection() === section.title) {
-                <div class="cv-nav-flyout"
-                     (mouseenter)="onFlyoutEnter()"
-                     (mouseleave)="onFlyoutLeave()">
+                <div class="cv-nav-flyout">
                   <div class="cv-nav-flyout-title">{{ section.title }}</div>
                   @for (item of section.items; track item.path) {
                     <a class="cv-nav-link"
@@ -163,28 +160,10 @@ export class ShellComponent {
 
   /** Which section's flyout is currently visible (title), or '' for none. */
   readonly openSection = signal<string>('');
-  /** Pending hide-timer id; cleared if the cursor re-enters before it fires. */
+  /** Pending auto-close timer; cleared if the cursor re-enters before it fires. */
   private hideTimer: ReturnType<typeof setTimeout> | null = null;
 
-  onTileEnter(title: string): void {
-    this.cancelHide();
-    this.openSection.set(title);
-  }
-
-  onTileLeave(): void {
-    this.scheduleHide();
-  }
-
-  onFlyoutEnter(): void {
-    this.cancelHide();
-  }
-
-  onFlyoutLeave(): void {
-    this.scheduleHide();
-  }
-
   toggleSection(title: string): void {
-    // Tap-to-toggle for touch / keyboard users. Mouse hover handles it for pointer users.
     this.cancelHide();
     this.openSection.set(this.openSection() === title ? '' : title);
   }
@@ -194,18 +173,17 @@ export class ShellComponent {
     this.openSection.set('');
   }
 
-  /** Is the user currently on a route owned by this section? Used for tile highlight. */
-  isSectionActive(section: NavSection): boolean {
-    const url = this.router.url;
-    if (url === '/' || url.startsWith('/?')) {
-      return section.title === 'Workspace';  // Overview lives under Workspace
-    }
-    return section.items.some(
-      (item) => item.path !== '/' && (url === item.path || url.startsWith(item.path + '/') || url.startsWith(item.path + '?')),
-    );
+  /**
+   * Re-entering the section cancels any pending auto-close. Mouseenter never *opens* the
+   * flyout — only click does — so this is purely a "user came back, keep it open" signal.
+   */
+  onSectionEnter(): void {
+    this.cancelHide();
   }
 
-  private scheduleHide(): void {
+  /** Schedule a hide after the grace period; cancelled if the cursor returns. */
+  onSectionLeave(): void {
+    if (this.openSection() === '') return;  // nothing to hide
     this.cancelHide();
     this.hideTimer = setTimeout(() => {
       this.openSection.set('');
@@ -218,5 +196,16 @@ export class ShellComponent {
       clearTimeout(this.hideTimer);
       this.hideTimer = null;
     }
+  }
+
+  /** Is the user currently on a route owned by this section? Used for tile highlight. */
+  isSectionActive(section: NavSection): boolean {
+    const url = this.router.url;
+    if (url === '/' || url.startsWith('/?')) {
+      return section.title === 'Workspace';  // Overview lives under Workspace
+    }
+    return section.items.some(
+      (item) => item.path !== '/' && (url === item.path || url.startsWith(item.path + '/') || url.startsWith(item.path + '?')),
+    );
   }
 }

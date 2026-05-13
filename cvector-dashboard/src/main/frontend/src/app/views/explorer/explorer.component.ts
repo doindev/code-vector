@@ -3,6 +3,7 @@ import {
   ChangeDetectionStrategy,
   Component,
   ElementRef,
+  Injector,
   OnDestroy,
   OnInit,
   effect,
@@ -277,6 +278,7 @@ export class ExplorerComponent implements OnInit, AfterViewInit, OnDestroy {
   private readonly api = inject(ApiService);
   private readonly http = inject(HttpClient);
   private readonly router = inject(Router);
+  private readonly injector = inject(Injector);
   private readonly schemaCanvas = viewChild<ElementRef<HTMLDivElement>>('schemaCy');
   private schemaCy?: Core;
 
@@ -307,10 +309,11 @@ export class ExplorerComponent implements OnInit, AfterViewInit, OnDestroy {
     // Lazy-init cytoscape: only when the canvas is in the DOM (i.e. user clicked the
     // Schema graph tab at least once). We initialise on first availability.
     queueMicrotask(() => this.ensureCy());
-    // Also re-check when the tab flips to 'graph'.
+    // Also re-check when the tab flips to 'graph'. Pass an explicit injector since
+    // ngAfterViewInit is not an injection context (would throw NG0203 otherwise).
     effect(() => {
       if (this.tab() === 'graph') this.ensureCy();
-    }, { allowSignalWrites: true });
+    }, { allowSignalWrites: true, injector: this.injector });
   }
 
   ngOnDestroy(): void {

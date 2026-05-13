@@ -12,6 +12,7 @@ import { HttpClient } from '@angular/common/http';
 import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 
 import { visiblePoll } from '../../core/poll';
+import { FolderPickerComponent } from '../../shared/folder-picker.component';
 
 interface MonitoredPath {
   readonly id: string;
@@ -34,7 +35,7 @@ interface StatusPayload {
 @Component({
   selector: 'cv-monitors',
   standalone: true,
-  imports: [FormsModule, DecimalPipe],
+  imports: [FormsModule, DecimalPipe, FolderPickerComponent],
   changeDetection: ChangeDetectionStrategy.OnPush,
   template: `
     <div class="cv-page-header">
@@ -61,11 +62,18 @@ interface StatusPayload {
         <div class="row g-2 align-items-end">
           <div class="col-md-9">
             <label class="form-label small text-secondary">Absolute path</label>
-            <input class="form-control"
-                   [ngModel]="newPath()"
-                   (ngModelChange)="newPath.set($event)"
-                   (keydown.enter)="add()"
-                   placeholder="C:\\path\\to\\project" />
+            <div class="input-group">
+              <input class="form-control"
+                     [ngModel]="newPath()"
+                     (ngModelChange)="newPath.set($event)"
+                     (keydown.enter)="add()"
+                     placeholder="C:\\path\\to\\project" />
+              <button class="btn btn-outline-secondary" type="button"
+                      (click)="pickerOpen.set(true)"
+                      title="Browse for a folder">
+                <i class="bi bi-folder2-open"></i>
+              </button>
+            </div>
           </div>
           <div class="col-md-3 d-flex gap-2">
             <button class="btn btn-primary flex-grow-1" (click)="add()"
@@ -153,6 +161,10 @@ interface StatusPayload {
       <i class="bi bi-info-circle"></i>
       Persisted at <code>~/.cvector/dashboard.json</code>. Counters update every 3 seconds.
     </p>
+
+    <cv-folder-picker [open]="pickerOpen()" [initialPath]="newPath()"
+                      (selected)="onPickerSelect($event)"
+                      (cancel)="pickerOpen.set(false)" />
   `,
 })
 export class MonitorsComponent implements OnInit {
@@ -162,6 +174,7 @@ export class MonitorsComponent implements OnInit {
   readonly monitors = signal<ReadonlyArray<MonitoredPath>>([]);
   readonly showAdd = signal(false);
   readonly newPath = signal('');
+  readonly pickerOpen = signal(false);
   readonly loading = signal(true);
   readonly saving = signal(false);
   readonly error = signal('');
@@ -243,5 +256,10 @@ export class MonitorsComponent implements OnInit {
 
   formatDate(iso: string): string {
     try { return new Date(iso).toLocaleDateString(); } catch { return iso; }
+  }
+
+  onPickerSelect(path: string): void {
+    this.newPath.set(path);
+    this.pickerOpen.set(false);
   }
 }
