@@ -290,10 +290,13 @@ export class OverviewComponent implements OnInit {
   readonly scanError = signal('');
 
   ngOnInit(): void {
-    this.api
-      .health()
-      .pipe(takeUntilDestroyed(this.destroyRef), catchError(() => of(null)))
-      .subscribe((res) => this.status.set(!!res));
+    this.refreshHealth();
+    /* Poll health on a slow cadence so the badge self-heals if the first call lands
+       while the backend is restarting or a transient network blip drops the request.
+       visiblePoll only fires while the tab is visible — no background traffic. */
+    visiblePoll(10000)
+      .pipe(takeUntilDestroyed(this.destroyRef))
+      .subscribe(() => this.refreshHealth());
 
     this.loadOnboard();
     this.refreshScanStatus();
@@ -320,6 +323,13 @@ export class OverviewComponent implements OnInit {
       next: (d) => this.data.set(d),
       error: (err) => this.error.set(err?.error?.message ?? err?.message ?? 'Failed to load briefing'),
     });
+  }
+
+  private refreshHealth(): void {
+    this.api
+      .health()
+      .pipe(catchError(() => of(null)))
+      .subscribe((res) => this.status.set(!!res));
   }
 
   refreshScanStatus(): void {

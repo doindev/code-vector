@@ -94,10 +94,10 @@ const HIDE_DELAY_MS = 400;
   template: `
     <div class="cv-shell">
       <aside class="cv-sidebar">
-        <div class="cv-brand">
+        <a class="cv-brand" routerLink="/" title="Go to overview">
           <i class="bi bi-diagram-3-fill cv-accent"></i>
           <span class="cv-brand-text">cvector</span>
-        </div>
+        </a>
         <nav class="cv-nav">
           @for (section of nav; track section.title) {
             <div class="cv-nav-section"

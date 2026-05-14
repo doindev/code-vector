@@ -40,6 +40,12 @@
   font-size: 0.7rem;
   font-weight: 600;
   letter-spacing: 0.04em;
+  // The brand is an <a routerLink="/"> — strip the default link decoration so it still
+  // reads as a static label, but give it a subtle hover affordance.
+  color: inherit;
+  text-decoration: none;
+
+  &:hover { color: var(--cv-accent); }
 
   i {
     font-size: 1.6rem;
