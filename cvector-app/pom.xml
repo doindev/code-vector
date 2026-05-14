@@ -132,24 +132,44 @@
                         before jpackage runs so the build is idempotent without forcing a full
                         `mvn clean` (which would invalidate the rest of the reactor's compiled
                         output and add ~30 s to every rebuild).
+
+                        Uses antrun rather than maven-clean-plugin because Windows Defender
+                        real-time scanning holds a transient handle on a freshly-jpackaged
+                        cvector.exe for several seconds. maven-clean-plugin retries 10× with a
+                        100 ms gap (~1 s total) which isn't always enough; antrun's `<delete>`
+                        with `failonerror="false"` + a 2 s sleep + a final authoritative delete
+                        gives Defender time to release the handle on iterative rebuilds.
                     -->
                     <plugin>
                         <groupId>org.apache.maven.plugins</groupId>
-                        <artifactId>maven-clean-plugin</artifactId>
+                        <artifactId>maven-antrun-plugin</artifactId>
                         <executions>
                             <execution>
                                 <id>clean-dist-before-jpackage</id>
                                 <phase>pre-integration-test</phase>
                                 <goals>
-                                    <goal>clean</goal>
+                                    <goal>run</goal>
                                 </goals>
                                 <configuration>
-                                    <excludeDefaultDirectories>true</excludeDefaultDirectories>
-                                    <filesets>
-                                        <fileset>
-                                            <directory>${project.build.directory}/dist</directory>
-                                        </fileset>
-                                    </filesets>
+                                    <target>
+                                        <!--
+                                            Poll-delete loop. Windows Defender real-time scan can
+                                            hold a freshly-built cvector.exe for 5–15 seconds; one
+                                            attempt isn't enough. Five attempts spaced 3 s apart
+                                            (~12 s max wait) covers the typical hold window. Only
+                                            the final delete fails the build — earlier failures are
+                                            swallowed so we keep retrying.
+                                        -->
+                                        <delete dir="${project.build.directory}/dist" failonerror="false"/>
+                                        <sleep seconds="3"/>
+                                        <delete dir="${project.build.directory}/dist" failonerror="false"/>
+                                        <sleep seconds="3"/>
+                                        <delete dir="${project.build.directory}/dist" failonerror="false"/>
+                                        <sleep seconds="3"/>
+                                        <delete dir="${project.build.directory}/dist" failonerror="false"/>
+                                        <sleep seconds="3"/>
+                                        <delete dir="${project.build.directory}/dist"/>
+                                    </target>
                                 </configuration>
                             </execution>
                         </executions>
