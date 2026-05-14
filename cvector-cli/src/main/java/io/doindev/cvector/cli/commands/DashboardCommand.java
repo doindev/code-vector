@@ -72,12 +72,10 @@ public class DashboardCommand implements Callable<Integer> {
                 try {
                     TimeUnit.MILLISECONDS.sleep(600);
                     URI url = URI.create(base + "/dashboard/");
-                    if (Desktop.isDesktopSupported()
-                            && Desktop.getDesktop().isSupported(Desktop.Action.BROWSE)) {
-                        Desktop.getDesktop().browse(url);
+                    if (openInBrowser(url)) {
                         System.out.println("opened " + url + " in default browser");
                     } else {
-                        System.out.println("(--open requested but headless / Desktop API unavailable; visit " + url + " manually)");
+                        System.out.println("(--open requested but no opener available; visit " + url + " manually)");
                     }
                 } catch (Exception e) {
                     System.err.println("failed to open browser: " + e.getMessage());
@@ -95,5 +93,56 @@ public class DashboardCommand implements Callable<Integer> {
         }, "cvector-shutdown"));
         shutdown.await();
         return 0;
+    }
+
+    /**
+     * Try every viable way to open a URL in the user's default browser, in order:
+     * Java's {@link Desktop} API first, then the platform's native shell helper.
+     *
+     * <p>Desktop API alone isn't enough because jpackage's {@code APP_IMAGE} launcher
+     * starts the JVM without a GUI session attached, so {@link Desktop#isDesktopSupported()}
+     * (or {@link Desktop.Action#BROWSE} support specifically) returns false. The
+     * fallback path shells out to the OS's url-handler binary, which works regardless
+     * of how the JVM was launched:
+     * <ul>
+     *   <li>Windows: {@code rundll32 url.dll,FileProtocolHandler <url>} — the same
+     *       mechanism Explorer uses internally, works headless.</li>
+     *   <li>macOS: {@code open <url>}.</li>
+     *   <li>Linux / BSD: {@code xdg-open <url>}.</li>
+     * </ul>
+     *
+     * <p>Returns {@code true} as soon as any method appears to have succeeded
+     * (Desktop.browse returned without throwing, or the spawned subprocess started).
+     * Returns {@code false} only when every path fails, which is when the caller
+     * tells the user to paste the URL manually.
+     */
+    private static boolean openInBrowser(URI url) {
+        try {
+            if (Desktop.isDesktopSupported()
+                    && Desktop.getDesktop().isSupported(Desktop.Action.BROWSE)) {
+                Desktop.getDesktop().browse(url);
+                return true;
+            }
+        } catch (Exception ignored) {
+            // Fall through to OS shell helpers below.
+        }
+        String os = System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT);
+        try {
+            if (os.contains("win")) {
+                new ProcessBuilder("rundll32", "url.dll,FileProtocolHandler", url.toString())
+                        .inheritIO().start();
+                return true;
+            }
+            if (os.contains("mac")) {
+                new ProcessBuilder("open", url.toString()).inheritIO().start();
+                return true;
+            }
+            // Most Linux desktop environments ship xdg-open. Falls through to manual
+            // paste if it isn't installed (headless servers, minimal containers, etc.).
+            new ProcessBuilder("xdg-open", url.toString()).inheritIO().start();
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
     }
 }
