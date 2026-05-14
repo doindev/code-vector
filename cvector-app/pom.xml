@@ -210,6 +210,21 @@
                             <destination>${project.build.directory}/dist</destination>
                             <type>APP_IMAGE</type>
                             <!--
+                                Build the Windows launcher as a CONSOLE-subsystem .exe rather than
+                                the GUI default. Without this, jpackage produces a .exe that does
+                                not inherit the calling shell's stdout/stderr: every CLI command
+                                that just prints text (status / search / explain / --version /
+                                --help) ran "silently" because picocli's writes went to a detached
+                                handle. Dashboard mode "appeared" to work only because port-bind
+                                + browser-open are observable side effects. winConsole=true makes
+                                stdout/stderr inherit from PowerShell / cmd / bash so users
+                                actually see what cvector printed. Trade-off: double-clicking
+                                cvector.exe from Explorer flashes a brief console window, which
+                                is acceptable for a CLI tool whose primary invocation is from
+                                a terminal anyway.
+                            -->
+                            <winConsole>true</winConsole>
+                            <!--
                                 Intentionally NOT setting -Dspring.aot.enabled=true here.
                                 The AOT artifacts are generated at build time against the
                                 default WebApplicationType (NONE), which works fine for the
