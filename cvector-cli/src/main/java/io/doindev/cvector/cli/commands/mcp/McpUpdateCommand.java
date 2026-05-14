@@ -50,7 +50,7 @@ public class McpUpdateCommand implements Callable<Integer> {
             CvectorConfig.McpConfig next = new CvectorConfig.McpConfig(newUrl, transport.toLowerCase());
             return new CvectorConfig(
                     before.activeProject(), before.projects(), before.neo4j(),
-                    before.backend(), before.rest(), next, before.docker());
+                    before.backend(), before.rest(), next, before.docker(), before.rules());
         });
         CvectorConfig.McpConfig mcp = updated.mcpOrDefault();
         System.out.println("updated MCP settings:");

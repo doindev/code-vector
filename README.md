@@ -200,6 +200,8 @@ You can switch any time without changing your data model — the parsers emit th
 | `docker.neo4jVersion` | string | `"5"` | Image tag — used as `{image}:{neo4jVersion}`. |
 | `docker.boltPort` | integer | `7687` | Host port the container's Bolt listener is mapped to. |
 | `docker.httpPort` | integer | `7474` | Host port for Neo4j HTTP / Browser. |
+| `rules` | object | `null` | **Workspace-wide** architecture-rules policy — see [Rules policy](#rules-policy). Applies to every project in `projects`. |
+| `projects.<name>.rules` | object | `null` | **Per-project** rules override — same shape as the workspace `rules` field, layered on top of it so a single project can raise thresholds or disable rules without touching the workspace policy. |
 
 Every section is optional — omit it and the defaults above apply. Adding a field never breaks older binaries (Jackson ignores unknown fields at load time).
 
@@ -334,9 +336,122 @@ The dashboard exposes the same file as JSON:
 
 Every save publishes a `SettingsChangedEvent` so views that depend on the config refresh without a reload.
 
+### Rules policy
+
+cvector's architecture-rules engine pulls its configuration from **four layered sources**, merged in this order (later sources override earlier ones):
+
+1. **Built-in defaults** — hard-coded thresholds (`godFileMethods: 30`, `godClassMethods: 20`, `longMethodLines: 80`, `deepInheritance: 5`) plus a couple of universal `excludePaths` (`/internal/`, `/target/`, `/generated-sources/`).
+2. **`.cvector/rules.yml`** — legacy file-based config. Still loaded automatically when present so existing projects keep working. See [.cvector/rules.yml](#cvectorrulesyml) below.
+3. **Workspace `rules` section in `settings.json`** — applied to every project in the workspace.
+4. **Per-project `rules` inside `projects.<name>`** — overrides for one specific project, layered on top of the workspace policy.
+
+Per-field merge semantics:
+
+| Field | Merge |
+|---|---|
+| `thresholds` | Map-merge by key. A later layer's value replaces an earlier value for the same key; keys the later layer doesn't mention keep the earlier value. |
+| `disable` | Union — once a rule is disabled at any layer it stays disabled. You can't re-enable from a lower layer. |
+| `excludePaths` | Union with dedup. Ordering reflects layer order (defaults first, per-project last). |
+| `custom` | By-name override — a later layer's custom rule with the same `name` replaces the earlier one wholesale (Cypher + severity + description). |
+
+#### Example: workspace policy applied to every project
+
+```json
+{
+  "activeProject": "my-project",
+  "projects": {
+    "my-project": { "projectId": "...", "name": "my-project", "rootPath": "..." }
+  },
+  "backend": "embedded",
+  "rules": {
+    "thresholds": {
+      "godFileMethods": 50,
+      "longMethodLines": 120
+    },
+    "disable": ["deep-inheritance"],
+    "excludePaths": [
+      "/legacy/",
+      "/vendor/"
+    ],
+    "custom": [
+      {
+        "name": "no-system-out-in-services",
+        "description": "Service classes should not print to System.out.",
+        "severity": "WARN",
+        "cypher": "MATCH (c:Class {projectId: $pid, isService: true})-[:CONTAINS]->(m:Method)-[:CALLS]->(callee:Method) WHERE callee.fqName CONTAINS 'PrintStream.println' RETURN c.fqName AS subject, callee.fqName AS message",
+        "cypherKuzu": "MATCH (c:Node)-[:CONTAINS]->(m:Node)-[:CALLS]->(callee:Node) WHERE c.label = 'Class' AND m.label = 'Method' AND callee.label = 'Method' AND c.isService = true AND callee.fqName CONTAINS 'PrintStream.println' RETURN c.fqName AS subject, callee.fqName AS message"
+      }
+    ]
+  }
+}
+```
+
+#### Example: per-project override on top of the workspace
+
+```json
+{
+  "activeProject": "frontend-app",
+  "projects": {
+    "backend-api": {
+      "projectId": "...",
+      "name": "backend-api",
+      "rootPath": "..."
+    },
+    "frontend-app": {
+      "projectId": "...",
+      "name": "frontend-app",
+      "rootPath": "...",
+      "rules": {
+        "thresholds": {
+          "longMethodLines": 200
+        },
+        "disable": ["dead-code"]
+      }
+    }
+  },
+  "backend": "embedded",
+  "rules": {
+    "thresholds": {
+      "longMethodLines": 120
+    }
+  }
+}
+```
+
+Effective `longMethodLines` per project:
+- `backend-api` → **120** (workspace value).
+- `frontend-app` → **200** (per-project override on top of workspace).
+
+`dead-code` is disabled **only** for `frontend-app`. Run `cvector project switch backend-api && cvector rules` and dead-code violations still appear.
+
+#### Per-field reference
+
+| Field | Type | Description |
+|---|---|---|
+| `thresholds.godFileMethods` | integer | Files with more methods than this trigger the `god-file` rule (severity ERROR). |
+| `thresholds.godClassMethods` | integer | Classes with more methods than this trigger the `god-class` rule (severity ERROR). |
+| `thresholds.longMethodLines` | integer | Methods whose body exceeds this many lines trigger `long-method` (severity WARN). |
+| `thresholds.deepInheritance` | integer | Classes with an extends-chain deeper than this trigger `deep-inheritance` (severity WARN). |
+| `disable` | string[] | Rule names to skip entirely. Built-in names: `god-file`, `god-class`, `long-method`, `deep-inheritance`, `dead-code`. Custom rules are skippable by their `name` too. |
+| `excludePaths` | string[] | File-path substrings (or `**` glob fragments) that exclude matching nodes from rule evaluation. Useful for vendored code, generated sources, build output. |
+| `custom[].name` | string | Unique name for a Cypher rule. Used in `disable` and to dedupe across layers. |
+| `custom[].description` | string | Human-readable summary shown in the report. |
+| `custom[].severity` | string | `ERROR` / `WARN` / `INFO`. Defaults to `WARN` if absent or invalid. |
+| `custom[].cypher` | string | Cypher returning one row per violation with columns `subject` (the offender) and `message`. Available parameter: `$pid` (active project id). |
+| `custom[].cypherKuzu` | string | *(optional)* Kuzu-dialect body. Kuzu uses a polymorphic `Node` table and a subset of Cypher; supply this when the rule's `cypher` body uses Neo4j-only features. The resolver picks `cypherKuzu` automatically when the active backend is Kuzu. |
+
+#### Where rules can come from
+
+| Use case | Where to put rules |
+|---|---|
+| Single project, shared with the team | Workspace `rules` in `settings.json`. Commit `.cvector/settings.json`. |
+| Same workspace, two projects with different tolerances | Workspace `rules` (baseline) + per-project `rules` for the relaxed one. |
+| Mix of standards across many workspaces | Per-workspace `rules` in each `settings.json`. |
+| Existing project on rules.yml | Keep using `.cvector/rules.yml`. Optionally layer settings.json on top (e.g. per-project disable a rule without touching the shared YAML). |
+
 ### `.cvector/rules.yml`
 
-Optional. Generated by `cvector rules --init`. Sets thresholds, disables built-in rules, and defines custom Cypher rules.
+Optional **legacy** file. Generated by `cvector rules --init`. Sets thresholds, disables built-in rules, and defines custom Cypher rules. Same shape as the `rules` section in `settings.json` but in YAML. Still loaded automatically when present — sits between the built-in defaults and the workspace `rules` section in the layered merge.
 
 ```yaml
 thresholds:

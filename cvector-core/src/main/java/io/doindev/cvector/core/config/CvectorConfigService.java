@@ -63,7 +63,7 @@ public class CvectorConfigService {
         CvectorConfig raw = mapper.readValue(readPath(projectRoot).toFile(), CvectorConfig.class);
         if (raw.projects() == null) {
             return new CvectorConfig(raw.activeProject(), new LinkedHashMap<>(),
-                    raw.neo4j(), raw.backend(), raw.rest(), raw.mcp(), raw.docker());
+                    raw.neo4j(), raw.backend(), raw.rest(), raw.mcp(), raw.docker(), raw.rules());
         }
         return raw;
     }

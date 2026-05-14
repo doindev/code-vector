@@ -2,11 +2,13 @@ package io.doindev.cvector.mcp;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.doindev.cvector.core.config.CvectorConfig;
+import io.doindev.cvector.core.config.CvectorConfigService;
 import io.doindev.cvector.core.store.GraphStore;
 import io.doindev.cvector.core.util.LouvainCommunityDetector;
 import io.doindev.cvector.core.util.UnionFind;
 import io.doindev.cvector.rules.RulesConfig;
-import io.doindev.cvector.rules.RulesConfigLoader;
+import io.doindev.cvector.rules.RulesConfigResolver;
 import io.doindev.cvector.rules.RulesEngine;
 import io.doindev.cvector.rules.Violation;
 import org.springframework.ai.tool.annotation.Tool;
@@ -37,10 +39,12 @@ public class CvectorTools {
 
     private final GraphStore store;
     private final McpServerConfig.McpActiveProject project;
+    private final CvectorConfigService configService;
 
-    public CvectorTools(GraphStore store, McpServerConfig.McpActiveProject project) {
+    public CvectorTools(GraphStore store, McpServerConfig.McpActiveProject project, CvectorConfigService configService) {
         this.store = store;
         this.project = project;
+        this.configService = configService;
     }
 
     @Tool(name = "cv_stats", description = "Graph statistics for the active cvector project: node counts by label and edge counts by type.")
@@ -216,10 +220,14 @@ public class CvectorTools {
         return out;
     }
 
-    @Tool(name = "cv_rules", description = "Run the cvector rules engine and return violations by rule (uses .cvector/rules.yml if present).")
+    @Tool(name = "cv_rules", description = "Run the cvector rules engine and return violations by rule. Layers defaults → .cvector/rules.yml → workspace settings.json rules → per-project rules.")
     public Map<String, Object> rules() {
         Path rulesYml = Paths.get(project.rootPath(), ".cvector", "rules.yml");
-        RulesConfig cfg = RulesConfigLoader.loadOrDefault(rulesYml);
+        // Load settings.json fresh per call so live edits (e.g. raising a threshold) take effect
+        // without restarting the MCP server.
+        CvectorConfig workspace = loadWorkspaceConfigSilently();
+        String projectKey = workspace != null ? workspace.activeProject() : null;
+        RulesConfig cfg = RulesConfigResolver.resolve(workspace, projectKey, rulesYml);
         RulesEngine.Report report = new RulesEngine(project.projectId(), store, cfg).run();
 
         List<Map<String, Object>> runs = new ArrayList<>();
@@ -247,6 +255,23 @@ public class CvectorTools {
                 "totalViolations", report.totalViolations(),
                 "runs", runs
         );
+    }
+
+    /**
+     * Load the workspace's settings.json from the project's root, silently swallowing any I/O
+     * error. The rules engine treats a {@code null} return as "no workspace policy" — it falls
+     * through to the legacy rules.yml + defaults so a missing or broken settings file never
+     * brings cv_rules down.
+     */
+    private CvectorConfig loadWorkspaceConfigSilently() {
+        if (configService == null) return null;
+        try {
+            Path root = Paths.get(project.rootPath());
+            if (!configService.exists(root)) return null;
+            return configService.load(root);
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     @Tool(name = "cv_communities",

@@ -51,7 +51,7 @@ public class ProjectCreateCommand implements Callable<Integer> {
 
         String activeProject = switchAfter ? name : cfg.activeProject();
         CvectorConfig updated = new CvectorConfig(activeProject, projects, cfg.neo4j(),
-                cfg.backend(), cfg.rest(), cfg.mcp(), cfg.docker());
+                cfg.backend(), cfg.rest(), cfg.mcp(), cfg.docker(), cfg.rules());
         svc.save(configRoot, updated);
 
         System.out.println("created project '" + name + "' (" + projectId + ") at " + rootPath);

@@ -33,7 +33,7 @@ public class ProjectSwitchCommand implements Callable<Integer> {
             return 1;
         }
         CvectorConfig updated = new CvectorConfig(name, cfg.projects(), cfg.neo4j(),
-                cfg.backend(), cfg.rest(), cfg.mcp(), cfg.docker());
+                cfg.backend(), cfg.rest(), cfg.mcp(), cfg.docker(), cfg.rules());
         svc.save(configRoot, updated);
         System.out.println("active project switched to '" + name + "'");
         return 0;
