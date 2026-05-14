@@ -53,8 +53,11 @@ import java.util.concurrent.Callable;
 @Component
 @Command(
         name = "cvector",
-        mixinStandardHelpOptions = true,
-        version = "cvector 0.0.1",
+        // mixinStandardHelpOptions intentionally false: we hand-roll the help + version
+        // flags so --version can carry the extra `--ver` alias and the version output
+        // can include the bundled JDK info via CvectorVersionProvider.
+        mixinStandardHelpOptions = false,
+        versionProvider = CvectorVersionProvider.class,
         description = "Neo4j-backed code knowledge graph.",
         subcommands = {
                 InitCommand.class,
@@ -104,6 +107,17 @@ public class CvectorCommand implements Callable<Integer> {
 
     @Spec
     CommandSpec spec;
+
+    // Hand-rolled help + version replacements for the standard picocli mixin. -h / --help
+    // behave the same as the mixin version; -V / --version / --ver all print the version
+    // block produced by CvectorVersionProvider (app version + bundled JDK + OS).
+    @Option(names = {"-h", "--help"}, usageHelp = true,
+            description = "Show this help message and exit.")
+    boolean usageHelpRequested;
+
+    @Option(names = {"-V", "--version", "--ver"}, versionHelp = true,
+            description = "Print version information (app + bundled JDK + OS) and exit.")
+    boolean versionInfoRequested;
 
     /**
      * Legacy root-level {@code --embedded} flag. Kept for back-compat with the previous boot

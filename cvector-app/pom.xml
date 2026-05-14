@@ -163,6 +163,40 @@
                             </execution>
                         </executions>
                     </plugin>
+                    <!--
+                        jpackage's `<input>` directive copies EVERY file in the given directory
+                        into the produced app/ folder. Pointing it at `${project.build.directory}`
+                        directly was dragging in the entire Maven build tree (classes/, spring-aot/,
+                        test-classes/, generated-sources/, maven-status/): ~3 MB of bloat on top
+                        of the 159 MB fat-jar, AND the deeply-nested AOT bean-definition class
+                        files busted Windows' 260-char MAX_PATH on the install-script Copy-Item
+                        step. Stage only the fat-jar into a clean directory and point jpackage at
+                        that instead.
+                    -->
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-resources-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>stage-fatjar-for-jpackage</id>
+                                <phase>pre-integration-test</phase>
+                                <goals>
+                                    <goal>copy-resources</goal>
+                                </goals>
+                                <configuration>
+                                    <outputDirectory>${project.build.directory}/jpackage-input</outputDirectory>
+                                    <resources>
+                                        <resource>
+                                            <directory>${project.build.directory}</directory>
+                                            <includes>
+                                                <include>${project.build.finalName}.jar</include>
+                                            </includes>
+                                        </resource>
+                                    </resources>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
                     <plugin>
                         <groupId>org.panteleyev</groupId>
                         <artifactId>jpackage-maven-plugin</artifactId>
@@ -171,7 +205,7 @@
                             <name>cvector</name>
                             <appVersion>0.0.1</appVersion>
                             <vendor>doindev</vendor>
-                            <input>${project.build.directory}</input>
+                            <input>${project.build.directory}/jpackage-input</input>
                             <mainJar>${project.build.finalName}.jar</mainJar>
                             <destination>${project.build.directory}/dist</destination>
                             <type>APP_IMAGE</type>
