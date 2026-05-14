@@ -3,17 +3,33 @@
 #
 # Usage:  ./install/macos/install.sh
 # Override install location: CVECTOR_INSTALL_DIR=/Applications/cvector.app ./install.sh
+# Skip the Angular dashboard SPA: CVECTOR_SKIP_DASHBOARD=1 ./install.sh
 #
-# Builds the cvector .app bundle via `mvn -Pdist install`, copies it under
-# ~/.local/share/cvector by default, optionally symlinks the launcher into
-# ~/.local/bin and adds that directory to your shell PATH, and stamps out a
-# default ~/.cvector/project.json.
+# Builds the cvector .app bundle via
+#   `mvn -Pdist,dashboard-ui install -DskipTests`
+# and copies it under ~/.local/share/cvector by default. The dashboard-ui profile
+# bundles the Angular SPA inside the .app so /dashboard/ serves the full UI;
+# set CVECTOR_SKIP_DASHBOARD=1 to skip it (REST endpoints still work, no SPA).
+#
+# After build the script:
+#   - copies the .app bundle to $INSTALL_DIR,
+#   - symlinks ~/.local/bin/cvector -> $INSTALL_DIR/Contents/MacOS/cvector,
+#   - optionally appends ~/.local/bin to the user's shell PATH,
+#   - seeds a default ~/.cvector/settings.json (with backend = embedded so the
+#     launcher works out of the box, no Neo4j or Docker required).
 #
 # Re-running this script:
 #   - asks to stop any running cvector first
 #   - overwrites the installed files in place
 #   - only adds to PATH if you confirm (and the entry is not already there)
-#   - only overwrites project.json if you confirm
+#   - only overwrites settings.json if you confirm; leaves a legacy project.json
+#     alone (the loader still reads it)
+#
+# Gatekeeper note: the .app bundle is unsigned, so the first launch from Finder
+# triggers "cannot be opened because the developer cannot be verified". Either
+# right-click -> Open (one-time per binary) or remove the quarantine attribute:
+#   xattr -dr com.apple.quarantine "$INSTALL_DIR"
+# Launching via the symlinked CLI (`cvector ...` from a terminal) is unaffected.
 
 set -euo pipefail
 
@@ -65,10 +81,17 @@ if [[ -n "${PIDS}" ]]; then
     fi
 fi
 
-# 2. Build the distributable.
+# 2. Build the distributable. Activate the dashboard-ui profile unless explicitly
+# disabled — without it the Angular SPA is dropped and /dashboard/ returns 404,
+# which is rarely what a fresh installer wants.
+if [[ -n "${CVECTOR_SKIP_DASHBOARD:-}" ]]; then
+    PROFILES="dist"
+else
+    PROFILES="dist,dashboard-ui"
+fi
 echo ""
-echo ">> mvn -Pdist install -DskipTests"
-( cd "${REPO_ROOT}" && mvn -Pdist install -DskipTests )
+echo ">> mvn -P${PROFILES} install -DskipTests"
+( cd "${REPO_ROOT}" && mvn "-P${PROFILES}" install -DskipTests )
 
 # jpackage on macOS emits an .app bundle. The launcher lives at Contents/MacOS/cvector.
 APP_BUNDLE="${REPO_ROOT}/cvector-app/target/dist/cvector.app"
@@ -120,9 +143,15 @@ else
     echo "${BIN_PARENT} already on PATH in ${PROFILE}"
 fi
 
-# 6. Create ~/.cvector (only if absent) and optionally seed project.json.
+# 6. Create ~/.cvector (only if absent) and optionally seed settings.json.
+# This is the "home fallback" config the loader walks up to when cwd doesn't have
+# a project-local .cvector/. Seeding it here means `cvector status` / `cvector
+# dashboard` work from any directory the user happens to be in post-install.
 USER_CVECTOR="${HOME}/.cvector"
-PROJECT_JSON="${USER_CVECTOR}/project.json"
+SETTINGS_JSON="${USER_CVECTOR}/settings.json"
+# Legacy filename — still read by older binaries. We never write it; just check.
+LEGACY_PROJECT_JSON="${USER_CVECTOR}/project.json"
+
 if [[ -d "${USER_CVECTOR}" ]]; then
     echo "${USER_CVECTOR} already exists -- not modifying the directory itself"
 else
@@ -130,13 +159,16 @@ else
     echo "created ${USER_CVECTOR}"
 fi
 
-write_default_project_json() {
+write_default_settings_json() {
     local target="$1" uuid
     if command -v uuidgen >/dev/null 2>&1; then
         uuid="$(uuidgen | tr '[:upper:]' '[:lower:]')"
     else
         uuid="00000000-0000-0000-0000-000000000000"
     fi
+    # `backend = embedded` is the default but stating it makes the file
+    # self-documenting. neo4j / rest / mcp / docker sections are omitted entirely
+    # so they pick up the config-record defaults (loopback bind, port 2969, etc.).
     cat > "${target}" <<EOF
 {
   "activeProject": "default",
@@ -147,27 +179,27 @@ write_default_project_json() {
       "rootPath": "${HOME}"
     }
   },
-  "neo4j": {
-    "uri": "bolt://localhost:7687",
-    "user": "neo4j",
-    "password": "neo4j"
-  }
+  "backend": "embedded"
 }
 EOF
 }
 
-if [[ ! -f "${PROJECT_JSON}" ]]; then
-    write_default_project_json "${PROJECT_JSON}"
-    echo "wrote default ${PROJECT_JSON}"
-else
+if [[ ! -f "${SETTINGS_JSON}" && ! -f "${LEGACY_PROJECT_JSON}" ]]; then
+    write_default_settings_json "${SETTINGS_JSON}"
+    echo "wrote default ${SETTINGS_JSON}"
+elif [[ -f "${SETTINGS_JSON}" ]]; then
     echo ""
-    echo "${PROJECT_JSON} already exists."
-    if ask_yes_no "Overwrite with the installer defaults?" n; then
-        write_default_project_json "${PROJECT_JSON}"
-        echo "overwrote ${PROJECT_JSON} with defaults"
+    echo "${SETTINGS_JSON} already exists."
+    if ask_yes_no "Overwrite with the installer defaults (backend=embedded)?" n; then
+        write_default_settings_json "${SETTINGS_JSON}"
+        echo "overwrote ${SETTINGS_JSON} with defaults"
     else
-        echo "kept existing ${PROJECT_JSON}"
+        echo "kept existing ${SETTINGS_JSON}"
     fi
+else
+    # Only the legacy project.json exists. Leave it alone — the loader still reads
+    # it, and the user can migrate via `cvector db` / REST PUT when ready.
+    echo "found legacy ${LEGACY_PROJECT_JSON} (still readable; canonical name is settings.json)"
 fi
 
 echo ""

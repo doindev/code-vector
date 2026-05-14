@@ -2,16 +2,33 @@
 #
 # Usage:  .\install\windows\install.ps1
 # Override install location: $env:CVECTOR_INSTALL_DIR = "..."; .\install.ps1
+# Skip the Angular dashboard SPA: $env:CVECTOR_SKIP_DASHBOARD = "1"; .\install.ps1
 #
-# Builds the cvector .exe distributable via `mvn -Pdist install`, copies it under
-# $env:LOCALAPPDATA\Programs\cvector by default, optionally adds that directory to
-# the user PATH, and stamps out a default %USERPROFILE%\.cvector\project.json.
+# Builds the cvector .exe distributable via
+#   `mvn -Pdist,dashboard-ui install -DskipTests`
+# and copies it under %LOCALAPPDATA%\Programs\cvector by default. The dashboard-ui
+# profile bundles the Angular SPA inside the .exe so /dashboard/ serves the full UI;
+# set CVECTOR_SKIP_DASHBOARD=1 to skip it (REST endpoints still work, just no SPA).
+#
+# After build the script:
+#   - copies the dist tree to $InstallDir,
+#   - optionally adds that directory to the user PATH (per-user, no admin needed),
+#   - seeds a default %USERPROFILE%\.cvector\settings.json (with backend = embedded
+#     so the .exe works out of the box, no Neo4j or Docker required).
 #
 # Re-running this script:
 #   - asks to stop any running cvector.exe first
 #   - overwrites the installed files in place
 #   - only adds to PATH if you confirm (and the entry is not already there)
-#   - only overwrites project.json if you confirm
+#   - only overwrites settings.json if you confirm
+#
+# Windows Defender note: on rebuilds, Defender's real-time scan can hold a transient
+# handle on the previously-built cvector.exe and cause "Unable to delete" failures
+# during the Maven clean step. The cleanest fix is a one-time exclusion: Settings ->
+# Windows Security -> Virus & threat protection -> Manage settings -> Exclusions ->
+# Add an exclusion -> Folder -> pick this repo's cvector-app\target. Without that,
+# the first run usually works (nothing pre-existing to lock); only iterative re-runs
+# hit the issue.
 
 [CmdletBinding()]
 param(
@@ -62,12 +79,15 @@ if ($running) {
     }
 }
 
-# 2. Build the distributable.
+# 2. Build the distributable. Activate the dashboard-ui profile unless explicitly
+# disabled — without it the Angular SPA is dropped and /dashboard/ returns 404,
+# which is rarely what a fresh installer wants.
+$profiles = if ($env:CVECTOR_SKIP_DASHBOARD) { "dist" } else { "dist,dashboard-ui" }
 Push-Location $repoRoot
 try {
     Write-Host ""
-    Write-Host ">> mvn -Pdist install -DskipTests"
-    & mvn "-Pdist" install "-DskipTests"
+    Write-Host ">> mvn -P$profiles install -DskipTests"
+    & mvn "-P$profiles" install "-DskipTests"
     if ($LASTEXITCODE -ne 0) { throw "maven build failed (exit $LASTEXITCODE)" }
 }
 finally {
@@ -112,9 +132,15 @@ if (-not $onPath) {
     Write-Host "$InstallDir already on user PATH"
 }
 
-# 5. Create %USERPROFILE%\.cvector (only if absent) and optionally seed project.json.
+# 5. Create %USERPROFILE%\.cvector (only if absent) and optionally seed settings.json.
+# This is the "home fallback" config the loader walks up to when cwd doesn't have a
+# project-local .cvector/. Seeding it here means `cvector status`/`cvector dashboard`
+# work from any drive or directory the user happens to be in after install.
 $userCvector = Join-Path $env:USERPROFILE ".cvector"
-$projectJson = Join-Path $userCvector "project.json"
+$settingsJson = Join-Path $userCvector "settings.json"
+# Legacy filename — still read by older binaries. We never write it; just check.
+$legacyProjectJson = Join-Path $userCvector "project.json"
+
 if (Test-Path $userCvector) {
     Write-Host "$userCvector already exists -- not modifying the directory itself"
 } else {
@@ -122,10 +148,13 @@ if (Test-Path $userCvector) {
     Write-Host "created $userCvector"
 }
 
-function Write-DefaultProjectJson {
+function Write-DefaultSettingsJson {
     param([string]$Path)
     $uuid = [guid]::NewGuid().ToString()
     $rootEscaped = $env:USERPROFILE -replace '\\','\\'
+    # `backend = embedded` is the default but stating it makes the file self-documenting.
+    # The neo4j / rest / mcp / docker sections are omitted entirely so they pick up the
+    # config-record defaults (loopback bind, port 2969, MCP at /mcp, etc.).
     $json = @"
 {
   "activeProject": "default",
@@ -136,28 +165,28 @@ function Write-DefaultProjectJson {
       "rootPath": "$rootEscaped"
     }
   },
-  "neo4j": {
-    "uri": "bolt://localhost:7687",
-    "user": "neo4j",
-    "password": "neo4j"
-  }
+  "backend": "embedded"
 }
 "@
     [System.IO.File]::WriteAllText($Path, $json)
 }
 
-if (-not (Test-Path $projectJson)) {
-    Write-DefaultProjectJson -Path $projectJson
-    Write-Host "wrote default $projectJson"
-} else {
+if (-not (Test-Path $settingsJson) -and -not (Test-Path $legacyProjectJson)) {
+    Write-DefaultSettingsJson -Path $settingsJson
+    Write-Host "wrote default $settingsJson"
+} elseif (Test-Path $settingsJson) {
     Write-Host ""
-    Write-Host "$projectJson already exists."
-    if (Read-YesNo -Prompt "Overwrite with the installer defaults?" -Default 'n') {
-        Write-DefaultProjectJson -Path $projectJson
-        Write-Host "overwrote $projectJson with defaults"
+    Write-Host "$settingsJson already exists."
+    if (Read-YesNo -Prompt "Overwrite with the installer defaults (backend=embedded)?" -Default 'n') {
+        Write-DefaultSettingsJson -Path $settingsJson
+        Write-Host "overwrote $settingsJson with defaults"
     } else {
-        Write-Host "kept existing $projectJson"
+        Write-Host "kept existing $settingsJson"
     }
+} else {
+    # Only the legacy project.json exists. Leave it alone — the loader still reads it,
+    # and the user can `cvector db` / REST PUT to migrate when ready.
+    Write-Host "found legacy $legacyProjectJson (still readable; canonical name is settings.json)"
 }
 
 Write-Host ""

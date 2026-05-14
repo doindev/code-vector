@@ -175,9 +175,18 @@
                             <mainJar>${project.build.finalName}.jar</mainJar>
                             <destination>${project.build.directory}/dist</destination>
                             <type>APP_IMAGE</type>
-                            <javaOptions>
-                                <option>-Dspring.aot.enabled=true</option>
-                            </javaOptions>
+                            <!--
+                                Intentionally NOT setting -Dspring.aot.enabled=true here.
+                                The AOT artifacts are generated at build time against the
+                                default WebApplicationType (NONE), which works fine for the
+                                CLI subcommands but breaks `cvector dashboard`: the
+                                pre-baked bean definitions do not include a ServletWebServerFactory,
+                                so Tomcat never starts and Spring fails with "Web application
+                                could not be started". CLI mode is ~1 s slower without AOT,
+                                but the .exe has to support every subcommand correctly.
+                                Users who only want CLI speed can re-enable AOT manually:
+                                  cvector.exe -J-Dspring.aot.enabled=true status
+                            -->
                             <!--
                                 jpackage can't auto-detect required modules from a non-modular fat jar,
                                 so list them explicitly. Covers Spring Boot + jackson + Neo4j driver +
@@ -194,6 +203,11 @@
                                 <module>java.logging</module>
                                 <module>java.xml</module>
                                 <module>java.security.jgss</module>
+                                <module>java.instrument</module>
+                                <module>java.scripting</module>
+                                <module>java.rmi</module>
+                                <module>java.compiler</module>
+                                <module>jdk.zipfs</module>
                                 <module>jdk.crypto.ec</module>
                                 <module>jdk.unsupported</module>
                             </addModules>

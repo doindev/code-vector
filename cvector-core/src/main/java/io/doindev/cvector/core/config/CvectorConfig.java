@@ -89,7 +89,12 @@ public record CvectorConfig(
      * Per-workspace project entry. The optional {@code rules} field carries a project-scoped
      * override of the workspace-wide {@link RulesPolicy}; the rules engine merges both at
      * load time (defaults → rules.yml → workspace {@code rules} → project {@code rules}).
+     *
+     * <p>{@code @JsonInclude(NON_NULL)} keeps {@code rules: null} out of serialized files —
+     * the auto-bootstrapped {@code ~/.cvector/settings.json} would otherwise carry a noisy
+     * null field that confuses new users reading their first config file.
      */
+    @JsonInclude(JsonInclude.Include.NON_NULL)
     public record ProjectEntry(String projectId, String name, String rootPath, RulesPolicy rules) {
         /** Legacy 3-arg constructor for callers that don't carry rules. */
         public ProjectEntry(String projectId, String name, String rootPath) {
@@ -112,6 +117,7 @@ public record CvectorConfig(
      *       replaces a workspace-level one (Cypher + severity + description all updated).</li>
      * </ul>
      */
+    @JsonInclude(JsonInclude.Include.NON_NULL)
     public record RulesPolicy(
             Map<String, Integer> thresholds,
             List<String> disable,
@@ -124,6 +130,7 @@ public record CvectorConfig(
     }
 
     /** Custom Cypher rule definition that can appear under {@link RulesPolicy#custom}. */
+    @JsonInclude(JsonInclude.Include.NON_NULL)
     public record CustomPolicy(
             String name,
             String description,
@@ -132,6 +139,7 @@ public record CvectorConfig(
             String cypherKuzu
     ) {}
 
+    @JsonInclude(JsonInclude.Include.NON_NULL)
     public record Neo4jConfig(String uri, String user, String password) {
 
         public static Neo4jConfig defaults() {
@@ -144,6 +152,7 @@ public record CvectorConfig(
      * localhost so the API isn't exposed without the user explicitly opting in via
      * {@code cvector host 0.0.0.0}.
      */
+    @JsonInclude(JsonInclude.Include.NON_NULL)
     public record RestConfig(Integer port, String host) {
 
         public static RestConfig defaults() {
@@ -162,6 +171,7 @@ public record CvectorConfig(
      * {@code url} is informational for clients — the server still binds to {@link RestConfig#host}
      * and {@link RestConfig#port} (plus the MCP path) by default.
      */
+    @JsonInclude(JsonInclude.Include.NON_NULL)
     public record McpConfig(String url, String transport) {
 
         public static final String TRANSPORT_HTTP = "http";
@@ -192,6 +202,7 @@ public record CvectorConfig(
      * Docker-managed Neo4j config used when {@link #backend} is {@code docker}. The compose file
      * lives at {@code .cvector/docker-compose.yml} and {@code cvector init} writes it on demand.
      */
+    @JsonInclude(JsonInclude.Include.NON_NULL)
     public record DockerConfig(String image, String containerName, String neo4jVersion, Integer boltPort, Integer httpPort) {
 
         public static DockerConfig defaults() {
