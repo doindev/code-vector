@@ -213,8 +213,8 @@
                                 Build the Windows launcher as a CONSOLE-subsystem .exe rather than
                                 the GUI default. Without this, jpackage produces a .exe that does
                                 not inherit the calling shell's stdout/stderr: every CLI command
-                                that just prints text (status / search / explain / --version /
-                                --help) ran "silently" because picocli's writes went to a detached
+                                that just prints text (status / search / explain / dash dash version /
+                                dash dash help) ran "silently" because picocli's writes went to a detached
                                 handle. Dashboard mode "appeared" to work only because port-bind
                                 + browser-open are observable side effects. winConsole=true makes
                                 stdout/stderr inherit from PowerShell / cmd / bash so users
