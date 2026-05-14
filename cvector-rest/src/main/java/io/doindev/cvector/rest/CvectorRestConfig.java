@@ -100,7 +100,10 @@ public class CvectorRestConfig {
         Path root = configService.findConfigRoot(cwd);
         if (root == null) {
             throw new IllegalStateException(
-                    "No .cvector/project.json found from " + cwd + ". Run `cvector init` first.");
+                    "No .cvector/settings.json found from " + cwd
+                            + " (also checked your user home directory). Run `cvector init` "
+                            + "inside the project, or create a global workspace at "
+                            + "~/.cvector/settings.json.");
         }
         try {
             return configService.load(root);

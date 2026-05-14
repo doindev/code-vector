@@ -7,6 +7,7 @@ import com.fasterxml.jackson.databind.SerializationFeature;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.LinkedHashMap;
 
 /**
@@ -86,12 +87,48 @@ public class CvectorConfigService {
         mapper.writeValue(file.toFile(), config);
     }
 
+    /**
+     * Locate the workspace's config root by walking up from {@code start} looking for
+     * {@code .cvector/settings.json} (or the legacy {@code .cvector/project.json}).
+     *
+     * <p>Falls back to {@link #userHomeConfigRoot()} when the walk reaches the filesystem
+     * root without finding a project-local config. Two use cases this fallback enables:
+     * <ol>
+     *   <li>Running {@code cvector status} (or any read command) from {@code C:\} or
+     *       {@code /tmp} — anywhere not under the user's home — instead of getting
+     *       <em>"No .cvector/settings.json found"</em>.</li>
+     *   <li>A "global" workspace at {@code ~/.cvector/settings.json} whose {@code projects}
+     *       map points at absolute {@code rootPath}s on disk. cvector will pick that up and
+     *       operate on the active project from any cwd.</li>
+     * </ol>
+     *
+     * <p>Project-local config still wins: if you're inside a directory that has its own
+     * {@code .cvector/settings.json}, the walk finds it first and the home fallback is
+     * never consulted.
+     */
     public Path findConfigRoot(Path start) {
         Path cur = start.toAbsolutePath().normalize();
         while (cur != null) {
             if (exists(cur)) return cur;
             cur = cur.getParent();
         }
+        Path home = userHomeConfigRoot();
+        if (home != null && exists(home)) return home;
         return null;
+    }
+
+    /**
+     * Returns the user's home directory as a potential config root, or {@code null} when
+     * the {@code user.home} system property is missing or unreadable. The presence of a
+     * config file there isn't checked here — {@link #findConfigRoot} does that.
+     */
+    public Path userHomeConfigRoot() {
+        String home = System.getProperty("user.home");
+        if (home == null || home.isBlank()) return null;
+        try {
+            return Paths.get(home);
+        } catch (RuntimeException e) {
+            return null;
+        }
     }
 }

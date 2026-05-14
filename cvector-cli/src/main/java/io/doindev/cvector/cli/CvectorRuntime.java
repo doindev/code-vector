@@ -35,8 +35,11 @@ public class CvectorRuntime {
         Path root = configService.findConfigRoot(workingDir());
         if (root == null) {
             throw new IllegalStateException(
-                    "No .cvector/settings.json (or legacy project.json) found in " + workingDir()
-                            + " or any parent. Run `cvector init` first.");
+                    "No .cvector/settings.json found in " + workingDir()
+                            + " or any parent (also checked your user home directory). "
+                            + "Run `cvector init` inside the project, or create a global "
+                            + "workspace at ~/.cvector/settings.json so commands work from "
+                            + "anywhere.");
         }
         return root;
     }

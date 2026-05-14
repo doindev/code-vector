@@ -117,8 +117,9 @@ public class McpServerConfig {
         Path cwd = Paths.get("").toAbsolutePath();
         Path root = configService.findConfigRoot(cwd);
         if (root == null) {
-            throw new IllegalStateException("No .cvector/settings.json (or legacy project.json) from "
-                    + cwd + " — run `cvector init`.");
+            throw new IllegalStateException("No .cvector/settings.json found from "
+                    + cwd + " (also checked your user home directory). Run `cvector init`, or "
+                    + "create a global workspace at ~/.cvector/settings.json.");
         }
         try {
             return configService.load(root);

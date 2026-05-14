@@ -143,6 +143,8 @@ Three ways out (top to bottom: most permanent → most ad-hoc):
 
 cvector keeps all per-workspace state in a single file: `.cvector/settings.json` (created by `cvector init`, discovered by walking up from the current working directory). The file has seven top-level fields, only two of which are required after `init` (`activeProject`, `projects`); every other section falls back to a sensible default if absent.
 
+> **Global fallback.** If the walk-up finds no project-local `.cvector/`, cvector also checks **`~/.cvector/settings.json`** (your user home). That lets `cvector status`, `cvector dashboard`, etc. work from anywhere — even `C:\` or `/tmp` — as long as you've set up a home-level config whose `projects` map points at absolute `rootPath`s. Project-local config still wins when it exists; the home fallback is consulted only when nothing's found by the walk-up.
+
 > **Legacy filename.** Older installs used `.cvector/project.json`. The loader still reads that name as a fallback so existing workspaces keep working, but every write goes to `settings.json`. If you have both, `settings.json` wins.
 
 ### Picking a backend
