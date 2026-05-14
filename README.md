@@ -1,6 +1,8 @@
 # cvector
 
-Neo4j-backed code knowledge graph with a polyglot scanner, a Picocli CLI, a Spring Boot REST API, and an MCP server for AI assistants. Point it at a codebase and it ingests files into a graph of `Class → Method → CALLS → Method`, REST endpoints, SQL tables, config keys, container images, IaC resources, GraphQL types, and more — then exposes that graph to humans (CLI + dashboard) and to AI assistants (MCP tools, resources, prompts).
+Code knowledge graph with a polyglot scanner, a Picocli CLI, a Spring Boot REST API + dashboard, and an MCP server for AI assistants. Point it at a codebase and it ingests files into a graph of `Class → Method → CALLS → Method`, REST endpoints, SQL tables, config keys, container images, IaC resources, GraphQL types, and more — then exposes that graph to humans (CLI + dashboard) and to AI assistants (MCP tools, resources, prompts).
+
+**Backends.** cvector ships with an **embedded [KuzuDB](https://kuzudb.com) store** as the default — in-process, MIT-licensed, no separate database to run. The graph data lives under `~/.cvector/kuzu-data/<projectId>/`. Optionally you can point cvector at **Neo4j** instead — either an existing remote instance over Bolt, or one cvector spins up for you via Docker Compose. See [Backends & settings.json](#backends--settingsjson) for the full configuration matrix.
 
 ---
 
@@ -8,7 +10,7 @@ Neo4j-backed code knowledge graph with a polyglot scanner, a Picocli CLI, a Spri
 
 1. [Requirements](#requirements)
 2. [Quick start](#quick-start)
-3. [Configuration](#configuration)
+3. [Backends & settings.json](#backends--settingsjson)
 4. [CLI commands](#cli-commands)
 5. [REST API](#rest-api)
 6. [MCP server](#mcp-server)
@@ -16,7 +18,7 @@ Neo4j-backed code knowledge graph with a polyglot scanner, a Picocli CLI, a Spri
    - [Resources](#mcp-resources)
    - [Prompts](#mcp-prompts)
    - [Client setup](#mcp-client-setup)
-7. [Embedded KuzuDB](#embedded-kuzudb)
+7. [Embedded KuzuDB (default backend)](#embedded-kuzudb-default-backend)
 8. [Supported languages](#supported-languages)
 9. [Rules & quality gates](#rules--quality-gates)
 10. [Roles & access control](#roles--access-control)
@@ -31,10 +33,13 @@ Neo4j-backed code knowledge graph with a polyglot scanner, a Picocli CLI, a Spri
 |---|---|---|
 | **Java** | 17 (compile target) | Runs on JDK 21+ to enable virtual threads in MCP/dashboard. |
 | **Maven** | 3.9+ | The build uses ANTLR4 maven plugin for grammar generation. |
-| **Neo4j** | 5.x | Local Docker container works; see below. |
 | **OS** | Windows / Linux / macOS | Build is OS-agnostic. |
+| **Neo4j** | *(optional)* 5.x | Only required if you opt out of the embedded KuzuDB default — see [Backends](#backends--settingsjson). The Kuzu native library is bundled in the fat-jar for all three platforms. |
+| **Docker** | *(optional)* | Only needed for the `docker` backend mode where cvector manages a Neo4j container for you. |
 
-### Starting a local Neo4j
+### Optional: starting a local Neo4j manually
+
+Only needed if you want `backend: "remote"` against your own Neo4j instance. Skip this section entirely if you're using the embedded default (most users).
 
 ```bash
 docker run --name neo4j_admin \
@@ -43,11 +48,44 @@ docker run --name neo4j_admin \
   -d neo4j:5
 ```
 
+For the `docker` backend mode (where cvector spins the container up for you), see [Backend: Docker-managed Neo4j](#backend-docker-managed-neo4j) below — no manual `docker run` needed.
+
 ---
 
 ## Quick start
 
-### Option A — Docker compose (no local Java needed)
+### Option A — Embedded (default; no extra infrastructure)
+
+This is the recommended starting point. The graph lives in an in-process KuzuDB at `~/.cvector/kuzu-data/<projectId>/` — nothing else to install, nothing to spin up.
+
+```bash
+# 1. Build the fat jar (and the optional dashboard UI)
+mvn -DskipTests install                                # CLI + REST only
+mvn -pl cvector-app -am -Pdashboard-ui -DskipTests package   # + Angular dashboard
+
+# 2. Initialise cvector in the codebase you want to scan
+cd /path/to/your/project
+java -jar /path/to/cvector/cvector-app/target/cvector.jar init --project my-project
+
+# `init` writes .cvector/settings.json with backend = "embedded". No edits needed.
+
+# 3. Scan
+java -jar /path/to/cvector.jar scan
+
+# 4. Try it out
+java -jar /path/to/cvector.jar status
+java -jar /path/to/cvector.jar onboard
+java -jar /path/to/cvector.jar rules
+
+# 5. Open the dashboard (auto-launches a browser tab)
+java -jar /path/to/cvector.jar dashboard -o
+```
+
+The fat jar at `cvector-app/target/cvector.jar` is the single executable for **CLI**, **dashboard**, and **MCP server** modes — the first argument selects the mode.
+
+### Option B — Neo4j via Docker compose (instead of embedded)
+
+Use this if you want a Neo4j instance you can query in the Neo4j Browser, GDS / Bloom, or share across multiple cvector projects.
 
 ```bash
 git clone <this repo> cvector && cd cvector
@@ -57,6 +95,7 @@ docker compose up -d neo4j
 
 # One-shot scan of the current directory
 docker compose run --rm cvector init --project my-project
+# Edit .cvector/settings.json: set "backend": "remote" and fill in neo4j.password.
 docker compose run --rm cvector scan
 
 # Long-lived REST dashboard on http://localhost:2969
@@ -66,29 +105,7 @@ docker compose up -d dashboard
 docker compose run --rm -T cvector serve
 ```
 
-The Neo4j password defaults to `cvector_admin_pw`; override with `NEO4J_AUTH=neo4j/<your-pw>` in the environment. The `cvector` service mounts the host repo as `/workspace`, so scans see your real files.
-
-### Option B — Local JDK + Maven
-
-```bash
-# 1. Build the fat jar
-mvn -DskipTests install
-
-# 2. Initialise cvector in your project root
-cd /path/to/your/project
-java -jar /path/to/cvector/cvector-app/target/cvector.jar init --project my-project
-
-# 3. Edit .cvector/project.json — set neo4j password
-# 4. Scan the codebase
-java -jar /path/to/cvector.jar scan
-
-# 5. Try it out
-java -jar /path/to/cvector.jar status
-java -jar /path/to/cvector.jar onboard
-java -jar /path/to/cvector.jar rules
-```
-
-The fat jar at `cvector-app/target/cvector.jar` is the single executable for **CLI**, **dashboard**, and **MCP server** modes — the first argument selects the mode.
+The Neo4j password defaults to `cvector_admin_pw`; override with `NEO4J_AUTH=neo4j/<your-pw>` in the environment. The `cvector` service mounts the host repo as `/workspace`, so scans see your real files. See [Backend: Remote Neo4j](#backend-remote-neo4j-existing-instance) for the matching `settings.json` shape.
 
 ### Option C — Standalone Windows distributable (no JDK required)
 
@@ -112,39 +129,210 @@ The plugin is `org.panteleyev:jpackage-maven-plugin`, bound to the `verify` phas
 
 ---
 
-## Configuration
+## Backends & settings.json
 
-cvector uses a single config file per workspace.
+cvector keeps all per-workspace state in a single file: `.cvector/settings.json` (created by `cvector init`, discovered by walking up from the current working directory). The file has seven top-level fields, only two of which are required after `init` (`activeProject`, `projects`); every other section falls back to a sensible default if absent.
 
-### `.cvector/project.json`
+> **Legacy filename.** Older installs used `.cvector/project.json`. The loader still reads that name as a fallback so existing workspaces keep working, but every write goes to `settings.json`. If you have both, `settings.json` wins.
 
-Created by `cvector init`. Discovered by walking up from the current working directory.
+### Picking a backend
+
+The `backend` field decides where the graph is stored. Three modes:
+
+| Mode | When to use | Setup cost |
+|---|---|---|
+| **`embedded`** *(default)* | Default — single-user, fast cold start, no other process to run. | None. The Kuzu native library is bundled in the fat-jar; database lives at `~/.cvector/kuzu-data/<projectId>/`. |
+| **`remote`** | You already have a Neo4j instance, or you want to use Neo4j Browser / GDS / Bloom on the same graph. | Provide a running Neo4j 5.x. Set `neo4j.uri / user / password`. |
+| **`docker`** | You want Neo4j but don't want to manage it yourself. cvector writes a `docker-compose.yml` and runs `docker compose up -d` for you. | Docker installed. cvector handles the rest. |
+
+You can switch any time without changing your data model — the parsers emit the same `GraphEvent` shapes regardless of backend. Switching from one backend to another does **not** migrate the existing graph data; you re-run `cvector scan` to populate the new backend.
+
+### Full schema
 
 ```json
 {
   "activeProject": "my-project",
   "projects": {
     "my-project": {
-      "projectId": "uuid-here",
+      "projectId": "0d357370-80be-423e-9f79-c7ffc496eed3",
       "name": "my-project",
-      "rootPath": "/absolute/path/to/project"
+      "rootPath": "C:\\path\\to\\project"
     }
   },
+  "backend": "embedded",
   "neo4j": {
     "uri": "bolt://localhost:7687",
     "user": "neo4j",
-    "password": "your-password"
+    "password": "neo4j"
+  },
+  "rest": {
+    "port": 2969,
+    "host": "127.0.0.1"
+  },
+  "mcp": {
+    "url": "http://127.0.0.1:2969/mcp",
+    "transport": "http"
+  },
+  "docker": {
+    "image": "neo4j",
+    "containerName": "cvector-neo4j",
+    "neo4jVersion": "5",
+    "boltPort": 7687,
+    "httpPort": 7474
   }
 }
 ```
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `activeProject` | string | (set by `init`) | Name of the project commands operate on by default. |
-| `projects` | map | `{}` | Project entries keyed by name. Each has `projectId`, `name`, `rootPath`. |
-| `neo4j.uri` | string | `bolt://localhost:7687` | Neo4j Bolt URL. |
-| `neo4j.user` | string | `neo4j` | Username. |
-| `neo4j.password` | string | `neo4j` | Password. |
+| `activeProject` | string | *(set by `init`)* | Name of the project that commands operate on by default. Use `cvector project switch <name>` to change. |
+| `projects` | object | `{}` | Map of project name → `ProjectEntry`. Each entry has `projectId` (UUID, generated once and stable for the life of the project), `name` (human label, equal to the map key), and `rootPath` (absolute path to the codebase root). |
+| `backend` | string | `"embedded"` | One of `"embedded"` / `"remote"` / `"docker"`. Unknown values fall back to `"embedded"`. |
+| `neo4j.uri` | string | `"bolt://localhost:7687"` | Neo4j Bolt URL. Used only when `backend ∈ {remote, docker}`. |
+| `neo4j.user` | string | `"neo4j"` | Bolt username. |
+| `neo4j.password` | string | `"neo4j"` | Bolt password. **REST `GET /api/settings` masks this as `"***"`; sending `"***"` back via `PUT /api/settings` is treated as "keep existing".** |
+| `rest.port` | integer | `2969` | Port the dashboard / REST API binds to. |
+| `rest.host` | string | `"127.0.0.1"` | Bind address. `127.0.0.1` keeps the dashboard loopback-only; use `0.0.0.0` to expose on the network. Easier: `cvector host 0.0.0.0`. |
+| `mcp.url` | string | `"http://127.0.0.1:2969/mcp"` | Informational URL clients can use to reach the MCP server. The server itself binds at `rest.host:rest.port`. |
+| `mcp.transport` | string | `"http"` | One of `"http"` / `"sse"` / `"stdio"`. Drives how MCP clients connect. |
+| `docker.image` | string | `"neo4j"` | Docker image name (without tag). |
+| `docker.containerName` | string | `"cvector-neo4j"` | Compose service / container name. |
+| `docker.neo4jVersion` | string | `"5"` | Image tag — used as `{image}:{neo4jVersion}`. |
+| `docker.boltPort` | integer | `7687` | Host port the container's Bolt listener is mapped to. |
+| `docker.httpPort` | integer | `7474` | Host port for Neo4j HTTP / Browser. |
+
+Every section is optional — omit it and the defaults above apply. Adding a field never breaks older binaries (Jackson ignores unknown fields at load time).
+
+### Backend: Embedded Kuzu *(default)*
+
+Minimal `settings.json` for the default backend:
+
+```json
+{
+  "activeProject": "my-project",
+  "projects": {
+    "my-project": {
+      "projectId": "0d357370-80be-423e-9f79-c7ffc496eed3",
+      "name": "my-project",
+      "rootPath": "/absolute/path/to/project"
+    }
+  },
+  "backend": "embedded"
+}
+```
+
+That's the entire file. No Neo4j credentials needed; no network ports to open. `cvector init` writes this for you. The `rest`, `mcp`, `neo4j`, and `docker` sections can be omitted entirely — defaults kick in.
+
+CLI shortcut to flip the active backend:
+
+```bash
+cvector db --embedded
+```
+
+### Backend: Remote Neo4j (existing instance)
+
+You already run Neo4j somewhere — locally, on a VM, in a managed service. Tell cvector how to reach it:
+
+```json
+{
+  "activeProject": "my-project",
+  "projects": {
+    "my-project": {
+      "projectId": "...",
+      "name": "my-project",
+      "rootPath": "/absolute/path/to/project"
+    }
+  },
+  "backend": "remote",
+  "neo4j": {
+    "uri": "bolt://neo4j.internal:7687",
+    "user": "neo4j",
+    "password": "your-actual-password"
+  }
+}
+```
+
+CLI shortcut:
+
+```bash
+cvector db --remote                     # switch backend mode
+# then edit settings.json to set neo4j.uri / user / password (or set them via REST PUT /api/settings)
+```
+
+Connection failures surface from the Bolt driver downstream — the dashboard's `/api/health` returns the connection error in the `status` field.
+
+### Backend: Docker-managed Neo4j
+
+cvector writes `.cvector/docker-compose.yml` from the `docker` section and runs `docker compose up -d` for you. You don't manage the container — flip the backend and run any scan command.
+
+```json
+{
+  "activeProject": "my-project",
+  "projects": {
+    "my-project": {
+      "projectId": "...",
+      "name": "my-project",
+      "rootPath": "/absolute/path/to/project"
+    }
+  },
+  "backend": "docker",
+  "neo4j": {
+    "uri": "bolt://localhost:7687",
+    "user": "neo4j",
+    "password": "cvector_admin_pw"
+  },
+  "docker": {
+    "image": "neo4j",
+    "containerName": "cvector-neo4j",
+    "neo4jVersion": "5",
+    "boltPort": 7687,
+    "httpPort": 7474
+  }
+}
+```
+
+`DockerNeo4jBackend.ensureRunning` waits up to 60 s for the bolt port to open. If Docker is missing or compose fails, cvector continues — the next graph read will surface the connection error from the Bolt driver. The compose file is best-effort: it's regenerated from the config on every `ensureRunning` call only if missing, so manual edits to `docker-compose.yml` persist.
+
+CLI shortcut:
+
+```bash
+cvector db --docker
+```
+
+### Switching backends and inspecting state
+
+| Command | Effect |
+|---|---|
+| `cvector db --embedded` | Set `backend: "embedded"` and save. |
+| `cvector db --remote` | Set `backend: "remote"` and save. |
+| `cvector db --docker` | Set `backend: "docker"` and save. |
+| `cvector host <addr>` | Update `rest.host` (e.g. `0.0.0.0` to expose the dashboard on the LAN). |
+| `cvector mcp` | Show current MCP config. |
+| `cvector mcp update --transport <http\|sse\|stdio> <URL>` | Update `mcp.transport` and `mcp.url`. |
+| `cvector --backend <mode> <subcommand>` | One-shot backend override that does **not** persist to `settings.json`. |
+| `--embedded` *(global flag)* | Legacy back-compat; equivalent to `--backend embedded` at the root level. Subcommands no longer inherit it (it would collide with `cvector db --embedded`). |
+| Env `CVECTOR_EMBEDDED=true` | Same as the `--embedded` flag for shell scripts / Docker. |
+
+### Network exposure
+
+The dashboard / REST API binds to `rest.host:rest.port` — defaulting to **loopback only** (`127.0.0.1:2969`). Remote hosts on the network cannot reach the embedded server at the default address. To expose it:
+
+```bash
+cvector host 0.0.0.0                                    # persists in settings.json
+# or one-shot:
+cvector dashboard --server.address=0.0.0.0
+```
+
+Pair off-loopback exposure with a reverse proxy and auth. The `cvector serve` MCP transport uses stdio, so it never opens a network socket regardless of `rest.host`.
+
+### Settings via REST
+
+The dashboard exposes the same file as JSON:
+
+- `GET /api/settings` — full config with `neo4j.password` masked as `"***"`.
+- `PUT /api/settings` — partial JSON patch; merged into the existing config. Sending `"password": "***"` is a no-op (preserves the stored value), so you can round-trip a `GET` response through a `PUT` without losing the credential.
+
+Every save publishes a `SettingsChangedEvent` so views that depend on the config refresh without a reload.
 
 ### `.cvector/rules.yml`
 
@@ -174,6 +362,12 @@ custom:
       MATCH (c:Class {projectId: $pid, isService: true})-[:CONTAINS]->(m:Method)-[:CALLS]->(callee:Method)
       WHERE callee.fqName CONTAINS 'PrintStream.println'
       RETURN c.fqName AS subject, callee.fqName AS message
+    # Optional Kuzu-specific body. If absent, the cypher above is used for both backends.
+    # cypherKuzu: |
+    #   MATCH (c:Node)-[:CONTAINS]->(m:Node)-[:CALLS]->(callee:Node)
+    #   WHERE c.label = 'Class' AND m.label = 'Method' AND callee.label = 'Method'
+    #     AND c.isService = true AND callee.fqName CONTAINS 'PrintStream.println'
+    #   RETURN c.fqName AS subject, callee.fqName AS message
 ```
 
 ### Spring profiles
@@ -182,24 +376,14 @@ custom:
 |---|---|---|
 | (default) | CLI commands | Single-shot execution, no web/MCP. |
 | `mcp` | `cvector serve` | Stdio JSON-RPC server, MCP capabilities enabled, virtual threads on. |
-| (web mode) | `cvector dashboard` | Embedded servlet container on port 2969, virtual threads on. |
+| (web mode) | `cvector dashboard` | Embedded servlet container on `rest.host:rest.port` (default `127.0.0.1:2969`), virtual threads on. |
 
 ### Environment variables
 
 | Variable | Effect |
 |---|---|
-| `cvector_role` / `CVECTOR_ROLE` | Restrict tools/REST paths exposed: `dev` (default), `architect`, `security`, `pm`. |
-| `CVECTOR_EMBEDDED` | When `true`, route graph access through the embedded KuzuDB store under `~/.cvector/kuzu-data/<projectId>/` instead of `project.json`'s `neo4j` block. Equivalent to passing `--embedded`. See the [Embedded KuzuDB](#embedded-kuzudb) section. |
-
-### Global flags
-
-| Flag | Effect |
-|---|---|
-| `--embedded` | Use the embedded KuzuDB store (no Neo4j required). Inherited by every subcommand. |
-
-### Network exposure
-
-The dashboard / REST API (`cvector dashboard`) is bound to **`127.0.0.1` only** by default (set in `application.properties` as `server.address=127.0.0.1`). Remote hosts cannot reach the embedded web server. To expose it on a trusted network, override with `--server.address=0.0.0.0`. The `cvector serve` (MCP) transport is stdio, so it never opens a network socket.
+| `cvector_role` / `CVECTOR_ROLE` | Restrict tools/REST paths exposed: `dev` (default), `architect`, `security`, `pm`. See [Roles](#roles--access-control). |
+| `CVECTOR_EMBEDDED` | Same as `--embedded` flag — forces the embedded backend regardless of `settings.json`. Useful in shell scripts and Docker entrypoints. |
 
 ---
 
@@ -211,7 +395,7 @@ Invoke as `java -jar cvector.jar <command> [args]`.
 
 | Command | Purpose | Key options |
 |---|---|---|
-| `init` | Create `.cvector/project.json` in the current directory. | `--project <name>` (defaults to dir name), `--force` |
+| `init` | Create `.cvector/settings.json` in the current directory (defaults to `backend: "embedded"`). | `--project <name>` (defaults to dir name), `--force` |
 | `project create <name>` | Add another project to the workspace. | `--root <path>`, `--switch` |
 | `project list` | List all projects. | — |
 | `project info` | Show active project's config. | — |
@@ -425,9 +609,9 @@ Each helper writes an MCP server entry that runs `java -jar <path>/cvector.jar s
 
 ---
 
-## Embedded KuzuDB
+## Embedded KuzuDB (default backend)
 
-The `cvector-embedded-kuzudb-server` module ships an in-process [KuzuDB](https://kuzudb.com) store as an alternative backing for the graph. KuzuDB is an embedded property-graph database (MIT licensed) that speaks Cypher — no separate process, no port, no Docker. The Kuzu native library is bundled in the artifact for Linux / macOS / Windows.
+The `cvector-embedded-kuzudb-server` module ships an in-process [KuzuDB](https://kuzudb.com) store — and is the **default** graph backing for cvector. KuzuDB is an embedded property-graph database (MIT licensed) that speaks Cypher: no separate process, no port, no Docker. The Kuzu native library is bundled in the artifact for Linux / macOS / Windows. Set `backend: "remote"` or `backend: "docker"` in `settings.json` to opt into a Neo4j backing instead — see [Backends & settings.json](#backends--settingsjson).
 
 The module is named with its backend (`-kuzudb-`) so additional embedded backends (e.g. DuckDB, SQLite-backed graph) can ship as parallel modules without colliding.
 
@@ -459,7 +643,7 @@ cvector embedded query "MATCH (n:Node) RETURN count(n)"
 cvector embedded wipe                 # delete the project's database directory
 ```
 
-The `--embedded` global flag (and `CVECTOR_EMBEDDED=true`) are wired through `CvectorCommand`; commands that don't yet honour it will continue using the Neo4j connection from `project.json`.
+The embedded backend is the default — no flag required. The legacy `--embedded` global flag (and `CVECTOR_EMBEDDED=true` env var) remain for back-compat: they force embedded regardless of `settings.json`. To switch to a Neo4j backing instead, use `cvector db --remote` or `cvector db --docker` and fill in the `neo4j` block of `settings.json`. See [Backends & settings.json](#backends--settingsjson).
 
 ### Layout
 
@@ -475,17 +659,18 @@ A KuzuDB "database" is a directory, not a single file — Kuzu writes columnar s
 |---|---|---|
 | `cvector.embedded` | unset | Same as the `--embedded` flag. Set via `-Dcvector.embedded=true` or env. |
 
-### Trade-offs vs Neo4j
+### Trade-offs: Kuzu (default) vs Neo4j (optional)
 
-| Aspect | Neo4j (Bolt) | KuzuDB (in-process) |
+| Aspect | KuzuDB (default, in-process) | Neo4j (optional, Bolt) |
 |---|---|---|
-| Cold start | ~10 s | ~50 ms |
-| Memory floor | ~500 MB heap | ~50 MB |
-| License | GPL v3 (Community) | MIT |
-| Cypher dialect | Reference | Subset; no `SET n += $props`, limited `MERGE` |
-| Schema | Schema-on-read | Upfront `CREATE NODE TABLE` |
-| Tooling | Neo4j Browser, GDS, Bloom | CLI + Kuzu Explorer (separate web UI) |
-| Network | Bolt TCP | Java function call |
+| Cold start | ~50 ms | ~10 s |
+| Memory floor | ~50 MB | ~500 MB heap |
+| License | MIT | GPL v3 (Community) |
+| Cypher dialect | Subset; no `SET n += $props`, limited `MERGE` | Reference |
+| Schema | Upfront `CREATE NODE TABLE` (handled by cvector at boot) | Schema-on-read |
+| Tooling | CLI + Kuzu Explorer (separate web UI) | Neo4j Browser, GDS, Bloom |
+| Network | Java function call | Bolt TCP |
+| Setup | Built-in; no extra process | Run a Neo4j 5.x instance or use `backend: "docker"` |
 
 ---
 
