@@ -20,10 +20,6 @@
             <artifactId>cvector-core</artifactId>
         </dependency>
         <dependency>
-            <groupId>io.doindev</groupId>
-            <artifactId>cvector-neo4j</artifactId>
-        </dependency>
-        <dependency>
             <groupId>io.methvin</groupId>
             <artifactId>directory-watcher</artifactId>
         </dependency>

@@ -2,19 +2,17 @@ package io.doindev.cvector.cli.commands;
 
 import io.doindev.cvector.cli.CvectorRuntime;
 import io.doindev.cvector.core.config.CvectorConfig;
-import io.doindev.cvector.neo4j.Neo4jClient;
-import io.doindev.cvector.neo4j.repo.GraphQueries;
+import io.doindev.cvector.core.store.GraphStore;
 import org.springframework.stereotype.Component;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
 
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Callable;
 
 @Component
-@Command(name = "flows", description = "Trace execution flows from entry points through the call graph.")
+@Command(name = "flows", description = "Trace execution flows from entry points through the call graph.", mixinStandardHelpOptions = true)
 public class FlowsCommand implements Callable<Integer> {
 
     @Option(names = "--max-depth", description = "Max BFS depth from each entry point (default 4).")
@@ -36,81 +34,52 @@ public class FlowsCommand implements Callable<Integer> {
     public Integer call() {
         CvectorConfig cfg = runtime.loadConfig();
         CvectorConfig.ProjectEntry active = runtime.requireActiveProject(cfg);
-        String pid = active.projectId();
-
-        try (Neo4jClient client = runtime.openNeo4j(cfg)) {
-            GraphQueries q = new GraphQueries(client);
-
-            if ("rest".equals(kind) || "all".equals(kind)) {
-                section("REST endpoint flows");
-                renderFlows(q, pid,
-                        "MATCH (e:ApiEndpoint {projectId: $pid})-[:HANDLES]->(handler:Method) "
-                                + "RETURN handler.id AS id, e.httpMethod + ' ' + e.path AS entry, handler.fqName AS handler "
-                                + "ORDER BY entry LIMIT $lim");
-            }
-
-            if ("main".equals(kind) || "all".equals(kind)) {
-                section("Main-method flows");
-                renderFlows(q, pid,
-                        "MATCH (m:Method {projectId: $pid, name: 'main'}) "
-                                + "WHERE coalesce(m.isStatic, false) = true "
-                                + "RETURN m.id AS id, m.fqName AS entry, m.fqName AS handler "
-                                + "ORDER BY m.fqName LIMIT $lim");
-            }
-
-            if ("test".equals(kind) || "all".equals(kind)) {
-                section("Test-method flows");
-                renderFlows(q, pid,
-                        "MATCH (m:Method {projectId: $pid}) "
-                                + "WHERE coalesce(m.isTest, false) = true "
-                                + "RETURN m.id AS id, m.fqName AS entry, m.fqName AS handler "
-                                + "ORDER BY m.fqName LIMIT $lim");
-            }
+        try (GraphStore store = runtime.openGraphStore(cfg)) {
+            Map<String, List<Map<String, Object>>> flows =
+                    store.traceFlows(active.projectId(), kind, Math.max(1, maxDepth), limit);
+            if ("rest".equals(kind) || "all".equals(kind)) renderSection("REST endpoint flows", flows.get("rest"));
+            if ("main".equals(kind) || "all".equals(kind)) renderSection("Main-method flows", flows.get("main"));
+            if ("test".equals(kind) || "all".equals(kind)) renderSection("Test-method flows", flows.get("test"));
         }
         return 0;
     }
 
-    private void renderFlows(GraphQueries q, String pid, String cypher) {
-        Map<String, Object> params = new LinkedHashMap<>();
-        params.put("pid", pid);
-        params.put("lim", limit);
-        List<Map<String, Object>> entries = q.raw(cypher, params);
-        if (entries.isEmpty()) {
+    private void renderSection(String title, List<Map<String, Object>> entries) {
+        section(title);
+        if (entries == null || entries.isEmpty()) {
             System.out.println("  (none)");
             return;
         }
         for (Map<String, Object> e : entries) {
-            String entryLabel = String.valueOf(e.get("entry"));
-            String handlerFq = String.valueOf(e.get("handler"));
-            String id = String.valueOf(e.get("id"));
-
-            String depthLiteral = String.valueOf(Math.max(1, maxDepth));
-            List<Map<String, Object>> reached = q.raw(
-                    "MATCH (start {id: $id, projectId: $pid}) "
-                            + "MATCH (start)-[:CALLS*1.." + depthLiteral + "]->(callee:Method) "
-                            + "WHERE callee.projectId = $pid "
-                            + "RETURN DISTINCT callee.fqName AS fqName LIMIT 100",
-                    Map.of("id", id, "pid", pid)
-            );
-
+            String entryLabel = entryLabelOf(e);
+            String handler = e.get("handler") != null ? String.valueOf(e.get("handler")) : entryLabel;
+            Object reachesObj = e.get("reaches");
             System.out.println();
             System.out.println("entry: " + entryLabel);
-            System.out.println("  handler: " + handlerFq);
-            if (reached.isEmpty()) {
+            if (e.get("handler") != null) System.out.println("  handler: " + handler);
+            if (!(reachesObj instanceof List<?> reaches) || reaches.isEmpty()) {
                 System.out.println("  reaches: (no downstream CALLS within depth " + maxDepth + ")");
-            } else {
-                System.out.println("  reaches " + reached.size() + " methods within depth " + maxDepth + ":");
-                int shown = 0;
-                for (Map<String, Object> r : reached) {
-                    if (shown >= 8) {
-                        System.out.println("    ... (" + (reached.size() - shown) + " more)");
-                        break;
-                    }
-                    System.out.println("    - " + r.get("fqName"));
-                    shown++;
+                continue;
+            }
+            System.out.println("  reaches " + reaches.size() + " methods within depth " + maxDepth + ":");
+            int shown = 0;
+            for (Object r : reaches) {
+                if (shown >= 8) {
+                    System.out.println("    ... (" + (reaches.size() - shown) + " more)");
+                    break;
                 }
+                System.out.println("    - " + r);
+                shown++;
             }
         }
+    }
+
+    private static String entryLabelOf(Map<String, Object> e) {
+        // For REST entries we built a "{method} {path}" label; main/test rows just carry an `entry` fqName.
+        if (e.get("method") != null && e.get("path") != null) {
+            return e.get("method") + " " + e.get("path");
+        }
+        return String.valueOf(e.getOrDefault("entry", e.get("handler")));
     }
 
     private static void section(String title) {

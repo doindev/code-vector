@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(Get-NetTCPConnection *)",
+      "PowerShell(Start-Process \"http://localhost:2969/dashboard/\"; \"launched\")",
+      "PowerShell(Start-Process \"http://localhost:2969/dashboard/\"; \"opened\")"
+    ]
+  }
+}

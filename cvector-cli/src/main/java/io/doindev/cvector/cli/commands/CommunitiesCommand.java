@@ -3,17 +3,15 @@ package io.doindev.cvector.cli.commands;
 import io.doindev.cvector.cli.CvectorRuntime;
 import io.doindev.cvector.cli.output.TableRenderer;
 import io.doindev.cvector.core.config.CvectorConfig;
+import io.doindev.cvector.core.store.GraphStore;
 import io.doindev.cvector.core.util.LouvainCommunityDetector;
 import io.doindev.cvector.core.util.UnionFind;
-import io.doindev.cvector.neo4j.Neo4jClient;
-import io.doindev.cvector.neo4j.repo.GraphQueries;
 import org.springframework.stereotype.Component;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
 
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -21,7 +19,7 @@ import java.util.Map;
 import java.util.concurrent.Callable;
 
 @Component
-@Command(name = "communities", description = "Detect functional clusters in the call graph.")
+@Command(name = "communities", description = "Detect functional clusters in the call graph.", mixinStandardHelpOptions = true)
 public class CommunitiesCommand implements Callable<Integer> {
 
     @Option(names = "--algorithm",
@@ -45,63 +43,34 @@ public class CommunitiesCommand implements Callable<Integer> {
         CvectorConfig cfg = runtime.loadConfig();
         CvectorConfig.ProjectEntry active = runtime.requireActiveProject(cfg);
 
-        try (Neo4jClient client = runtime.openNeo4j(cfg)) {
-            GraphQueries q = new GraphQueries(client);
-            List<Map<String, Object>> methods = fetchMethods(q, active.projectId());
-            if (methods.isEmpty()) {
+        try (GraphStore store = runtime.openGraphStore(cfg)) {
+            GraphStore.MethodCallGraph g = store.methodCallGraph(active.projectId());
+            if (g.fqNames().length == 0) {
                 System.out.println("(no Method nodes in graph; run `cvector scan` first)");
                 return 0;
             }
-            List<Map<String, Object>> edges = fetchCallsEdges(q, active.projectId());
-            ClusterModel model = clusterMethods(methods, edges, algorithm.toLowerCase(Locale.ROOT));
+            ClusterModel model = clusterMethods(g, algorithm.toLowerCase(Locale.ROOT));
             renderClusters(model);
         }
         return 0;
     }
 
-    private static List<Map<String, Object>> fetchMethods(GraphQueries q, String pid) {
-        return q.raw(
-                "MATCH (m:Method {projectId: $pid}) RETURN m.id AS id, m.fqName AS fqName",
-                Map.of("pid", pid));
-    }
-
-    private static List<Map<String, Object>> fetchCallsEdges(GraphQueries q, String pid) {
-        return q.raw(
-                "MATCH (a:Method {projectId: $pid})-[:CALLS]->(b:Method {projectId: $pid}) "
-                        + "RETURN a.id AS fromId, b.id AS toId",
-                Map.of("pid", pid));
-    }
-
-    private static ClusterModel clusterMethods(List<Map<String, Object>> methods, List<Map<String, Object>> edges, String algorithm) {
-        Map<String, Integer> indexOf = new HashMap<>();
-        String[] fqNames = new String[methods.size()];
-        for (int i = 0; i < methods.size(); i++) {
-            String id = (String) methods.get(i).get("id");
-            indexOf.put(id, i);
-            fqNames[i] = (String) methods.get(i).get("fqName");
-        }
-        List<int[]> edgePairs = new ArrayList<>(edges.size());
-        for (Map<String, Object> e : edges) {
-            Integer fi = indexOf.get(e.get("fromId"));
-            Integer ti = indexOf.get(e.get("toId"));
-            if (fi != null && ti != null) edgePairs.add(new int[]{fi, ti});
-        }
-
+    private static ClusterModel clusterMethods(GraphStore.MethodCallGraph g, String algorithm) {
         int[] community;
         double modularity;
         switch (algorithm) {
             case "leiden" -> {
-                LouvainCommunityDetector.Result r = LouvainCommunityDetector.detectLeiden(methods.size(), edgePairs);
+                LouvainCommunityDetector.Result r = LouvainCommunityDetector.detectLeiden(g.fqNames().length, g.edges());
                 community = r.community();
                 modularity = r.modularity();
             }
             case "louvain" -> {
-                LouvainCommunityDetector.Result r = LouvainCommunityDetector.detect(methods.size(), edgePairs);
+                LouvainCommunityDetector.Result r = LouvainCommunityDetector.detect(g.fqNames().length, g.edges());
                 community = r.community();
                 modularity = r.modularity();
             }
             case "connected-components", "components", "union-find" -> {
-                community = unionFindCommunities(methods.size(), edgePairs);
+                community = unionFindCommunities(g.fqNames().length, g.edges());
                 modularity = Double.NaN;
             }
             default -> throw new IllegalArgumentException(
@@ -113,10 +82,10 @@ public class CommunitiesCommand implements Callable<Integer> {
             groups.computeIfAbsent(community[i], k -> new ArrayList<>()).add(i);
         }
         int[] internalEdges = new int[Math.max(1, maxId(community) + 1)];
-        for (int[] e : edgePairs) {
+        for (int[] e : g.edges()) {
             if (community[e[0]] == community[e[1]]) internalEdges[community[e[0]]]++;
         }
-        return new ClusterModel(fqNames, groups, internalEdges, methods.size(), edgePairs.size(), modularity, algorithm);
+        return new ClusterModel(g.fqNames(), groups, internalEdges, g.fqNames().length, g.edges().size(), modularity, algorithm);
     }
 
     private static int[] unionFindCommunities(int n, List<int[]> edges) {

@@ -8,7 +8,7 @@ import picocli.CommandLine.Command;
 import java.util.concurrent.Callable;
 
 @Component
-@Command(name = "info", description = "Show the active project's configuration.")
+@Command(name = "info", description = "Show the active project's configuration.", mixinStandardHelpOptions = true)
 public class ProjectInfoCommand implements Callable<Integer> {
 
     private final CvectorRuntime runtime;

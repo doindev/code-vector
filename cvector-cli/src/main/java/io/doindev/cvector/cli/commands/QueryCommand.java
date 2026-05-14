@@ -3,8 +3,7 @@ package io.doindev.cvector.cli.commands;
 import io.doindev.cvector.cli.CvectorRuntime;
 import io.doindev.cvector.cli.output.TableRenderer;
 import io.doindev.cvector.core.config.CvectorConfig;
-import io.doindev.cvector.neo4j.Neo4jClient;
-import io.doindev.cvector.neo4j.repo.GraphQueries;
+import io.doindev.cvector.core.store.GraphStore;
 import org.springframework.stereotype.Component;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
@@ -16,7 +15,7 @@ import java.util.Map;
 import java.util.concurrent.Callable;
 
 @Component
-@Command(name = "query", description = "Execute a raw Cypher query against the active project.")
+@Command(name = "query", description = "Execute a raw Cypher query against the active project.", mixinStandardHelpOptions = true)
 public class QueryCommand implements Callable<Integer> {
 
     @Parameters(index = "0", description = "Cypher query (use $pid for the active project id).")
@@ -35,11 +34,10 @@ public class QueryCommand implements Callable<Integer> {
     public Integer call() {
         CvectorConfig cfg = runtime.loadConfig();
         CvectorConfig.ProjectEntry active = runtime.requireActiveProject(cfg);
-        try (Neo4jClient client = runtime.openNeo4j(cfg)) {
-            GraphQueries q = new GraphQueries(client);
+        try (GraphStore store = runtime.openGraphStore(cfg)) {
             Map<String, Object> params = new HashMap<>();
             params.put("pid", active.projectId());
-            GraphQueries.QueryResult result = q.rawAutoTyped(cypher, params);
+            GraphStore.RawResult result = store.rawCypher(cypher, params);
             if (json) {
                 System.out.println(toJsonArray(result.rows()));
             } else if (result.isWrite()) {

@@ -30,6 +30,7 @@ import io.doindev.cvector.parser.style.StylesheetParserAdapter;
 import io.doindev.cvector.parser.terraform.TerraformParserAdapter;
 import io.doindev.cvector.parser.ts.TypeScriptParserAdapter;
 import io.doindev.cvector.parser.tsql.TSqlParserAdapter;
+import io.doindev.cvector.parser.vue.VueSfcParserAdapter;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
@@ -47,15 +48,22 @@ public class CliConfiguration {
     @Bean public Parser yamlParserAdapter() { return new YamlParserAdapter(); }
     @Bean public Parser jsonParserAdapter() { return new JsonParserAdapter(); }
     @Bean public Parser envParserAdapter() { return new EnvParserAdapter(); }
-    @Bean public Parser typeScriptParserAdapter() { return new TypeScriptParserAdapter(); }
-    @Bean public Parser stylesheetParserAdapter() { return new StylesheetParserAdapter(); }
+    @Bean public TypeScriptParserAdapter typeScriptParserAdapter() { return new TypeScriptParserAdapter(); }
+    @Bean public StylesheetParserAdapter stylesheetParserAdapter() { return new StylesheetParserAdapter(); }
+    @Bean public Parser vueSfcParserAdapter(TypeScriptParserAdapter ts, StylesheetParserAdapter css) {
+        return new VueSfcParserAdapter(ts, css);
+    }
     @Bean public Parser pythonParserAdapter() { return new PythonParserAdapter(); }
     @Bean public Parser terraformParserAdapter() { return new TerraformParserAdapter(); }
     @Bean public Parser dockerfileParserAdapter() { return new DockerfileParserAdapter(); }
     @Bean public Parser cSharpParserAdapter() { return new CSharpParserAdapter(); }
     @Bean public Parser rustParserAdapter() { return new RustParserAdapter(); }
     @Bean public Parser goParserAdapter() { return new GoParserAdapter(); }
-    @Bean public Parser javaScriptParserAdapter() { return new JavaScriptParserAdapter(); }
+    // JavaScriptParserAdapter is intentionally NOT registered: the TypeScript parser claims
+    // the same extension set (.js/.jsx/.mjs/.cjs) and TS is a strict superset of JS, so every
+    // .js file would be parsed twice under the multi-dispatch model. The dedicated JS adapter
+    // remains in the codebase as an alternative the user can swap in via CliConfiguration if
+    // they want a JS-only build without the TS grammar's overhead.
     @Bean public Parser kotlinParserAdapter() { return new KotlinParserAdapter(); }
     @Bean public Parser cParserAdapter() { return new CParserAdapter(); }
     @Bean public Parser cppParserAdapter() { return new CppParserAdapter(); }

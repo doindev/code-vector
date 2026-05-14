@@ -16,7 +16,7 @@ import java.util.UUID;
 import java.util.concurrent.Callable;
 
 @Component
-@Command(name = "init", description = "Initialize cvector in the current directory.")
+@Command(name = "init", description = "Initialize cvector in the current directory.", mixinStandardHelpOptions = true)
 public class InitCommand implements Callable<Integer> {
 
     private static final String COMPOSE_TEMPLATE = """
@@ -61,7 +61,17 @@ public class InitCommand implements Callable<Integer> {
         String id = UUID.randomUUID().toString();
         Map<String, CvectorConfig.ProjectEntry> projects = new LinkedHashMap<>();
         projects.put(name, new CvectorConfig.ProjectEntry(id, name, cwd.toString()));
-        CvectorConfig cfg = new CvectorConfig(name, projects, CvectorConfig.Neo4jConfig.defaults());
+        // Fresh project defaults to embedded Kuzu — no Docker / Neo4j required to get going.
+        // The neo4j section is still emitted with defaults so a user can flip backends with
+        // `cvector db --remote` without having to edit the file by hand.
+        CvectorConfig cfg = new CvectorConfig(
+                name,
+                projects,
+                CvectorConfig.Neo4jConfig.defaults(),
+                CvectorConfig.BACKEND_EMBEDDED,
+                CvectorConfig.RestConfig.defaults(),
+                CvectorConfig.McpConfig.defaults(),
+                CvectorConfig.DockerConfig.defaults());
         svc.save(cwd, cfg);
 
         Path compose = svc.configDir(cwd).resolve("docker-compose.yml");

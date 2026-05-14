@@ -2,10 +2,9 @@ package io.doindev.cvector.mcp;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.doindev.cvector.core.store.GraphStore;
 import io.doindev.cvector.core.util.LouvainCommunityDetector;
 import io.doindev.cvector.core.util.UnionFind;
-import io.doindev.cvector.neo4j.Neo4jClient;
-import io.doindev.cvector.neo4j.repo.GraphQueries;
 import io.doindev.cvector.rules.RulesConfig;
 import io.doindev.cvector.rules.RulesConfigLoader;
 import io.doindev.cvector.rules.RulesEngine;
@@ -27,23 +26,21 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
+/**
+ * MCP tools exposed to AI agents. All read paths route through {@link GraphStore}, so the tool
+ * surface works against either Neo4j or the embedded KuzuDB store with no backend branching.
+ */
 public class CvectorTools {
 
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final String OSV_URL = "https://api.osv.dev/v1/query";
 
-    private final GraphQueries q;
-    private final Neo4jClient client;
+    private final GraphStore store;
     private final McpServerConfig.McpActiveProject project;
 
-    public CvectorTools(GraphQueries graphQueries, McpServerConfig.McpActiveProject activeProject) {
-        this(graphQueries, null, activeProject);
-    }
-
-    public CvectorTools(GraphQueries graphQueries, Neo4jClient client, McpServerConfig.McpActiveProject activeProject) {
-        this.q = graphQueries;
-        this.client = client;
-        this.project = activeProject;
+    public CvectorTools(GraphStore store, McpServerConfig.McpActiveProject project) {
+        this.store = store;
+        this.project = project;
     }
 
     @Tool(name = "cv_stats", description = "Graph statistics for the active cvector project: node counts by label and edge counts by type.")
@@ -51,27 +48,21 @@ public class CvectorTools {
         return Map.of(
                 "project", project.name(),
                 "projectId", project.projectId(),
-                "nodes", q.nodeCounts(project.projectId()),
-                "edges", q.edgeCounts(project.projectId())
+                "nodes", store.nodeCounts(project.projectId()),
+                "edges", store.edgeCounts(project.projectId())
         );
     }
 
-    @Tool(name = "cv_health", description = "Health check: Neo4j connectivity, graph size, last scan commit, and core counts.")
+    @Tool(name = "cv_health", description = "Health check: backend connectivity, graph size, last scan commit, and core counts.")
     public Map<String, Object> health() {
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("project", project.name());
         out.put("projectId", project.projectId());
-        boolean ok = client != null && client.ping();
-        out.put("neo4j", Map.of("ok", ok, "uri", client == null ? null : client.uri()));
-        Map<String, Long> nodes = q.nodeCounts(project.projectId());
-        Map<String, Long> edges = q.edgeCounts(project.projectId());
-        out.put("nodes", nodes);
-        out.put("edges", edges);
-        var lastCommit = q.raw(
-                "MATCH (p:Project {projectId: $pid}) RETURN p.lastScanCommit AS sha, p.rootPath AS root",
-                Map.of("pid", project.projectId())
-        );
-        out.put("lastScan", lastCommit.isEmpty() ? Map.of() : lastCommit.get(0));
+        boolean ok = store.ping();
+        out.put("backend", Map.of("type", store.backend(), "ok", ok, "uri", store.displayUri()));
+        out.put("nodes", store.nodeCounts(project.projectId()));
+        out.put("edges", store.edgeCounts(project.projectId()));
+        out.put("lastScan", store.projectMeta(project.projectId()));
         return out;
     }
 
@@ -93,17 +84,7 @@ public class CvectorTools {
             @ToolParam(description = "Max results (default 25).", required = false) Integer limit,
             @ToolParam(description = "Restrict to a single node label (e.g. 'Method').", required = false) String label) {
         int lim = limit == null ? 25 : limit;
-        String regex = "(?i).*" + query.replace("*", ".*") + ".*";
-        String labelFilter = label != null && !label.isBlank() ? "AND any(l IN labels(n) WHERE l = $label) " : "";
-        String cypher = "MATCH (n) WHERE n.projectId = $pid "
-                + "AND (n.fqName =~ $regex OR n.name =~ $regex) " + labelFilter
-                + "RETURN labels(n)[0] AS label, n.fqName AS fqName, n.name AS name, n.id AS id LIMIT $lim";
-        List<Map<String, Object>> rows = q.raw(cypher, Map.of(
-                "pid", project.projectId(),
-                "regex", regex,
-                "label", label == null ? "" : label,
-                "lim", lim
-        ));
+        List<Map<String, Object>> rows = store.searchByName(project.projectId(), query, label, lim);
         return Map.of("query", query, "count", rows.size(), "results", rows);
     }
 
@@ -111,7 +92,7 @@ public class CvectorTools {
             description = "Full context for a symbol: type, file:line, callers (incoming CALLS), callees (outgoing CALLS).")
     public Map<String, Object> explain(@ToolParam(description = "Symbol name (fully-qualified or last segment).") String symbol) {
         Map<String, Object> out = new LinkedHashMap<>();
-        List<Map<String, Object>> matches = q.findSymbol(project.projectId(), symbol);
+        List<Map<String, Object>> matches = store.findSymbol(project.projectId(), symbol);
         out.put("query", symbol);
         if (matches.isEmpty()) {
             out.put("found", false);
@@ -122,11 +103,11 @@ public class CvectorTools {
         out.put("found", true);
         out.put("symbol", hit);
         if ("Method".equals(hit.get("label"))) {
-            out.put("callers", q.callers(project.projectId(), id));
-            out.put("callees", q.callees(project.projectId(), id));
+            out.put("callers", store.callers(project.projectId(), id));
+            out.put("callees", store.callees(project.projectId(), id));
         }
         if (hit.get("fileId") != null) {
-            out.put("file", q.fileOf(project.projectId(), (String) hit.get("fileId")));
+            out.put("file", store.fileOf(project.projectId(), (String) hit.get("fileId")));
         }
         return out;
     }
@@ -138,7 +119,7 @@ public class CvectorTools {
             @ToolParam(description = "Max traversal depth (default 3).", required = false) Integer depth) {
         int d = depth == null ? 3 : depth;
         Map<String, Object> out = new LinkedHashMap<>();
-        List<Map<String, Object>> matches = q.findSymbol(project.projectId(), symbol);
+        List<Map<String, Object>> matches = store.findSymbol(project.projectId(), symbol);
         if (matches.isEmpty()) {
             out.put("found", false);
             out.put("query", symbol);
@@ -148,32 +129,7 @@ public class CvectorTools {
         out.put("found", true);
         out.put("symbol", hit);
         out.put("depth", d);
-        out.put("impacted", q.impactDownstream(project.projectId(), (String) hit.get("id"), d));
-        return out;
-    }
-
-    @Tool(name = "cv_test_impact",
-            description = "Find test methods (@Test-annotated) that transitively reach a given symbol.")
-    public Map<String, Object> testImpact(
-            @ToolParam(description = "Symbol name.") String symbol,
-            @ToolParam(description = "Max traversal depth (default 5).", required = false) Integer depth) {
-        int d = depth == null ? 5 : depth;
-        Map<String, Object> out = new LinkedHashMap<>();
-        List<Map<String, Object>> matches = q.findSymbol(project.projectId(), symbol);
-        if (matches.isEmpty()) {
-            out.put("found", false);
-            out.put("query", symbol);
-            return out;
-        }
-        Map<String, Object> hit = matches.get(0);
-        String id = (String) hit.get("id");
-        String cypher = "MATCH (t:Method {projectId: $pid, isTest: true}) "
-                + "MATCH (sym {id: $id, projectId: $pid}) "
-                + "MATCH p = shortestPath((t)-[:CALLS|REFERENCES*1.." + Math.max(1, d) + "]->(sym)) "
-                + "RETURN DISTINCT t.fqName AS test, t.fileId AS fileId, length(p) AS depth ORDER BY depth ASC LIMIT 200";
-        out.put("found", true);
-        out.put("symbol", hit);
-        out.put("tests", q.raw(cypher, Map.of("pid", project.projectId(), "id", id)));
+        out.put("impacted", store.impactDownstream(project.projectId(), (String) hit.get("id"), d));
         return out;
     }
 
@@ -181,7 +137,7 @@ public class CvectorTools {
             description = "Everything a class or method contains and references: methods, called methods, fields, importing files.")
     public Map<String, Object> context(@ToolParam(description = "Symbol name (Class or Method).") String symbol) {
         Map<String, Object> out = new LinkedHashMap<>();
-        List<Map<String, Object>> matches = q.findSymbol(project.projectId(), symbol);
+        List<Map<String, Object>> matches = store.findSymbol(project.projectId(), symbol);
         if (matches.isEmpty()) {
             out.put("found", false);
             out.put("query", symbol);
@@ -191,13 +147,9 @@ public class CvectorTools {
         String id = (String) hit.get("id");
         out.put("found", true);
         out.put("symbol", hit);
-        out.put("contains", q.raw(
-                "MATCH (n {id: $id, projectId: $pid})-[:CONTAINS]->(child) "
-                        + "RETURN labels(child)[0] AS label, child.fqName AS fqName LIMIT 200",
-                Map.of("id", id, "pid", project.projectId())
-        ));
-        out.put("callers", q.callers(project.projectId(), id));
-        out.put("callees", q.callees(project.projectId(), id));
+        out.put("contains", store.contains(project.projectId(), id, 200));
+        out.put("callers", store.callers(project.projectId(), id));
+        out.put("callees", store.callees(project.projectId(), id));
         return out;
     }
 
@@ -205,7 +157,7 @@ public class CvectorTools {
             description = "Graph-aware rename impact: all callers, references, importing files, and the target's definition for a symbol about to be renamed.")
     public Map<String, Object> rename(@ToolParam(description = "Symbol to rename (fully-qualified or last segment).") String symbol) {
         Map<String, Object> out = new LinkedHashMap<>();
-        List<Map<String, Object>> matches = q.findSymbol(project.projectId(), symbol);
+        List<Map<String, Object>> matches = store.findSymbol(project.projectId(), symbol);
         if (matches.isEmpty()) {
             out.put("found", false);
             out.put("query", symbol);
@@ -215,17 +167,9 @@ public class CvectorTools {
         String id = (String) hit.get("id");
         out.put("found", true);
         out.put("symbol", hit);
-        out.put("callers", q.callers(project.projectId(), id));
-        out.put("references", q.raw(
-                "MATCH (src)-[:REFERENCES]->(target {id: $id, projectId: $pid}) "
-                        + "RETURN labels(src)[0] AS label, src.fqName AS fqName, src.fileId AS fileId, src.startLine AS line LIMIT 500",
-                Map.of("id", id, "pid", project.projectId())
-        ));
-        out.put("importingFiles", q.raw(
-                "MATCH (f:File)-[:IMPORTS]->(target {id: $id, projectId: $pid}) "
-                        + "RETURN f.path AS path LIMIT 200",
-                Map.of("id", id, "pid", project.projectId())
-        ));
+        out.put("callers", store.callers(project.projectId(), id));
+        out.put("references", store.referencingNodes(project.projectId(), id, 500));
+        out.put("importingFiles", store.importingFiles(project.projectId(), id, 200));
         return out;
     }
 
@@ -236,14 +180,7 @@ public class CvectorTools {
             @ToolParam(description = "Max rows (default 50).", required = false) Integer limit) {
         String window = since == null || since.isBlank() ? "24h" : since;
         int lim = limit == null ? 50 : limit;
-        Duration d = parseDuration(window);
-        String cutoff = java.time.ZonedDateTime.now(java.time.ZoneOffset.UTC).minus(d).toString();
-        var rows = q.raw(
-                "MATCH (n) WHERE n.projectId = $pid AND n.lastIngestedAt > datetime($cutoff) "
-                        + "RETURN labels(n)[0] AS label, n.fqName AS fqName, toString(n.lastIngestedAt) AS lastIngestedAt "
-                        + "ORDER BY n.lastIngestedAt DESC LIMIT $lim",
-                Map.of("pid", project.projectId(), "cutoff", cutoff, "lim", lim)
-        );
+        List<Map<String, Object>> rows = store.recentlyChanged(project.projectId(), parseDuration(window), lim);
         return Map.of("since", window, "count", rows.size(), "changes", rows);
     }
 
@@ -252,42 +189,30 @@ public class CvectorTools {
         String pid = project.projectId();
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("project", Map.of("name", project.name(), "projectId", pid, "rootPath", project.rootPath()));
-        out.put("nodes", q.nodeCounts(pid));
-        out.put("edges", q.edgeCounts(pid));
-        out.put("languages", q.raw(
-                "MATCH (f:File {projectId: $pid}) RETURN f.language AS language, count(*) AS files ORDER BY files DESC",
-                Map.of("pid", pid)));
-        out.put("topClasses", q.raw(
-                "MATCH (c:Class {projectId: $pid})-[:CONTAINS]->(m:Method) "
-                        + "RETURN c.fqName AS fqName, count(m) AS methods ORDER BY methods DESC LIMIT 10",
-                Map.of("pid", pid)));
-        out.put("restEndpoints", q.raw(
-                "MATCH (e:ApiEndpoint {projectId: $pid}) RETURN e.httpMethod AS method, e.path AS path ORDER BY path",
-                Map.of("pid", pid)));
-        out.put("tables", q.raw(
-                "MATCH (t:Table {projectId: $pid}) OPTIONAL MATCH (t)-[:CONTAINS]->(c:Column) "
-                        + "RETURN t.name AS table, count(c) AS columns ORDER BY t.name",
-                Map.of("pid", pid)));
-        out.put("configKeys", q.raw(
-                "MATCH (k:ConfigKey {projectId: $pid}) RETURN k.fqName AS key, k.value AS value ORDER BY k.fqName LIMIT 50",
-                Map.of("pid", pid)));
-        out.put("envVars", q.raw(
-                "MATCH (e:EnvVar {projectId: $pid}) RETURN e.name AS name, e.value AS value ORDER BY e.name",
-                Map.of("pid", pid)));
-        out.put("dependencies", q.raw(
-                "MATCH (d:MavenDependency {projectId: $pid}) "
-                        + "RETURN d.groupId AS groupId, d.artifactId AS artifactId, d.version AS version, d.scope AS scope "
-                        + "ORDER BY groupId, artifactId",
-                Map.of("pid", pid)));
-        out.put("callGraphHubs", q.raw(
-                "MATCH (m:Method {projectId: $pid}) "
-                        + "OPTIONAL MATCH (m)-[out:CALLS]->() "
-                        + "OPTIONAL MATCH ()-[in:CALLS]->(m) "
-                        + "WITH m, count(DISTINCT out) AS outDeg, count(DISTINCT in) AS inDeg "
-                        + "WHERE outDeg + inDeg > 0 "
-                        + "RETURN m.fqName AS fqName, outDeg, inDeg, outDeg + inDeg AS total "
-                        + "ORDER BY total DESC LIMIT 10",
-                Map.of("pid", pid)));
+        out.put("nodes", store.nodeCounts(pid));
+        out.put("edges", store.edgeCounts(pid));
+        out.put("dependencies", store.mavenDependencies(pid));
+        out.putAll(store.onboardSummary(pid));
+        return out;
+    }
+
+    @Tool(name = "cv_test_impact",
+            description = "Find test methods (@Test-annotated) that transitively reach a given symbol.")
+    public Map<String, Object> testImpact(
+            @ToolParam(description = "Symbol name.") String symbol,
+            @ToolParam(description = "Max traversal depth (default 5).", required = false) Integer depth) {
+        int d = depth == null ? 5 : depth;
+        Map<String, Object> out = new LinkedHashMap<>();
+        List<Map<String, Object>> matches = store.findSymbol(project.projectId(), symbol);
+        if (matches.isEmpty()) {
+            out.put("found", false);
+            out.put("query", symbol);
+            return out;
+        }
+        Map<String, Object> hit = matches.get(0);
+        out.put("found", true);
+        out.put("symbol", hit);
+        out.put("tests", store.testReach(project.projectId(), (String) hit.get("id"), d));
         return out;
     }
 
@@ -295,7 +220,7 @@ public class CvectorTools {
     public Map<String, Object> rules() {
         Path rulesYml = Paths.get(project.rootPath(), ".cvector", "rules.yml");
         RulesConfig cfg = RulesConfigLoader.loadOrDefault(rulesYml);
-        RulesEngine.Report report = new RulesEngine(project.projectId(), q, cfg).run();
+        RulesEngine.Report report = new RulesEngine(project.projectId(), store, cfg).run();
 
         List<Map<String, Object>> runs = new ArrayList<>();
         for (RulesEngine.RuleRun r : report.runs()) {
@@ -333,10 +258,9 @@ public class CvectorTools {
         String algo = (algorithm == null || algorithm.isBlank()) ? "leiden" : algorithm.toLowerCase();
         int min = minSize == null ? 3 : minSize;
         int lim = limit == null ? 10 : limit;
-        String pid = project.projectId();
 
-        MethodGraph g = loadMethodGraph(pid);
-        if (g.fqNames.length == 0) return Map.of("communities", List.of(), "totalMethods", 0);
+        GraphStore.MethodCallGraph g = store.methodCallGraph(project.projectId());
+        if (g.fqNames().length == 0) return Map.of("communities", List.of(), "totalMethods", 0);
 
         DetectionResult det = detectCommunities(algo, g);
         if (det == null) {
@@ -346,61 +270,37 @@ public class CvectorTools {
         }
 
         Map<Integer, List<Integer>> groups = groupByCommunity(det.community);
-        List<Map<String, Object>> result = topCommunities(groups, g.fqNames, min, lim);
+        List<Map<String, Object>> result = topCommunities(groups, g.fqNames(), min, lim);
 
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("algorithm", algo);
-        out.put("totalMethods", g.fqNames.length);
-        out.put("totalEdges", g.edgeCount);
+        out.put("totalMethods", g.fqNames().length);
+        out.put("totalEdges", g.edges().size());
         out.put("communitiesFound", groups.size());
         if (!Double.isNaN(det.modularity)) out.put("modularity", det.modularity);
         out.put("communities", result);
         return out;
     }
 
-    private record MethodGraph(String[] fqNames, List<int[]> edges, int edgeCount) {}
     private record DetectionResult(int[] community, double modularity) {}
 
-    private MethodGraph loadMethodGraph(String pid) {
-        List<Map<String, Object>> methods = q.raw(
-                "MATCH (m:Method {projectId: $pid}) RETURN m.id AS id, m.fqName AS fqName",
-                Map.of("pid", pid));
-        Map<String, Integer> indexOf = new HashMap<>(methods.size() * 2);
-        String[] fqNames = new String[methods.size()];
-        for (int i = 0; i < methods.size(); i++) {
-            String id = (String) methods.get(i).get("id");
-            indexOf.put(id, i);
-            fqNames[i] = (String) methods.get(i).get("fqName");
-        }
-        List<Map<String, Object>> edges = q.raw(
-                "MATCH (a:Method {projectId: $pid})-[:CALLS]->(b:Method {projectId: $pid}) RETURN a.id AS fromId, b.id AS toId",
-                Map.of("pid", pid));
-        List<int[]> edgePairs = new ArrayList<>(edges.size());
-        for (Map<String, Object> e : edges) {
-            Integer fi = indexOf.get(e.get("fromId"));
-            Integer ti = indexOf.get(e.get("toId"));
-            if (fi != null && ti != null) edgePairs.add(new int[]{fi, ti});
-        }
-        return new MethodGraph(fqNames, edgePairs, edges.size());
-    }
-
-    private DetectionResult detectCommunities(String algo, MethodGraph g) {
+    private DetectionResult detectCommunities(String algo, GraphStore.MethodCallGraph g) {
         switch (algo) {
             case "leiden" -> {
-                LouvainCommunityDetector.Result r = LouvainCommunityDetector.detectLeiden(g.fqNames.length, g.edges);
+                LouvainCommunityDetector.Result r = LouvainCommunityDetector.detectLeiden(g.fqNames().length, g.edges());
                 return new DetectionResult(r.community(), r.modularity());
             }
             case "louvain" -> {
-                LouvainCommunityDetector.Result r = LouvainCommunityDetector.detect(g.fqNames.length, g.edges);
+                LouvainCommunityDetector.Result r = LouvainCommunityDetector.detect(g.fqNames().length, g.edges());
                 return new DetectionResult(r.community(), r.modularity());
             }
             case "connected-components", "components", "union-find" -> {
-                UnionFind uf = new UnionFind(g.fqNames.length);
-                for (int[] p : g.edges) uf.union(p[0], p[1]);
-                int[] community = new int[g.fqNames.length];
+                UnionFind uf = new UnionFind(g.fqNames().length);
+                for (int[] p : g.edges()) uf.union(p[0], p[1]);
+                int[] community = new int[g.fqNames().length];
                 Map<Integer, Integer> remap = new LinkedHashMap<>();
                 int next = 0;
-                for (int i = 0; i < g.fqNames.length; i++) {
+                for (int i = 0; i < g.fqNames().length; i++) {
                     int root = uf.find(i);
                     Integer mapped = remap.get(root);
                     if (mapped == null) { mapped = next++; remap.put(root, mapped); }
@@ -442,66 +342,141 @@ public class CvectorTools {
             @ToolParam(description = "Entry-point kind: rest, main, test, or all (default all).", required = false) String kind,
             @ToolParam(description = "Max BFS depth from each entry (default 3).", required = false) Integer maxDepth,
             @ToolParam(description = "Max entry points to report (default 25).", required = false) Integer limit) {
-        String k = kind == null || kind.isBlank() ? "all" : kind;
         int depth = maxDepth == null ? 3 : maxDepth;
         int lim = limit == null ? 25 : limit;
-        String pid = project.projectId();
-
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("depth", depth);
-
-        if ("rest".equals(k) || "all".equals(k)) {
-            out.put("rest", q.raw(
-                    "MATCH (e:ApiEndpoint {projectId: $pid})-[:HANDLES]->(handler:Method) "
-                            + "OPTIONAL MATCH (handler)-[:CALLS*1.." + Math.max(1, depth) + "]->(c:Method {projectId: $pid}) "
-                            + "RETURN e.httpMethod AS method, e.path AS path, handler.fqName AS handler, "
-                            + "collect(DISTINCT c.fqName)[0..50] AS reaches LIMIT $lim",
-                    Map.of("pid", pid, "lim", lim)));
-        }
-        if ("main".equals(k) || "all".equals(k)) {
-            out.put("main", q.raw(
-                    "MATCH (m:Method {projectId: $pid, name: 'main'}) WHERE coalesce(m.isStatic, false) = true "
-                            + "OPTIONAL MATCH (m)-[:CALLS*1.." + Math.max(1, depth) + "]->(c:Method {projectId: $pid}) "
-                            + "RETURN m.fqName AS entry, collect(DISTINCT c.fqName)[0..50] AS reaches LIMIT $lim",
-                    Map.of("pid", pid, "lim", lim)));
-        }
-        if ("test".equals(k) || "all".equals(k)) {
-            out.put("test", q.raw(
-                    "MATCH (m:Method {projectId: $pid}) WHERE coalesce(m.isTest, false) = true "
-                            + "OPTIONAL MATCH (m)-[:CALLS*1.." + Math.max(1, depth) + "]->(c:Method {projectId: $pid}) "
-                            + "RETURN m.fqName AS entry, collect(DISTINCT c.fqName)[0..50] AS reaches LIMIT $lim",
-                    Map.of("pid", pid, "lim", lim)));
-        }
+        out.putAll(store.traceFlows(project.projectId(), kind, depth, lim));
         return out;
     }
 
     @Tool(name = "cv_service_links",
             description = "Cross-service dependencies: outgoing HTTP clients, message-broker producers/consumers, exposed REST endpoints, and database tables touched.")
     public Map<String, Object> serviceLinks() {
+        return new LinkedHashMap<>(store.serviceLinks(project.projectId()));
+    }
+
+    @Tool(name = "cv_trace",
+            description = "Shortest dependency chain between two symbols over CALLS edges (names only). Returns a flat fqName chain ordered from source to target.")
+    public Map<String, Object> trace(
+            @ToolParam(description = "Source symbol (fully-qualified or last segment).") String from,
+            @ToolParam(description = "Target symbol (fully-qualified or last segment).") String to,
+            @ToolParam(description = "Max BFS depth (default 6, hard cap 12).", required = false) Integer depth) {
+        return tracePath(from, to, depth, /*detailed=*/ false);
+    }
+
+    @Tool(name = "cv_path",
+            description = "Detailed shortest path between two symbols: each hop's node label, fqName, and the edge type leading to the next node.")
+    public Map<String, Object> path(
+            @ToolParam(description = "Source symbol.") String from,
+            @ToolParam(description = "Target symbol.") String to,
+            @ToolParam(description = "Max BFS depth (default 6, hard cap 12).", required = false) Integer depth) {
+        return tracePath(from, to, depth, /*detailed=*/ true);
+    }
+
+    private Map<String, Object> tracePath(String from, String to, Integer depth, boolean detailed) {
+        int d = depth == null ? 6 : Math.max(1, Math.min(depth, 12));
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("from", from);
+        out.put("to", to);
+        out.put("depth", d);
+        List<Map<String, Object>> sources = store.findSymbol(project.projectId(), from);
+        List<Map<String, Object>> targets = store.findSymbol(project.projectId(), to);
+        if (sources.isEmpty() || targets.isEmpty()) {
+            out.put("found", false);
+            out.put("reason", sources.isEmpty() ? "source-not-found" : "target-not-found");
+            return out;
+        }
+        Map<String, Object> source = sources.get(0);
+        Map<String, Object> target = targets.get(0);
+        out.put("source", source);
+        out.put("target", target);
+        Map<String, Object> p = store.shortestPath(project.projectId(),
+                (String) source.get("id"), (String) target.get("id"), d);
+        boolean found = Boolean.TRUE.equals(p.get("found"));
+        out.put("found", found);
+        if (!found) {
+            out.put("reason", "no-path");
+            return out;
+        }
+        out.put("pathDepth", p.get("depth"));
+        if (detailed) {
+            out.put("nodes", p.get("nodes"));
+            out.put("edges", p.get("edges"));
+        } else {
+            @SuppressWarnings("unchecked")
+            List<Map<String, Object>> nodes = (List<Map<String, Object>>) p.get("nodes");
+            List<Object> chain = new ArrayList<>(nodes.size());
+            for (Map<String, Object> n : nodes) chain.add(n.getOrDefault("fqName", n.getOrDefault("name", "")));
+            out.put("chain", chain);
+        }
+        return out;
+    }
+
+    @Tool(name = "cv_db_impact",
+            description = "Database blast radius: methods that read from or write to a given table (optionally narrowed to a column).")
+    public Map<String, Object> dbImpact(
+            @ToolParam(description = "Table name.") String table,
+            @ToolParam(description = "Optional column name to narrow the result.", required = false) String column) {
+        Map<String, List<Map<String, Object>>> impact = store.dbImpact(project.projectId(), table, column);
+        List<Map<String, Object>> readers = impact.getOrDefault("readers", List.of());
+        List<Map<String, Object>> writers = impact.getOrDefault("writers", List.of());
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("table", table);
+        out.put("column", column);
+        out.put("readerCount", readers.size());
+        out.put("writerCount", writers.size());
+        out.put("readers", readers);
+        out.put("writers", writers);
+        return out;
+    }
+
+    @Tool(name = "cv_guard",
+            description = "Quality gate snapshot: per-rule pass/fail and the worst-offender breakdown (god files, dead code, etc).")
+    public Map<String, Object> guard() {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("projectId", project.projectId());
+        out.putAll(store.guardSummary(project.projectId()));
+        return out;
+    }
+
+    @Tool(name = "cv_diff_start",
+            description = "Start an async git diff between two commits (or refs like HEAD~3 / branch names). Returns immediately with {ok, shaA, shaB}; poll cv_diff_status until running=false. The underlying command checks out two worktrees and runs full scans, so it can take minutes — only one diff may run at a time.")
+    public Map<String, Object> diffStart(
+            @ToolParam(description = "Base commit / ref (older).") String shaA,
+            @ToolParam(description = "Target commit / ref (newer).") String shaB,
+            @ToolParam(description = "Also diff CALLS edges (heavier query).", required = false) Boolean includeCalls,
+            @ToolParam(description = "Keep snapshot data after diff (default false).", required = false) Boolean keep) {
+        boolean inc = includeCalls != null && includeCalls;
+        boolean k = keep != null && keep;
+        return CvectorDiffSubprocess.start(shaA, shaB, inc, k);
+    }
+
+    @Tool(name = "cv_diff_status",
+            description = "Poll the status of the most recent cv_diff_start. Returns {running, startedAt, elapsedMillis, shaA, shaB, partialOutput, last:{output, exitCode}} when a diff is in flight or has completed.")
+    public Map<String, Object> diffStatus() {
+        return CvectorDiffSubprocess.status();
+    }
+
+    @Tool(name = "cv_wiki",
+            description = "Structured documentation snapshot: file index, top classes, REST endpoints, tables, config keys, dependencies.")
+    public Map<String, Object> wiki() {
         String pid = project.projectId();
         Map<String, Object> out = new LinkedHashMap<>();
-        out.put("outgoingHttp", q.raw(
-                "MATCH (m:Method {projectId: $pid})-[:CALLS]->(callee:Method) "
-                        + "WHERE callee.fqName =~ '(?i).*(RestTemplate|WebClient|HttpClient|FeignClient|OkHttpClient).*' "
-                        + "RETURN m.fqName AS caller, callee.fqName AS target, count(*) AS calls ORDER BY calls DESC LIMIT 50",
-                Map.of("pid", pid)));
-        out.put("outgoingMessaging", q.raw(
-                "MATCH (m:Method {projectId: $pid})-[:CALLS]->(callee:Method) "
-                        + "WHERE callee.fqName =~ '(?i).*(KafkaTemplate|RabbitTemplate|JmsTemplate|StreamBridge|SqsTemplate|SnsTemplate).*' "
-                        + "RETURN m.fqName AS caller, callee.fqName AS target, count(*) AS calls ORDER BY calls DESC LIMIT 50",
-                Map.of("pid", pid)));
-        out.put("incomingConsumers", q.raw(
-                "MATCH (m:Method {projectId: $pid}) WHERE coalesce(m.isQueueListener, false) = true "
-                        + "RETURN m.fqName AS handler LIMIT 100",
-                Map.of("pid", pid)));
-        out.put("restEndpoints", q.raw(
-                "MATCH (e:ApiEndpoint {projectId: $pid})-[:HANDLES]->(m:Method) "
-                        + "RETURN e.httpMethod AS method, e.path AS path, m.fqName AS handler ORDER BY path",
-                Map.of("pid", pid)));
-        out.put("tablesTouched", q.raw(
-                "MATCH (n)-[r:READS_TABLE|WRITES_TABLE]->(t:Table {projectId: $pid}) "
-                        + "RETURN t.name AS table, type(r) AS access, count(DISTINCT n) AS sources ORDER BY t.name",
-                Map.of("pid", pid)));
+        out.put("projectId", pid);
+        out.put("projectName", project.name());
+        Map<String, Long> nodes = store.nodeCounts(pid);
+        Map<String, Long> edges = store.edgeCounts(pid);
+        out.put("totals", Map.of(
+                "nodes", nodes.values().stream().mapToLong(Long::longValue).sum(),
+                "edges", edges.values().stream().mapToLong(Long::longValue).sum()
+        ));
+        out.put("nodes", nodes);
+        out.put("edges", edges);
+        out.put("files", store.fileInventory(pid));
+        out.putAll(store.onboardSummary(pid));
+        out.putAll(store.infrastructureSummary(pid));
+        out.put("dependencies", store.mavenDependencies(pid));
         return out;
     }
 
@@ -509,11 +484,7 @@ public class CvectorTools {
             description = "Dependency vulnerability check via OSV.dev for every MavenDependency in the graph. Network call may take several seconds.")
     public Map<String, Object> audit() {
         Map<String, Object> out = new LinkedHashMap<>();
-        List<Map<String, Object>> deps = q.raw(
-                "MATCH (d:MavenDependency {projectId: $pid}) "
-                        + "RETURN d.groupId AS groupId, d.artifactId AS artifactId, d.version AS version "
-                        + "ORDER BY groupId, artifactId",
-                Map.of("pid", project.projectId()));
+        List<Map<String, Object>> deps = store.mavenDependencies(project.projectId());
         out.put("dependenciesScanned", deps.size());
 
         if (deps.isEmpty()) {
@@ -527,7 +498,8 @@ public class CvectorTools {
         for (Map<String, Object> d : deps) {
             String groupId = String.valueOf(d.get("groupId"));
             String artifactId = String.valueOf(d.get("artifactId"));
-            String version = String.valueOf(d.get("version"));
+            Object versionObj = d.get("version");
+            String version = versionObj == null ? null : String.valueOf(versionObj);
             if (version == null || version.isBlank() || "null".equals(version) || version.contains("${")) continue;
             String coord = groupId + ":" + artifactId + ":" + version;
             try {

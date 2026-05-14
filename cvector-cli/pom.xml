@@ -25,6 +25,10 @@
         </dependency>
         <dependency>
             <groupId>io.doindev</groupId>
+            <artifactId>cvector-embedded-kuzudb-server</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.doindev</groupId>
             <artifactId>cvector-parser-java</artifactId>
         </dependency>
         <dependency>
@@ -38,6 +42,10 @@
         <dependency>
             <groupId>io.doindev</groupId>
             <artifactId>cvector-parser-ts</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.doindev</groupId>
+            <artifactId>cvector-parser-vue</artifactId>
         </dependency>
         <dependency>
             <groupId>io.doindev</groupId>

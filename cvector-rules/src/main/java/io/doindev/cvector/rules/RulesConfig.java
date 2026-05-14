@@ -76,6 +76,7 @@ public class RulesConfig {
         private String description;
         private Severity severity = Severity.WARN;
         private String cypher;
+        private String cypherKuzu;
 
         public String getName() { return name; }
         public void setName(String name) { this.name = name; }
@@ -85,5 +86,18 @@ public class RulesConfig {
         public void setSeverity(Severity severity) { this.severity = severity; }
         public String getCypher() { return cypher; }
         public void setCypher(String cypher) { this.cypher = cypher; }
+        public String getCypherKuzu() { return cypherKuzu; }
+        public void setCypherKuzu(String cypherKuzu) { this.cypherKuzu = cypherKuzu; }
+
+        /**
+         * Per-backend Cypher selection. Prefers {@code cypherKuzu} on the embedded backend, falls
+         * back to {@code cypher} (which is what every existing rules.yml carries).
+         */
+        public String getCypherFor(String backend) {
+            if ("kuzu".equals(backend) && cypherKuzu != null && !cypherKuzu.isBlank()) {
+                return cypherKuzu;
+            }
+            return cypher;
+        }
     }
 }

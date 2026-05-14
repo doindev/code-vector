@@ -9,7 +9,7 @@ import java.nio.file.Path;
 import java.util.concurrent.Callable;
 
 @Component
-@Command(name = "setup-antigravity", description = "Register cvector as an MCP server in Google Antigravity's MCP config.")
+@Command(name = "setup-antigravity", description = "Register cvector as an MCP server in Google Antigravity's MCP config.", mixinStandardHelpOptions = true)
 public class SetupAntigravityCommand implements Callable<Integer> {
 
     @Option(names = "--name", description = "Server entry name (default 'cvector').")

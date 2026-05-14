@@ -7,15 +7,16 @@ cvector is a Neo4j-backed code knowledge graph. Parsers walk a project, emit `Gr
 ## Architecture map
 
 ```
-cvector-core/          GraphEvent (NodeUpsert/EdgeUpsert/NodeRemove), NodeKey, Parser interface, CvectorConfig, CvectorRole
-cvector-neo4j/         Neo4jClient (driver wrapper), Ingestor (synchronized batcher), SchemaBootstrap, GraphQueries
-cvector-parser-*/      25 language/format parsers — most ANTLR4-based, all implement Parser
-cvector-rules/         RulesEngine + builtin rules (god-file, god-class, long-method, deep-inheritance, dead-code)
-cvector-watcher/       File watcher + cron-driven re-scan
-cvector-cli/           Picocli commands wired as Spring beans (33 commands)
-cvector-rest/          Spring Web controllers (`/api/*`)
-cvector-mcp/           MCP server: CvectorTools (16 tools), CvectorResources (8), CvectorPrompts (6)
-cvector-app/           Spring Boot main + fat-jar assembly (single entrypoint for all modes)
+cvector-core/             GraphEvent (NodeUpsert/EdgeUpsert/NodeRemove), NodeKey, Parser interface, CvectorConfig, CvectorRole
+cvector-neo4j/            Neo4jClient (driver wrapper), Ingestor (synchronized batcher), SchemaBootstrap, GraphQueries
+cvector-embedded-kuzudb-server/  Optional embedded KuzuDB store. EmbeddedKuzu (in-process), KuzuSchemaBootstrap (idempotent DDL), KuzuIngestor (deduping, shape-cached MERGEs in 500-row transactions), KuzuPostScan (unresolved-call rewiring, cleanupStale), KuzuGraphStore (read surface). Module is named with `-kuzudb-` so siblings (e.g. DuckDB-backed embedded server) can sit alongside.
+cvector-parser-*/         25 language/format parsers — most ANTLR4-based, all implement Parser
+cvector-rules/            RulesEngine + builtin rules (god-file, god-class, long-method, deep-inheritance, dead-code)
+cvector-watcher/          File watcher + cron-driven re-scan
+cvector-cli/              Picocli commands wired as Spring beans (33 commands)
+cvector-rest/             Spring Web controllers (`/api/*`)
+cvector-mcp/              MCP server: CvectorTools (16 tools), CvectorResources (8), CvectorPrompts (6)
+cvector-app/              Spring Boot main + fat-jar assembly (single entrypoint for all modes)
 ```
 
 The fat jar at `cvector-app/target/cvector.jar` selects mode via the first argument: `dashboard` → web, `serve` → MCP stdio, anything else → CLI command.
@@ -71,9 +72,18 @@ java -jar cvector-app/target/cvector.jar rules    # should report 0 violations
 - All beans are configured manually in `*Configuration` classes — no `@ComponentScan` magic on parsers. Parsers register through `CliConfiguration.@Bean Parser ...()` methods.
 - Virtual threads are enabled via property `spring.threads.virtual.enabled=true` in `application-mcp.properties` and in the dashboard's web properties. **Do not** enable for the scan loop — it's CPU-bound and virtual threads don't help there.
 
+### Embedded KuzuDB conventions
+
+- `--embedded` (Picocli, `scope = INHERIT`) and `CVECTOR_EMBEDDED=true` set the `cvector.embedded` system property. The `cvector embedded` subcommand tree (`init`, `info`, `query`, `wipe`) exercises the Kuzu store directly.
+- Database location: `~/.cvector/kuzu-data/<projectId>/graph.kuzu/` — a directory, not a file.
+- Schema is **declared upfront**: one polymorphic `Node` table (discriminated by a `label` property) plus 14 typed `REL` tables (`Node → Node`). New node labels are first-class properties, not new tables. New edge types must be added to `KuzuSchemaBootstrap.EDGE_TYPES`.
+- Kuzu's Cypher dialect is a subset of Neo4j's. Specifically: **`SET n += $props` is NOT supported** — properties must be enumerated. `MERGE` semantics are more limited. Anyone writing new Kuzu-targeted queries must use `MATCH ... CREATE` idioms.
+- Kuzu native lib auto-extracts from the jar at first load — it triggers the JDK-25 `System.load` restricted-method warning, which is harmless.
+- Don't try to "pretend" Kuzu is Neo4j by adapting `Neo4jClient.Record`. `EmbeddedKuzu.read()` returns `List<Map<String, Object>>` deliberately.
+
 ### Performance reminders
 
-- Java parsing was the historical bottleneck (~48s for 200 files). Current scan is ~5s. Don't reintroduce per-call `.resolve()` exception throwing.
+- Java parsing was the historical bottleneck (~48s for 200 files). Current scan is **~5.9 s warm** for 218 files / 14 k nodes / 14 k edges (~27 ms per file). Don't reintroduce per-call `.resolve()` exception throwing.
 - `Ingestor` batches at 500 nodes/edges per `UNWIND`. Don't issue per-node `MERGE` writes.
 - `cleanupStale` is one count + one delete across all label types, not 13 round-trips. Keep it that way.
 - The file-walk uses `ForkJoinPool.parallelStream()`. Anything Parser code does must be thread-safe (ANTLR parsers create fresh lexer/parser per `parse()` call, which is the easy path; sharing state across threads is the trap).

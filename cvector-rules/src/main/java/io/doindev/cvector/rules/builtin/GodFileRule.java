@@ -1,6 +1,6 @@
 package io.doindev.cvector.rules.builtin;
 
-import io.doindev.cvector.neo4j.repo.GraphQueries;
+import io.doindev.cvector.core.store.GraphStore;
 import io.doindev.cvector.rules.Rule;
 import io.doindev.cvector.rules.RulesConfig;
 import io.doindev.cvector.rules.Severity;
@@ -14,6 +14,19 @@ public class GodFileRule implements Rule {
 
     public static final String NAME = "god-file";
 
+    private static final String NEO4J_CYPHER =
+            "MATCH (f:File {projectId: $pid})-[:CONTAINS]->(:Class)-[:CONTAINS]->(m:Method) "
+                    + "WITH f, count(m) AS methods "
+                    + "WHERE methods >= $t "
+                    + "RETURN f.path AS path, f.id AS fileId, methods ORDER BY methods DESC";
+
+    private static final String KUZU_CYPHER =
+            "MATCH (f:Node)-[:CONTAINS]->(c:Node)-[:CONTAINS]->(m:Node) "
+                    + "WHERE f.label = 'File' AND c.label = 'Class' AND m.label = 'Method' "
+                    + "WITH f, count(m) AS methods "
+                    + "WHERE methods >= $t "
+                    + "RETURN f.path AS path, f.id AS fileId, methods ORDER BY methods DESC";
+
     @Override public String name() { return NAME; }
 
     @Override public String description() {
@@ -21,26 +34,20 @@ public class GodFileRule implements Rule {
     }
 
     @Override
-    public List<Violation> evaluate(String projectId, GraphQueries q, RulesConfig cfg) {
+    public List<Violation> evaluate(String projectId, GraphStore store, RulesConfig cfg) {
         int threshold = cfg.intThreshold("godFileMethods", 30);
-        var rows = q.raw(
-                "MATCH (f:File {projectId: $pid})-[:CONTAINS]->(:Class)-[:CONTAINS]->(m:Method) "
-                        + "WITH f, count(m) AS methods "
-                        + "WHERE methods >= $t "
-                        + "RETURN f.path AS path, f.id AS fileId, methods ORDER BY methods DESC",
-                Map.of("pid", projectId, "t", threshold)
-        );
+        String cypher = "kuzu".equals(store.backend()) ? KUZU_CYPHER : NEO4J_CYPHER;
+        var rows = store.rawCypher(cypher, Map.of("pid", projectId, "t", (long) threshold)).rows();
         List<Violation> out = new ArrayList<>();
         for (Map<String, Object> r : rows) {
             String path = String.valueOf(r.get("path"));
             if (cfg.isPathExcluded(path)) continue;
             long methods = ((Number) r.get("methods")).longValue();
-            Violation v = new Violation(
+            out.add(new Violation(
                     NAME, Severity.ERROR, path,
                     "file has " + methods + " methods (threshold " + threshold + ")",
                     String.valueOf(r.get("fileId")), null
-            );
-            out.add(v);
+            ));
         }
         return out;
     }

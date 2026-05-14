@@ -31,15 +31,18 @@
         <spring-ai.version>1.0.0</spring-ai.version>
         <directory-watcher.version>0.18.0</directory-watcher.version>
         <antlr4.version>4.13.2</antlr4.version>
+        <kuzu.version>0.11.3</kuzu.version>
     </properties>
 
     <modules>
         <module>cvector-core</module>
         <module>cvector-neo4j</module>
+        <module>cvector-embedded-kuzudb-server</module>
         <module>cvector-parser-java</module>
         <module>cvector-parser-sql</module>
         <module>cvector-parser-config</module>
         <module>cvector-parser-ts</module>
+        <module>cvector-parser-vue</module>
         <module>cvector-parser-style</module>
         <module>cvector-parser-python</module>
         <module>cvector-parser-terraform</module>
@@ -66,6 +69,7 @@
         <module>cvector-cli</module>
         <module>cvector-rest</module>
         <module>cvector-mcp</module>
+        <module>cvector-dashboard</module>
         <module>cvector-app</module>
     </modules>
 
@@ -105,6 +109,16 @@
             </dependency>
             <dependency>
                 <groupId>io.doindev</groupId>
+                <artifactId>cvector-embedded-kuzudb-server</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.kuzudb</groupId>
+                <artifactId>kuzu</artifactId>
+                <version>${kuzu.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.doindev</groupId>
                 <artifactId>cvector-parser-java</artifactId>
                 <version>${project.version}</version>
             </dependency>
@@ -121,6 +135,11 @@
             <dependency>
                 <groupId>io.doindev</groupId>
                 <artifactId>cvector-parser-ts</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.doindev</groupId>
+                <artifactId>cvector-parser-vue</artifactId>
                 <version>${project.version}</version>
             </dependency>
             <dependency>
@@ -241,6 +260,11 @@
             <dependency>
                 <groupId>io.doindev</groupId>
                 <artifactId>cvector-mcp</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.doindev</groupId>
+                <artifactId>cvector-dashboard</artifactId>
                 <version>${project.version}</version>
             </dependency>
             <dependency>

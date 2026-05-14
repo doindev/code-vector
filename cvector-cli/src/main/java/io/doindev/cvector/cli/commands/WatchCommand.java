@@ -4,9 +4,8 @@ import io.doindev.cvector.cli.CvectorRuntime;
 import io.doindev.cvector.core.Parser;
 import io.doindev.cvector.core.ProjectContext;
 import io.doindev.cvector.core.config.CvectorConfig;
-import io.doindev.cvector.neo4j.Ingestor;
-import io.doindev.cvector.neo4j.Neo4jClient;
-import io.doindev.cvector.neo4j.SchemaBootstrap;
+import io.doindev.cvector.core.store.GraphIngestor;
+import io.doindev.cvector.core.store.GraphStore;
 import io.doindev.cvector.watcher.CvectorWatcher;
 import org.springframework.scheduling.support.CronExpression;
 import org.springframework.stereotype.Component;
@@ -28,7 +27,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Stream;
 
 @Component
-@Command(name = "watch", description = "Live file watcher (default) or scheduled re-scan via --cron.")
+@Command(name = "watch", description = "Live file watcher (default) or scheduled re-scan via --cron.", mixinStandardHelpOptions = true)
 public class WatchCommand implements Callable<Integer> {
 
     @Parameters(index = "0", arity = "0..1", description = "Directory to watch (default: current directory).")
@@ -61,11 +60,12 @@ public class WatchCommand implements Callable<Integer> {
     }
 
     private Integer runLive(CvectorConfig cfg, ProjectContext ctx, Path watchRoot) throws Exception {
-        try (Neo4jClient client = runtime.openNeo4j(cfg);
-             CvectorWatcher watcher = new CvectorWatcher(ctx, parsers, client, debounceMillis)) {
-            new SchemaBootstrap(client).bootstrap();
+        try (GraphStore store = runtime.openGraphStore(cfg);
+             CvectorWatcher watcher = new CvectorWatcher(ctx, parsers, store, debounceMillis)) {
+            store.bootstrapSchema();
             watcher.start();
             System.out.println("watching " + watchRoot + " (live mode, debounce " + debounceMillis + "ms)");
+            System.out.println("backend: " + store.displayUri());
             System.out.println("press Ctrl-C to stop");
 
             CountDownLatch shutdown = new CountDownLatch(1);
@@ -99,8 +99,8 @@ public class WatchCommand implements Callable<Integer> {
             shutdown.countDown();
         }, "cvector-cron-shutdown"));
 
-        try (Neo4jClient client = runtime.openNeo4j(cfg)) {
-            new SchemaBootstrap(client).bootstrap();
+        try (GraphStore store = runtime.openGraphStore(cfg)) {
+            store.bootstrapSchema();
             for (Parser p : parsers) p.prepare(ctx);
 
             int iterations = 0;
@@ -118,7 +118,7 @@ public class WatchCommand implements Callable<Integer> {
 
                 long startMs = System.currentTimeMillis();
                 AtomicInteger files = new AtomicInteger();
-                try (Ingestor ingestor = new Ingestor(client)) {
+                try (GraphIngestor ingestor = store.openIngestor()) {
                     try (Stream<Path> walk = Files.walk(watchRoot)) {
                         walk.filter(Files::isRegularFile)
                                 .filter(WatchCommand::notInIgnored)

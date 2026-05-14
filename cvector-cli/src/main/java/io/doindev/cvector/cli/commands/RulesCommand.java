@@ -3,8 +3,7 @@ package io.doindev.cvector.cli.commands;
 import io.doindev.cvector.cli.CvectorRuntime;
 import io.doindev.cvector.cli.output.TableRenderer;
 import io.doindev.cvector.core.config.CvectorConfig;
-import io.doindev.cvector.neo4j.Neo4jClient;
-import io.doindev.cvector.neo4j.repo.GraphQueries;
+import io.doindev.cvector.core.store.GraphStore;
 import io.doindev.cvector.rules.RulesConfig;
 import io.doindev.cvector.rules.RulesConfigLoader;
 import io.doindev.cvector.rules.RulesEngine;
@@ -23,7 +22,7 @@ import java.util.Map;
 import java.util.concurrent.Callable;
 
 @Component
-@Command(name = "rules", description = "Evaluate architecture rules against the active project's graph.")
+@Command(name = "rules", description = "Evaluate architecture rules against the active project's graph.", mixinStandardHelpOptions = true)
 public class RulesCommand implements Callable<Integer> {
 
     @Option(names = "--init", description = "Write a template .cvector/rules.yml in the active project.")
@@ -57,8 +56,8 @@ public class RulesCommand implements Callable<Integer> {
         CvectorConfig.ProjectEntry active = runtime.requireActiveProject(cfg);
         RulesConfig rulesCfg = RulesConfigLoader.loadOrDefault(rulesPath);
 
-        try (Neo4jClient client = runtime.openNeo4j(cfg)) {
-            RulesEngine engine = new RulesEngine(active.projectId(), new GraphQueries(client), rulesCfg);
+        try (GraphStore store = runtime.openGraphStore(cfg)) {
+            RulesEngine engine = new RulesEngine(active.projectId(), store, rulesCfg);
             RulesEngine.Report report = engine.run();
             if (json) {
                 System.out.println(reportToJson(report));

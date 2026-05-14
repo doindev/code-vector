@@ -16,7 +16,17 @@ public class CvectorPrompts {
 
     public List<McpServerFeatures.SyncPromptSpecification> getPrompts() {
         List<McpServerFeatures.SyncPromptSpecification> out = new ArrayList<>();
-        out.add(prompt(
+        out.add(onboardPrompt());
+        out.add(reviewChangePrompt());
+        out.add(healthCheckPrompt());
+        out.add(explainModulePrompt());
+        out.add(migrationPlanPrompt());
+        out.add(infrastructurePrompt());
+        return out;
+    }
+
+    private static McpServerFeatures.SyncPromptSpecification onboardPrompt() {
+        return prompt(
                 "cvector-onboard",
                 "Full architecture briefing for a new team member.",
                 List.of(),
@@ -37,9 +47,11 @@ public class CvectorPrompts {
                         - Top 3 risks (god classes, long methods, dead code) with file:line citations
                         - "Where to start reading" — 5 suggested files in dependency order
                         """,
-                "Architecture briefing"));
+                "Architecture briefing");
+    }
 
-        out.add(prompt(
+    private static McpServerFeatures.SyncPromptSpecification reviewChangePrompt() {
+        return prompt(
                 "cvector-review-change",
                 "Impact analysis before changing a function, class, or file.",
                 List.of(arg("symbol", "Fully-qualified method or class name, or file path.", true)),
@@ -64,9 +76,11 @@ public class CvectorPrompts {
                             - Suggested test additions if coverage looks thin
                             """.formatted(symbol, symbol, symbol, symbol);
                 },
-                "Change impact review"));
+                "Change impact review");
+    }
 
-        out.add(prompt(
+    private static McpServerFeatures.SyncPromptSpecification healthCheckPrompt() {
+        return prompt(
                 "cvector-health-check",
                 "Comprehensive health report with prioritized action items.",
                 List.of(),
@@ -86,9 +100,11 @@ public class CvectorPrompts {
                         - Vulnerabilities ranked by exposure (callers × CVSS)
                         - One-sentence trajectory note ("better / worse / same than last scan" — use cv_changes for the comparison)
                         """,
-                "Health report"));
+                "Health report");
+    }
 
-        out.add(prompt(
+    private static McpServerFeatures.SyncPromptSpecification explainModulePrompt() {
+        return prompt(
                 "cvector-explain-module",
                 "Deep-dive into a specific file or module.",
                 List.of(arg("path", "Project-relative file path or class FQN.", true)),
@@ -112,9 +128,11 @@ public class CvectorPrompts {
                             - Reading order: 3–5 files to read in sequence to understand it end-to-end
                             """.formatted(path, path);
                 },
-                "Module deep-dive"));
+                "Module deep-dive");
+    }
 
-        out.add(prompt(
+    private static McpServerFeatures.SyncPromptSpecification migrationPlanPrompt() {
+        return prompt(
                 "cvector-migration-plan",
                 "Step-by-step migration plan with risk assessment.",
                 List.of(
@@ -147,9 +165,11 @@ public class CvectorPrompts {
                             scope.isEmpty() ? "" : " (scope: " + scope + ")",
                             from, from);
                 },
-                "Migration plan"));
+                "Migration plan");
+    }
 
-        out.add(prompt(
+    private static McpServerFeatures.SyncPromptSpecification infrastructurePrompt() {
+        return prompt(
                 "cvector-infrastructure",
                 "Audit all infrastructure: queues, metrics, events, external APIs, env vars, IaC resources.",
                 List.of(),
@@ -171,9 +191,7 @@ public class CvectorPrompts {
                         - Risk callouts: any endpoint with no auth-related token in the call path, any env var
                           with no default that crashes startup, any orphaned IaC resource
                         """,
-                "Infrastructure audit"));
-
-        return out;
+                "Infrastructure audit");
     }
 
     private static McpServerFeatures.SyncPromptSpecification prompt(

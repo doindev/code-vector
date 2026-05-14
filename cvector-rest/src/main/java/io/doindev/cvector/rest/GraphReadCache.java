@@ -1,0 +1,118 @@
+package io.doindev.cvector.rest;
+
+import org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplication;
+import org.springframework.context.event.EventListener;
+import org.springframework.stereotype.Component;
+
+import java.time.Duration;
+import java.time.Instant;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.function.Supplier;
+
+/**
+ * Tiny TTL cache for read-heavy REST endpoints. Memoises the expensive {@link
+ * io.doindev.cvector.core.store.GraphStore} aggregations ({@code onboardSummary},
+ * {@code healthRollup}, {@code serviceLinks}, {@code methodCallGraph}, etc.) so polling
+ * dashboard views don't hammer Kuzu on every refresh. The graph only changes when a scan
+ * lands; a 30 s default TTL gives the dashboard sub-second response on cache hits without
+ * masking real updates for more than half a minute.
+ *
+ * <p>Entries are keyed by an opaque string the caller chooses — typically
+ * {@code endpoint:projectId[:param=value...]}. Values are stored as {@link Object} so a
+ * single cache instance can hold heterogeneous result shapes; callers cast in the
+ * {@code Supplier} return type.
+ *
+ * <p>Concurrency: the underlying {@link ConcurrentHashMap} handles the get/put race; we
+ * accept that two callers may both miss and re-compute simultaneously (the duplicate work
+ * is bounded by the call site and avoids the lock-contention that {@code computeIfAbsent}
+ * would introduce when the supplier itself is slow).
+ */
+@Component
+@ConditionalOnWebApplication
+public class GraphReadCache {
+
+    /** Default TTL. Polling cadences are 2/3/10/30 s; 30 s lets the 10 s pollers cache-hit ~2/3 of the time. */
+    public static final Duration DEFAULT_TTL = Duration.ofSeconds(30);
+
+    /**
+     * Soft cap on entries. Symbol-keyed endpoints (search/explain/impact/slice) can produce
+     * one entry per unique navigation, so without a cap the cache grows with user activity.
+     * On insert past this size we sweep expired entries first, then drop the oldest-by-expiry
+     * to keep the cache bounded. 4096 ≈ a few MB of small JSON maps; cheap.
+     */
+    private static final int MAX_ENTRIES = 4096;
+
+    private final ConcurrentMap<String, Entry> cache = new ConcurrentHashMap<>();
+    /** Hits + misses since last {@link #invalidateAll}. Surfaced on /api/doctor so operators can see if the cache is actually doing useful work. */
+    private final java.util.concurrent.atomic.AtomicLong hits = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong misses = new java.util.concurrent.atomic.AtomicLong();
+
+    /** Memoise {@code compute} under {@code key} using the default TTL. */
+    public <T> T memoize(String key, Supplier<T> compute) {
+        return memoize(key, DEFAULT_TTL, compute);
+    }
+
+    @SuppressWarnings("unchecked")
+    public <T> T memoize(String key, Duration ttl, Supplier<T> compute) {
+        Instant now = Instant.now();
+        Entry hit = cache.get(key);
+        if (hit != null && hit.expiresAt.isAfter(now)) {
+            hits.incrementAndGet();
+            return (T) hit.value;
+        }
+        misses.incrementAndGet();
+        T value = compute.get();
+        if (cache.size() >= MAX_ENTRIES) sweep(now);
+        cache.put(key, new Entry(value, now.plus(ttl)));
+        return value;
+    }
+
+    /** Hit / miss counters reset on every {@link #invalidateAll} (i.e. after every scan). */
+    public long hits() { return hits.get(); }
+    public long misses() { return misses.get(); }
+
+    /**
+     * Two-pass eviction. First drop everything that already expired (cheap and correct).
+     * If we're still over the cap, drop the entries whose TTL is closest to expiring.
+     * Not perfect LRU but bounded and cheap: the cache exists to absorb burst polling,
+     * not to be a long-term memoiser.
+     */
+    private void sweep(Instant now) {
+        cache.values().removeIf(e -> e.expiresAt.isBefore(now));
+        if (cache.size() < MAX_ENTRIES) return;
+        // Drop ~25% of the soonest-to-expire entries so subsequent inserts don't immediately
+        // trigger another sweep.
+        int toRemove = Math.max(1, cache.size() / 4);
+        cache.entrySet().stream()
+                .sorted((a, b) -> a.getValue().expiresAt.compareTo(b.getValue().expiresAt))
+                .limit(toRemove)
+                .map(java.util.Map.Entry::getKey)
+                .forEach(cache::remove);
+    }
+
+    /** Drop all cached entries. Used after a scan completes so views see fresh data immediately. */
+    public void invalidateAll() {
+        cache.clear();
+        // Reset counters too so hit rate reflects the post-scan window the operator is asking
+        // about, not pre-scan stats that no longer correspond to live data.
+        hits.set(0);
+        misses.set(0);
+    }
+
+    /**
+     * Spring event hook: any publisher firing a {@link GraphMutatedEvent} (scan finished,
+     * watcher applied changes, schedule kicked an ingest) triggers a full flush. We don't
+     * try to be granular about which entries are stale — the cost of recomputing a few
+     * cached aggregates is small compared to the confusion of half-stale dashboards.
+     */
+    @EventListener
+    public void onGraphMutated(GraphMutatedEvent event) {
+        invalidateAll();
+    }
+
+    /** Cache snapshot stats for /api/health/cache or debugging. */
+    public int size() { return cache.size(); }
+
+    private record Entry(Object value, Instant expiresAt) {}
+}

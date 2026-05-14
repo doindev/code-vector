@@ -3,8 +3,7 @@ package io.doindev.cvector.cli.commands;
 import io.doindev.cvector.cli.CvectorRuntime;
 import io.doindev.cvector.cli.output.TableRenderer;
 import io.doindev.cvector.core.config.CvectorConfig;
-import io.doindev.cvector.neo4j.Neo4jClient;
-import io.doindev.cvector.neo4j.repo.GraphQueries;
+import io.doindev.cvector.core.store.GraphStore;
 import org.springframework.stereotype.Component;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
@@ -15,7 +14,7 @@ import java.util.Map;
 import java.util.concurrent.Callable;
 
 @Component
-@Command(name = "search", description = "Search graph nodes by name (substring or wildcard).")
+@Command(name = "search", description = "Search graph nodes by name (substring or wildcard).", mixinStandardHelpOptions = true)
 public class SearchCommand implements Callable<Integer> {
 
     @Parameters(index = "0", description = "Query (substring; supports * wildcards).")
@@ -37,15 +36,8 @@ public class SearchCommand implements Callable<Integer> {
     public Integer call() {
         CvectorConfig cfg = runtime.loadConfig();
         CvectorConfig.ProjectEntry active = runtime.requireActiveProject(cfg);
-        String regex = "(?i).*" + query.replace("*", ".*") + ".*";
-        try (Neo4jClient client = runtime.openNeo4j(cfg)) {
-            GraphQueries q = new GraphQueries(client);
-            String labelFilter = label != null ? "AND any(l IN labels(n) WHERE l = $label) " : "";
-            String cypher = "MATCH (n) WHERE n.projectId = $pid "
-                    + "AND (n.fqName =~ $regex OR n.name =~ $regex) " + labelFilter
-                    + "RETURN labels(n)[0] AS label, n.fqName AS fqName, n.name AS name, n.id AS id LIMIT $lim";
-            List<Map<String, Object>> rows = q.raw(cypher,
-                    Map.of("pid", active.projectId(), "regex", regex, "label", label == null ? "" : label, "lim", limit));
+        try (GraphStore store = runtime.openGraphStore(cfg)) {
+            List<Map<String, Object>> rows = store.searchByName(active.projectId(), query, label, limit);
             if (rows.isEmpty()) {
                 System.out.println("(no results for '" + query + "')");
                 return 0;

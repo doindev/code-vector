@@ -5,9 +5,8 @@ import io.doindev.cvector.cli.util.GitHelper;
 import io.doindev.cvector.core.Parser;
 import io.doindev.cvector.core.ProjectContext;
 import io.doindev.cvector.core.config.CvectorConfig;
-import io.doindev.cvector.neo4j.Ingestor;
-import io.doindev.cvector.neo4j.Neo4jClient;
-import io.doindev.cvector.neo4j.SchemaBootstrap;
+import io.doindev.cvector.core.store.GraphIngestor;
+import io.doindev.cvector.core.store.GraphStore;
 import org.springframework.stereotype.Component;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
@@ -22,7 +21,7 @@ import java.util.Optional;
 import java.util.concurrent.Callable;
 
 @Component
-@Command(name = "scan:incremental", description = "Re-parse only files changed since the last scan (git-diff-driven).")
+@Command(name = "scan:incremental", description = "Re-parse only files changed since the last scan (git-diff-driven).", mixinStandardHelpOptions = true)
 public class ScanIncrementalCommand implements Callable<Integer> {
 
     @Parameters(index = "0", arity = "0..1", description = "Project root (default: current directory).")
@@ -56,20 +55,15 @@ public class ScanIncrementalCommand implements Callable<Integer> {
             return 2;
         }
 
-        try (Neo4jClient client = runtime.openNeo4j(cfg);
-             Ingestor ingestor = new Ingestor(client)) {
-            new SchemaBootstrap(client).bootstrap();
+        try (GraphStore store = runtime.openGraphStore(cfg);
+             GraphIngestor ingestor = store.openIngestor()) {
+            store.bootstrapSchema();
 
             String baseCommit = fromCommit;
             if (baseCommit == null) {
-                var rows = client.read(
-                        "MATCH (p:Project {projectId: $pid}) RETURN p.lastScanCommit AS sha",
-                        Map.of("pid", ctx.projectId())
-                );
-                if (!rows.isEmpty()) {
-                    var v = rows.get(0).get("sha");
-                    if (!v.isNull()) baseCommit = v.asString();
-                }
+                Map<String, Object> meta = store.projectMeta(ctx.projectId());
+                Object sha = meta.get("lastScanCommit");
+                if (sha != null) baseCommit = sha.toString();
             }
             if (baseCommit == null) {
                 System.err.println("no previous scan commit found; run `cvector scan` first");
@@ -82,19 +76,17 @@ public class ScanIncrementalCommand implements Callable<Integer> {
 
             List<Path> changed = GitHelper.changedSince(scanRoot, baseCommit);
             List<Path> deleted = GitHelper.deletedSince(scanRoot, baseCommit);
+            System.out.println("backend: " + store.displayUri());
             System.out.println("base: " + baseCommit);
             System.out.println("head: " + currentHead.get());
             System.out.println("changed: " + changed.size() + ", deleted: " + deleted.size());
 
+            int removed = 0;
             for (Path deletedPath : deleted) {
                 String rel = scanRoot.relativize(deletedPath).toString().replace('\\', '/');
-                client.write(
-                        "MATCH (f:File {projectId: $pid, path: $path}) "
-                                + "OPTIONAL MATCH (f)-[:CONTAINS*0..]->(child) "
-                                + "DETACH DELETE f, child",
-                        Map.of("pid", ctx.projectId(), "path", rel)
-                );
+                removed += store.deleteFileSubtree(ctx.projectId(), rel);
             }
+            if (removed > 0) System.out.printf("removed %d node(s) for deleted files%n", removed);
 
             for (Parser p : parsers) p.prepare(ctx);
             int fileCount = 0;

@@ -1,6 +1,6 @@
 package io.doindev.cvector.rules.builtin;
 
-import io.doindev.cvector.neo4j.repo.GraphQueries;
+import io.doindev.cvector.core.store.GraphStore;
 import io.doindev.cvector.rules.Rule;
 import io.doindev.cvector.rules.RulesConfig;
 import io.doindev.cvector.rules.Severity;
@@ -11,6 +11,13 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
+/**
+ * Runs a user-supplied Cypher query (from {@code .cvector/rules.yml}) and turns each row into a
+ * {@link Violation}. The user is responsible for writing dialect-compatible Cypher — the rule
+ * definition can include separate {@code cypher} (Neo4j) and {@code cypherKuzu} (Kuzu) bodies
+ * via {@link RulesConfig.CustomRule#getCypherFor(String)}, falling back to the generic
+ * {@code cypher} if no per-backend variant is provided.
+ */
 public class CustomCypherRule implements Rule {
 
     private final RulesConfig.CustomRule definition;
@@ -30,11 +37,12 @@ public class CustomCypherRule implements Rule {
     }
 
     @Override
-    public List<Violation> evaluate(String projectId, GraphQueries q, RulesConfig cfg) {
-        if (definition.getCypher() == null || definition.getCypher().isBlank()) return List.of();
+    public List<Violation> evaluate(String projectId, GraphStore store, RulesConfig cfg) {
+        String cypher = definition.getCypherFor(store.backend());
+        if (cypher == null || cypher.isBlank()) return List.of();
         Map<String, Object> params = new HashMap<>();
         params.put("pid", projectId);
-        var rows = q.raw(definition.getCypher(), params);
+        var rows = store.rawCypher(cypher, params).rows();
         List<Violation> out = new ArrayList<>();
         for (Map<String, Object> r : rows) {
             String subject = stringOrEmpty(r, "subject");

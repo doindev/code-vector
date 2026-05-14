@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>io.doindev</groupId>
+        <artifactId>cwc-code-vector</artifactId>
+        <version>0.0.1-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>cvector-parser-vue</artifactId>
+    <name>cvector-parser-vue</name>
+    <description>Vue Single-File Component parser. Splits a .vue file into &lt;template&gt; / &lt;script&gt; / &lt;style&gt; regions and delegates each to the existing TS and stylesheet parser adapters.</description>
+
+    <dependencies>
+        <dependency>
+            <groupId>io.doindev</groupId>
+            <artifactId>cvector-core</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.doindev</groupId>
+            <artifactId>cvector-parser-ts</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.doindev</groupId>
+            <artifactId>cvector-parser-style</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.assertj</groupId>
+            <artifactId>assertj-core</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+</project>

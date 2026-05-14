@@ -5,8 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.doindev.cvector.cli.CvectorRuntime;
 import io.doindev.cvector.cli.output.TableRenderer;
 import io.doindev.cvector.core.config.CvectorConfig;
-import io.doindev.cvector.neo4j.Neo4jClient;
-import io.doindev.cvector.neo4j.repo.GraphQueries;
+import io.doindev.cvector.core.store.GraphStore;
 import org.springframework.stereotype.Component;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
@@ -23,7 +22,7 @@ import java.util.Map;
 import java.util.concurrent.Callable;
 
 @Component
-@Command(name = "audit", description = "Dependency vulnerability audit (OSV) cross-referenced with the graph.")
+@Command(name = "audit", description = "Dependency vulnerability audit (OSV) cross-referenced with the graph.", mixinStandardHelpOptions = true)
 public class AuditCommand implements Callable<Integer> {
 
     private static final String OSV_URL = "https://api.osv.dev/v1/query";
@@ -45,14 +44,8 @@ public class AuditCommand implements Callable<Integer> {
         CvectorConfig cfg = runtime.loadConfig();
         CvectorConfig.ProjectEntry active = runtime.requireActiveProject(cfg);
 
-        try (Neo4jClient client = runtime.openNeo4j(cfg)) {
-            GraphQueries q = new GraphQueries(client);
-            List<Map<String, Object>> deps = q.raw(
-                    "MATCH (d:MavenDependency {projectId: $pid}) "
-                            + "RETURN d.groupId AS groupId, d.artifactId AS artifactId, d.version AS version "
-                            + "ORDER BY groupId, artifactId",
-                    Map.of("pid", active.projectId())
-            );
+        try (GraphStore store = runtime.openGraphStore(cfg)) {
+            List<Map<String, Object>> deps = store.mavenDependencies(active.projectId());
             if (deps.isEmpty()) {
                 System.out.println("no Maven dependencies in graph; nothing to audit");
                 return 0;
@@ -65,12 +58,14 @@ public class AuditCommand implements Callable<Integer> {
 
             List<Map<String, Object>> findings = new ArrayList<>();
             int errorCount = 0;
+            int scannedCount = 0;
 
             for (Map<String, Object> d : deps) {
-                String groupId = String.valueOf(d.get("groupId"));
-                String artifactId = String.valueOf(d.get("artifactId"));
-                String version = String.valueOf(d.get("version"));
-                if (version == null || version.isBlank() || "null".equals(version)) continue;
+                String groupId = stringOf(d.get("groupId"));
+                String artifactId = stringOf(d.get("artifactId"));
+                String version = stringOf(d.get("version"));
+                if (version == null || version.isBlank() || "null".equals(version) || version.contains("${")) continue;
+                scannedCount++;
                 String coord = groupId + ":" + artifactId + ":" + version;
                 try {
                     String body = String.format(
@@ -106,9 +101,10 @@ public class AuditCommand implements Callable<Integer> {
             }
 
             System.out.println("audit (active project: " + active.name() + ")");
-            System.out.println("  dependencies scanned: " + deps.size());
-            if (errorCount > 0) System.out.println("  network/parse errors:  " + errorCount);
-            System.out.println("  vulnerabilities found: " + findings.size());
+            System.out.println("  dependencies in graph:   " + deps.size());
+            System.out.println("  dependencies scanned:    " + scannedCount);
+            if (errorCount > 0) System.out.println("  network/parse errors:    " + errorCount);
+            System.out.println("  vulnerabilities found:   " + findings.size());
             System.out.println();
             if (!findings.isEmpty()) TableRenderer.render(System.out, findings);
 
@@ -116,6 +112,8 @@ public class AuditCommand implements Callable<Integer> {
             return 0;
         }
     }
+
+    private static String stringOf(Object v) { return v == null ? null : v.toString(); }
 
     private static String primarySeverity(JsonNode vuln) {
         JsonNode sev = vuln.path("severity");

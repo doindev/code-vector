@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>io.doindev</groupId>
+        <artifactId>cwc-code-vector</artifactId>
+        <version>0.0.1-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>cvector-dashboard</artifactId>
+    <name>cvector-dashboard</name>
+    <description>
+        Optional Angular + Bootstrap dashboard for cvector. Bundles the built single-page
+        app under classpath:static/dashboard/ so the existing dashboard command (which
+        already runs Spring Boot in servlet mode on port 2969) serves it as a static
+        resource alongside the REST API.
+
+        The Angular build is driven by frontend-maven-plugin, opt-in via the `dashboard-ui`
+        Maven profile so that a plain `mvn package` doesn't require Node.js. When the
+        profile is active, the plugin downloads a pinned Node + npm, runs `npm ci`, and
+        runs `npm run build`, dropping the output at src/main/resources/static/dashboard/.
+    </description>
+
+    <dependencies>
+        <dependency>
+            <groupId>io.doindev</groupId>
+            <artifactId>cvector-core</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.doindev</groupId>
+            <artifactId>cvector-rest</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.doindev</groupId>
+            <artifactId>cvector-watcher</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.assertj</groupId>
+            <artifactId>assertj-core</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <profiles>
+        <!--
+            Build the Angular SPA from src/main/frontend/ and stage its output under
+            src/main/resources/static/dashboard/ so it's included in the cvector fat jar.
+            Activated explicitly with `mvn -P dashboard-ui package`. The default build
+            skips the front-end work entirely (no Node.js install required for plain
+            backend-only builds).
+        -->
+        <profile>
+            <id>dashboard-ui</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>com.github.eirslett</groupId>
+                        <artifactId>frontend-maven-plugin</artifactId>
+                        <version>1.15.0</version>
+                        <configuration>
+                            <workingDirectory>src/main/frontend</workingDirectory>
+                            <installDirectory>${project.build.directory}/node-install</installDirectory>
+                        </configuration>
+                        <executions>
+                            <execution>
+                                <id>install-node-and-npm</id>
+                                <goals><goal>install-node-and-npm</goal></goals>
+                                <configuration>
+                                    <nodeVersion>v20.18.0</nodeVersion>
+                                    <npmVersion>10.8.2</npmVersion>
+                                </configuration>
+                            </execution>
+                            <execution>
+                                <id>npm-install</id>
+                                <goals><goal>npm</goal></goals>
+                                <configuration>
+                                    <arguments>install --no-audit --no-fund</arguments>
+                                </configuration>
+                            </execution>
+                            <execution>
+                                <id>npm-run-build</id>
+                                <goals><goal>npm</goal></goals>
+                                <configuration>
+                                    <arguments>run build</arguments>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
+</project>

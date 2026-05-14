@@ -3,22 +3,18 @@ package io.doindev.cvector.cli.commands;
 import io.doindev.cvector.cli.CvectorRuntime;
 import io.doindev.cvector.cli.output.TableRenderer;
 import io.doindev.cvector.core.config.CvectorConfig;
-import io.doindev.cvector.neo4j.Neo4jClient;
-import io.doindev.cvector.neo4j.repo.GraphQueries;
+import io.doindev.cvector.core.store.GraphStore;
 import org.springframework.stereotype.Component;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
 
 import java.time.Duration;
-import java.time.ZoneOffset;
-import java.time.ZonedDateTime;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Callable;
 
 @Component
-@Command(name = "recent", description = "Show recently-ingested graph nodes.")
+@Command(name = "recent", description = "Show recently-ingested graph nodes.", mixinStandardHelpOptions = true)
 public class RecentCommand implements Callable<Integer> {
 
     @Option(names = "--since", description = "Time window (e.g. 24h, 7d, 30m, 1d). Default: 24h.")
@@ -38,19 +34,8 @@ public class RecentCommand implements Callable<Integer> {
         CvectorConfig cfg = runtime.loadConfig();
         CvectorConfig.ProjectEntry active = runtime.requireActiveProject(cfg);
         Duration window = parseDuration(since);
-        ZonedDateTime cutoff = ZonedDateTime.now(ZoneOffset.UTC).minus(window);
-
-        try (Neo4jClient client = runtime.openNeo4j(cfg)) {
-            GraphQueries q = new GraphQueries(client);
-            String cypher = "MATCH (n) WHERE n.projectId = $pid AND n.lastIngestedAt > datetime($cutoff) "
-                    + "RETURN labels(n)[0] AS label, n.fqName AS fqName, n.name AS name, "
-                    + "toString(n.lastIngestedAt) AS lastIngestedAt "
-                    + "ORDER BY n.lastIngestedAt DESC LIMIT $lim";
-            Map<String, Object> params = new HashMap<>();
-            params.put("pid", active.projectId());
-            params.put("cutoff", cutoff.toString());
-            params.put("lim", limit);
-            List<Map<String, Object>> rows = q.raw(cypher, params);
+        try (GraphStore store = runtime.openGraphStore(cfg)) {
+            List<Map<String, Object>> rows = store.recentlyChanged(active.projectId(), window, limit);
             if (rows.isEmpty()) {
                 System.out.println("(no nodes touched in last " + since + ")");
                 return 0;

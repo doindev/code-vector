@@ -2,8 +2,8 @@ package io.doindev.cvector.watcher;
 
 import io.doindev.cvector.core.Parser;
 import io.doindev.cvector.core.ProjectContext;
-import io.doindev.cvector.neo4j.Ingestor;
-import io.doindev.cvector.neo4j.Neo4jClient;
+import io.doindev.cvector.core.store.GraphIngestor;
+import io.doindev.cvector.core.store.GraphStore;
 import io.methvin.watcher.DirectoryChangeEvent;
 import io.methvin.watcher.DirectoryWatcher;
 import org.slf4j.Logger;
@@ -12,7 +12,6 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -20,13 +19,22 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
+/**
+ * Live file-system watcher that re-indexes changed files into the active {@link GraphStore}.
+ * Backend-agnostic — works against Neo4j or the embedded KuzuDB store.
+ *
+ * <p>Events are debounced (default 250 ms) and processed in a single batch per flush. Each flush
+ * opens a fresh {@link GraphIngestor} so buffered writes commit atomically per debounce window.
+ * File deletes route through {@link GraphStore#deleteFileSubtree} which cascades to all CONTAINS
+ * children (Neo4j: variable-length DETACH DELETE; Kuzu: Java BFS over CONTAINS edges).
+ */
 public class CvectorWatcher implements AutoCloseable {
 
     private static final Logger log = LoggerFactory.getLogger(CvectorWatcher.class);
 
     private final ProjectContext ctx;
     private final List<Parser> parsers;
-    private final Neo4jClient client;
+    private final GraphStore store;
     private final long debounceMillis;
 
     private final Map<Path, DirectoryChangeEvent.EventType> pending = new LinkedHashMap<>();
@@ -43,10 +51,10 @@ public class CvectorWatcher implements AutoCloseable {
     private volatile int totalDeletes;
     private volatile int transientFailures;
 
-    public CvectorWatcher(ProjectContext ctx, List<Parser> parsers, Neo4jClient client, long debounceMillis) {
+    public CvectorWatcher(ProjectContext ctx, List<Parser> parsers, GraphStore store, long debounceMillis) {
         this.ctx = ctx;
         this.parsers = parsers;
-        this.client = client;
+        this.store = store;
         this.debounceMillis = debounceMillis;
     }
 
@@ -57,7 +65,7 @@ public class CvectorWatcher implements AutoCloseable {
                 .listener(this::onEvent)
                 .build();
         watcher.watchAsync();
-        log.info("watching {}", ctx.rootPath());
+        log.info("watching {} (backend: {})", ctx.rootPath(), store.displayUri());
     }
 
     public int totalFilesProcessed() { return totalFiles; }
@@ -87,9 +95,7 @@ public class CvectorWatcher implements AutoCloseable {
             flushScheduled = false;
         }
         if (snapshot.isEmpty()) return;
-        Ingestor ingestor = null;
-        try {
-            ingestor = new Ingestor(client);
+        try (GraphIngestor ingestor = store.openIngestor()) {
             for (Map.Entry<Path, DirectoryChangeEvent.EventType> e : snapshot.entrySet()) {
                 Path p = e.getKey();
                 DirectoryChangeEvent.EventType type = e.getValue();
@@ -113,14 +119,10 @@ public class CvectorWatcher implements AutoCloseable {
             }
         } catch (RuntimeException outer) {
             log.warn("flush cycle failed: {}", outer.getMessage());
-        } finally {
-            if (ingestor != null) {
-                try { ingestor.close(); } catch (RuntimeException ignored) {}
-            }
         }
     }
 
-    private void handleUpsert(Path file, Ingestor ingestor) {
+    private void handleUpsert(Path file, GraphIngestor ingestor) {
         if (!Files.exists(file) || !Files.isRegularFile(file)) {
             log.debug("not a regular file (deleted before flush?): {}", file);
             return;
@@ -149,13 +151,12 @@ public class CvectorWatcher implements AutoCloseable {
     private void handleDelete(Path file) {
         String rel = ctx.rootPath().relativize(file).toString().replace('\\', '/');
         try {
-            client.write(
-                    "MATCH (f:File {projectId: $pid, path: $path}) "
-                            + "OPTIONAL MATCH (f)-[:CONTAINS*0..]->(child) "
-                            + "DETACH DELETE f, child",
-                    new HashMap<>(Map.of("pid", ctx.projectId(), "path", rel))
-            );
-            log.info("removed nodes for deleted file {}", rel);
+            int removed = store.deleteFileSubtree(ctx.projectId(), rel);
+            if (removed > 0) {
+                log.info("removed {} node(s) for deleted file {}", removed, rel);
+            } else {
+                log.debug("no graph state to remove for {}", rel);
+            }
         } catch (RuntimeException ex) {
             log.warn("failed to remove nodes for {}; will retry on next change: {}", rel, ex.getMessage());
             transientFailures++;

@@ -9,7 +9,7 @@ import java.nio.file.Path;
 import java.util.concurrent.Callable;
 
 @Component
-@Command(name = "setup-windsurf", description = "Register cvector as an MCP server in Windsurf's MCP config.")
+@Command(name = "setup-windsurf", description = "Register cvector as an MCP server in Windsurf's MCP config.", mixinStandardHelpOptions = true)
 public class SetupWindsurfCommand implements Callable<Integer> {
 
     @Option(names = "--name", description = "Server entry name (default 'cvector').")

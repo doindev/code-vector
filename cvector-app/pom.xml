@@ -64,6 +64,18 @@
                     <mainClass>io.doindev.cvector.CvectorApplication</mainClass>
                 </configuration>
                 <executions>
+                    <!--
+                        AOT pre-processes the Spring bean factory at build time so reflection-heavy
+                        bean construction can be replaced with generated, branch-predictable code.
+                        Picked up at runtime via `-Dspring.aot.enabled=true` (or by GraalVM native).
+                        Pairs with CDS (`-XX:SharedArchiveFile=...`) for the best startup wall-clock.
+                    -->
+                    <execution>
+                        <id>process-aot</id>
+                        <goals>
+                            <goal>process-aot</goal>
+                        </goals>
+                    </execution>
                     <execution>
                         <goals>
                             <goal>repackage</goal>
@@ -85,4 +97,81 @@
             </plugin>
         </plugins>
     </build>
+
+    <profiles>
+        <!--
+            mvn -Pdashboard-ui package pulls in the Angular dashboard and bundles its
+            built assets into the cvector fat jar so the dashboard command can serve
+            them. The dashboard module declares its own front-end build under the same
+            profile id, so activating one activates the other in lockstep.
+        -->
+        <profile>
+            <id>dashboard-ui</id>
+            <dependencies>
+                <dependency>
+                    <groupId>io.doindev</groupId>
+                    <artifactId>cvector-dashboard</artifactId>
+                </dependency>
+            </dependencies>
+        </profile>
+
+        <!--
+            `mvn -Pdist package` produces a self-contained Windows distributable at
+            target/dist/cvector/, containing cvector.exe + bundled JRE + the fat jar.
+            Skipped from the default build because jpackage adds ~30 s and writes ~150 MB
+            to target/.
+        -->
+        <profile>
+            <id>dist</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.panteleyev</groupId>
+                        <artifactId>jpackage-maven-plugin</artifactId>
+                        <version>1.6.5</version>
+                        <configuration>
+                            <name>cvector</name>
+                            <appVersion>0.0.1</appVersion>
+                            <vendor>doindev</vendor>
+                            <input>${project.build.directory}</input>
+                            <mainJar>${project.build.finalName}.jar</mainJar>
+                            <destination>${project.build.directory}/dist</destination>
+                            <type>APP_IMAGE</type>
+                            <javaOptions>
+                                <option>-Dspring.aot.enabled=true</option>
+                            </javaOptions>
+                            <!--
+                                jpackage can't auto-detect required modules from a non-modular fat jar,
+                                so list them explicitly. Covers Spring Boot + jackson + Neo4j driver +
+                                Kuzu JNI runtime needs. Add more if a runtime hits ClassNotFoundException
+                                for a JDK module.
+                            -->
+                            <addModules>
+                                <module>java.base</module>
+                                <module>java.management</module>
+                                <module>java.naming</module>
+                                <module>java.sql</module>
+                                <module>java.net.http</module>
+                                <module>java.desktop</module>
+                                <module>java.logging</module>
+                                <module>java.xml</module>
+                                <module>java.security.jgss</module>
+                                <module>jdk.crypto.ec</module>
+                                <module>jdk.unsupported</module>
+                            </addModules>
+                        </configuration>
+                        <executions>
+                            <execution>
+                                <id>jpackage</id>
+                                <phase>verify</phase>
+                                <goals>
+                                    <goal>jpackage</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 </project>
