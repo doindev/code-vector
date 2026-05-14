@@ -132,6 +132,15 @@
                         before jpackage runs so the build is idempotent without forcing a full
                         `mvn clean` (which would invalidate the rest of the reactor's compiled
                         output and add ~30 s to every rebuild).
+
+                        Windows note: if you're on Windows with Defender real-time scanning
+                        enabled, this delete can fail when Defender holds an open handle to a
+                        freshly-built cvector.exe from a prior build. Easiest permanent fix is
+                        to add {@code cvector-app/target/} to Defender's folder exclusions
+                        (Settings → Windows Security → Virus & threat protection → Manage
+                        settings → Exclusions → Add an exclusion → Folder). Without that, the
+                        one-shot workaround is {@code rm -rf cvector-app/target/dist} before
+                        the rebuild, or {@code mvn clean -Pdist install} for a full clean.
                     -->
                     <plugin>
                         <groupId>org.apache.maven.plugins</groupId>
