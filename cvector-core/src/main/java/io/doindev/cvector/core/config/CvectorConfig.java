@@ -3,6 +3,7 @@ package io.doindev.cvector.core.config;
 import com.fasterxml.jackson.annotation.JsonInclude;
 
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -26,11 +27,27 @@ public record CvectorConfig(
         String backend,
         RestConfig rest,
         McpConfig mcp,
-        DockerConfig docker
+        DockerConfig docker,
+        RulesPolicy rules
 ) {
 
     public CvectorConfig {
         if (projects == null) projects = new LinkedHashMap<>();
+    }
+
+    /**
+     * Legacy 7-arg constructor for callers written before the per-workspace {@code rules}
+     * section existed. Equivalent to passing {@code null} for {@code rules}, which causes
+     * the resolver to fall through to defaults / rules.yml / per-project overrides.
+     */
+    public CvectorConfig(String activeProject,
+                         Map<String, ProjectEntry> projects,
+                         Neo4jConfig neo4j,
+                         String backend,
+                         RestConfig rest,
+                         McpConfig mcp,
+                         DockerConfig docker) {
+        this(activeProject, projects, neo4j, backend, rest, mcp, docker, null);
     }
 
     /** Backend mode: {@code embedded} (default), {@code remote}, or {@code docker}. */
@@ -68,7 +85,52 @@ public record CvectorConfig(
         return projects.get(activeProject);
     }
 
-    public record ProjectEntry(String projectId, String name, String rootPath) {}
+    /**
+     * Per-workspace project entry. The optional {@code rules} field carries a project-scoped
+     * override of the workspace-wide {@link RulesPolicy}; the rules engine merges both at
+     * load time (defaults → rules.yml → workspace {@code rules} → project {@code rules}).
+     */
+    public record ProjectEntry(String projectId, String name, String rootPath, RulesPolicy rules) {
+        /** Legacy 3-arg constructor for callers that don't carry rules. */
+        public ProjectEntry(String projectId, String name, String rootPath) {
+            this(projectId, name, rootPath, null);
+        }
+    }
+
+    /**
+     * Architecture-rules policy. Layered between the built-in defaults, an optional
+     * {@code .cvector/rules.yml}, the workspace {@code rules} section, and any per-project
+     * override on {@link ProjectEntry#rules}. Every field is optional — a {@code null} value
+     * means "fall through to the next layer".
+     *
+     * <p>Resolution semantics ({@code RulesConfigResolver}):
+     * <ul>
+     *   <li>{@code thresholds}: map-merged — later layers override the same key.</li>
+     *   <li>{@code disable}: union — any layer that lists a rule disables it.</li>
+     *   <li>{@code excludePaths}: union — concatenated across layers, deduped.</li>
+     *   <li>{@code custom}: by-name override — a per-project custom rule with the same name
+     *       replaces a workspace-level one (Cypher + severity + description all updated).</li>
+     * </ul>
+     */
+    public record RulesPolicy(
+            Map<String, Integer> thresholds,
+            List<String> disable,
+            List<String> excludePaths,
+            List<CustomPolicy> custom
+    ) {
+        public static RulesPolicy empty() {
+            return new RulesPolicy(null, null, null, null);
+        }
+    }
+
+    /** Custom Cypher rule definition that can appear under {@link RulesPolicy#custom}. */
+    public record CustomPolicy(
+            String name,
+            String description,
+            String severity,
+            String cypher,
+            String cypherKuzu
+    ) {}
 
     public record Neo4jConfig(String uri, String user, String password) {
 

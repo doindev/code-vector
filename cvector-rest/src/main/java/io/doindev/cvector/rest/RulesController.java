@@ -1,9 +1,10 @@
 package io.doindev.cvector.rest;
 
+import io.doindev.cvector.core.config.CvectorConfig;
 import io.doindev.cvector.core.config.CvectorConfigService;
 import io.doindev.cvector.core.store.GraphStore;
 import io.doindev.cvector.rules.RulesConfig;
-import io.doindev.cvector.rules.RulesConfigLoader;
+import io.doindev.cvector.rules.RulesConfigResolver;
 import io.doindev.cvector.rules.RulesEngine;
 import io.doindev.cvector.rules.Violation;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplication;
@@ -59,7 +60,13 @@ public class RulesController {
         Path rulesPath = configRoot != null
                 ? configRoot.resolve(".cvector").resolve("rules.yml")
                 : null;
-        RulesConfig rulesCfg = RulesConfigLoader.loadOrDefault(rulesPath);
+        // Load the workspace config so the resolver can pull `rules` (global) and the active
+        // project's `rules` override out of settings.json. Falls back to null if the config
+        // can't be loaded — resolver treats that as "defaults + rules.yml only" so the
+        // dashboard keeps working even before init has written settings.json.
+        CvectorConfig cfg = loadConfigSilently(configRoot);
+        String projectKey = cfg != null ? cfg.activeProject() : null;
+        RulesConfig rulesCfg = RulesConfigResolver.resolve(cfg, projectKey, rulesPath);
 
         RulesEngine engine = new RulesEngine(project.projectId(), store, rulesCfg);
         RulesEngine.Report report = engine.run();
@@ -112,6 +119,15 @@ public class RulesController {
         try {
             Path cwd = Paths.get("").toAbsolutePath();
             return configService.findConfigRoot(cwd);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private CvectorConfig loadConfigSilently(Path configRoot) {
+        if (configRoot == null) return null;
+        try {
+            return configService.load(configRoot);
         } catch (Exception e) {
             return null;
         }

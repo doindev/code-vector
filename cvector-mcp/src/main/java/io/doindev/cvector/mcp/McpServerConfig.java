@@ -68,8 +68,10 @@ public class McpServerConfig {
     }
 
     @Bean
-    public CvectorTools cvectorTools(GraphStore mcpGraphStore, McpActiveProject mcpActiveProject) {
-        return new CvectorTools(mcpGraphStore, mcpActiveProject);
+    public CvectorTools cvectorTools(GraphStore mcpGraphStore,
+                                     McpActiveProject mcpActiveProject,
+                                     CvectorConfigService configService) {
+        return new CvectorTools(mcpGraphStore, mcpActiveProject, configService);
     }
 
     @Bean

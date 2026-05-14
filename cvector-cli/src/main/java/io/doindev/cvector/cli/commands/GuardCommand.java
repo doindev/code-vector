@@ -4,7 +4,7 @@ import io.doindev.cvector.cli.CvectorRuntime;
 import io.doindev.cvector.core.config.CvectorConfig;
 import io.doindev.cvector.core.store.GraphStore;
 import io.doindev.cvector.rules.RulesConfig;
-import io.doindev.cvector.rules.RulesConfigLoader;
+import io.doindev.cvector.rules.RulesConfigResolver;
 import io.doindev.cvector.rules.RulesEngine;
 import io.doindev.cvector.rules.Severity;
 import io.doindev.cvector.rules.Violation;
@@ -68,7 +68,8 @@ public class GuardCommand implements Callable<Integer> {
 
         CvectorConfig cfg = runtime.loadConfig();
         CvectorConfig.ProjectEntry active = runtime.requireActiveProject(cfg);
-        RulesConfig rulesCfg = RulesConfigLoader.loadOrDefault(configRoot.resolve(".cvector").resolve("rules.yml"));
+        Path rulesYml = configRoot.resolve(".cvector").resolve("rules.yml");
+        RulesConfig rulesCfg = RulesConfigResolver.resolve(cfg, cfg.activeProject(), rulesYml);
         applyOverrides(rulesCfg);
 
         try (GraphStore store = runtime.openGraphStore(cfg)) {

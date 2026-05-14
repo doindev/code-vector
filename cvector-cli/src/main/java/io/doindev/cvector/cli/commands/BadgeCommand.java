@@ -6,7 +6,7 @@ import io.doindev.cvector.cli.CvectorRuntime;
 import io.doindev.cvector.core.config.CvectorConfig;
 import io.doindev.cvector.core.store.GraphStore;
 import io.doindev.cvector.rules.RulesConfig;
-import io.doindev.cvector.rules.RulesConfigLoader;
+import io.doindev.cvector.rules.RulesConfigResolver;
 import io.doindev.cvector.rules.RulesEngine;
 import io.doindev.cvector.rules.Severity;
 import org.springframework.stereotype.Component;
@@ -59,7 +59,7 @@ public class BadgeCommand implements Callable<Integer> {
             String pid = active.projectId();
             Map<String, Long> nodes = store.nodeCounts(pid);
             List<Badge> badges = new ArrayList<>();
-            badges.add(rulesBadge(store, active, pid));
+            badges.add(rulesBadge(store, cfg, active, pid));
 
             long deps = nodes.getOrDefault("MavenDependency", 0L);
             badges.add(new Badge("dependencies", String.valueOf(deps), deps == 0 ? "lightgrey" : "blue"));
@@ -95,9 +95,9 @@ public class BadgeCommand implements Callable<Integer> {
         return 0;
     }
 
-    private Badge rulesBadge(GraphStore store, CvectorConfig.ProjectEntry active, String pid) {
+    private Badge rulesBadge(GraphStore store, CvectorConfig cfg, CvectorConfig.ProjectEntry active, String pid) {
         Path rulesYml = Path.of(active.rootPath()).resolve(".cvector").resolve("rules.yml");
-        RulesConfig rulesCfg = RulesConfigLoader.loadOrDefault(rulesYml);
+        RulesConfig rulesCfg = RulesConfigResolver.resolve(cfg, cfg.activeProject(), rulesYml);
         RulesEngine.Report report = new RulesEngine(pid, store, rulesCfg).run();
         if (report.hasErrors()) return new Badge("cvector rules", "failing", "red");
         int warn = report.bySeverity().getOrDefault(Severity.WARN.name(), 0);

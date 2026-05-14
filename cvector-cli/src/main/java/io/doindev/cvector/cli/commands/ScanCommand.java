@@ -69,7 +69,7 @@ public class ScanCommand implements Callable<Integer> {
                 return 1;
             }
             cfg = new CvectorConfig(project, cfg.projects(), cfg.neo4j(),
-                    cfg.backend(), cfg.rest(), cfg.mcp(), cfg.docker());
+                    cfg.backend(), cfg.rest(), cfg.mcp(), cfg.docker(), cfg.rules());
         }
         ProjectContext ctx = runtime.projectContext(cfg);
         Path scanRoot = path.toAbsolutePath().normalize();

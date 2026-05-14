@@ -6,6 +6,7 @@ import io.doindev.cvector.core.config.CvectorConfig;
 import io.doindev.cvector.core.store.GraphStore;
 import io.doindev.cvector.rules.RulesConfig;
 import io.doindev.cvector.rules.RulesConfigLoader;
+import io.doindev.cvector.rules.RulesConfigResolver;
 import io.doindev.cvector.rules.RulesEngine;
 import io.doindev.cvector.rules.Violation;
 import org.springframework.stereotype.Component;
@@ -54,7 +55,8 @@ public class RulesCommand implements Callable<Integer> {
 
         CvectorConfig cfg = runtime.loadConfig();
         CvectorConfig.ProjectEntry active = runtime.requireActiveProject(cfg);
-        RulesConfig rulesCfg = RulesConfigLoader.loadOrDefault(rulesPath);
+        // Layer defaults → rules.yml → workspace settings.json `rules` → per-project rules.
+        RulesConfig rulesCfg = RulesConfigResolver.resolve(cfg, cfg.activeProject(), rulesPath);
 
         try (GraphStore store = runtime.openGraphStore(cfg)) {
             RulesEngine engine = new RulesEngine(active.projectId(), store, rulesCfg);
