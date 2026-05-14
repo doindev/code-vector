@@ -505,6 +505,27 @@ public final class Neo4jGraphStore implements GraphStore {
     }
 
     @Override
+    public Map<String, Long> bulkCalleeCounts(String projectId, List<String> ids) {
+        Map<String, Long> out = new LinkedHashMap<>();
+        if (ids == null || ids.isEmpty()) return out;
+        Map<String, Object> params = new LinkedHashMap<>();
+        params.put("pid", projectId);
+        params.put("ids", ids);
+        List<Map<String, Object>> rows = queries.raw(
+                "MATCH (src {projectId: $pid})-[:CALLS]->(dst {projectId: $pid}) "
+                        + "WHERE src.id IN $ids "
+                        + "RETURN src.id AS sourceId, count(dst) AS cnt", params);
+        for (String id : ids) out.put(id, 0L);
+        for (Map<String, Object> r : rows) {
+            Object sid = r.get("sourceId");
+            if (sid == null) continue;
+            long cnt = (r.get("cnt") instanceof Number n) ? n.longValue() : 0L;
+            out.put(sid.toString(), cnt);
+        }
+        return out;
+    }
+
+    @Override
     public Map<String, java.util.Set<String>> bulkImpactedIds(String projectId, List<String> ids, int depth) {
         Map<String, java.util.Set<String>> out = new LinkedHashMap<>();
         if (ids == null || ids.isEmpty()) return out;

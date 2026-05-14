@@ -332,6 +332,24 @@ public interface GraphStore extends AutoCloseable {
     }
 
     /**
+     * Bulk outgoing-CALLS counter. Returns {@code id → callee-count} for every id in the
+     * input. Used by the dashboard graph view's drill indicator: the badge inside each node
+     * tells the user how many children they can drill into without having to expand first.
+     *
+     * <p>Default impl loops via {@link #callees}; backends override with a single grouped
+     * COUNT query so a 200-node slice is one round-trip instead of 200.
+     */
+    default Map<String, Long> bulkCalleeCounts(String projectId, List<String> ids) {
+        Map<String, Long> out = new java.util.LinkedHashMap<>();
+        if (ids == null || ids.isEmpty()) return out;
+        for (String id : ids) {
+            if (id == null || id.isBlank()) continue;
+            out.put(id, (long) callees(projectId, id).size());
+        }
+        return out;
+    }
+
+    /**
      * Find groups of Method nodes that look like duplicates — same name, same paramCount,
      * same returnType, and similar body length. Each group has at least {@code minOccurrences}
      * members. The result is a list of group records:

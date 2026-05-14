@@ -21,9 +21,13 @@ import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
 import picocli.CommandLine.Parameters;
 
+import java.io.IOException;
+import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.SimpleFileVisitor;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.util.ArrayList;
@@ -34,7 +38,6 @@ import java.util.Optional;
 import java.util.concurrent.Callable;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
-import java.util.stream.Stream;
 
 @Component
 @Command(name = "scan", description = "Scan a path and ingest into Neo4j.", mixinStandardHelpOptions = true)
@@ -425,54 +428,64 @@ public class ScanCommand implements Callable<Integer> {
         // class-level mutable caches use ConcurrentHashMap, JavaParser is held in a ThreadLocal).
         // The sink (`Ingestor` / `KuzuIngestor`) serialises via `synchronized accept`, so concurrent
         // emits are safe; the speedup comes from parallel AST construction across worker threads.
-        try (Stream<Path> walk = Files.walk(scanRoot)) {
-            walk.parallel()
-                    .filter(Files::isRegularFile)
-                    .filter(ScanCommand::notInIgnored)
-                    .forEach(file -> {
-                        List<Parser> ps = dispatch(file, byExt, customAccepts);
-                        if (ps.isEmpty()) return;
+        //
+        // collectScanFiles uses walkFileTree (not Files.walk) so that a single unreadable
+        // directory or file does not abort the entire scan -- visitFileFailed returns
+        // CONTINUE, and ignored directories are pruned at preVisitDirectory time so we never
+        // even try to enumerate inside node_modules / .git / etc.
+        List<Path> files = collectScanFiles(scanRoot);
+        files.parallelStream().forEach(file -> {
+            try {
+                List<Parser> ps = dispatch(file, byExt, customAccepts);
+                if (ps.isEmpty()) return;
 
-                        String relPath = ctx.rootPath().relativize(file).toString().replace('\\', '/');
+                String relPath = ctx.rootPath().relativize(file).toString().replace('\\', '/');
 
-                        // Compute the file's content hash exactly once per scan. Used by both the
-                        // skip-check (if a prior hash matches we don't re-parse) and the post-scan
-                        // stamp (so the NEXT scan can skip this file). Previously the function
-                        // was called twice per file — duplicated I/O + SHA-256 on a parallel hot
-                        // path. Single-call version saves the second read + digest.
-                        String currentHash = fileContentHash(file);
+                // Compute the file's content hash exactly once per scan. Used by both the
+                // skip-check (if a prior hash matches we don't re-parse) and the post-scan
+                // stamp (so the NEXT scan can skip this file). Previously the function
+                // was called twice per file — duplicated I/O + SHA-256 on a parallel hot
+                // path. Single-call version saves the second read + digest.
+                String currentHash = fileContentHash(file);
 
-                        // Content-hash skip: if a prior scan recorded this exact bytes-hash for
-                        // this file, the parser output would be byte-identical, so re-parsing is
-                        // pure waste. Mark the prior nodes as still-alive and move on.
-                        if (canSkip) {
-                            FileSnapshot prior = existingFiles.get(relPath);
-                            if (prior != null && prior.contentHash() != null
-                                    && currentHash != null && currentHash.equals(prior.contentHash())) {
-                                skipTouchedIds.addAll(prior.nodeIds());
-                                skipped.incrementAndGet();
-                                fileCount.incrementAndGet();
-                                return;
-                            }
-                        }
-
-                        for (Parser p : ps) p.parse(file, ctx, sink);
-
-                        // Stamp the file's contentHash so the NEXT scan can skip it. We piggyback
-                        // on whichever File NodeKey the parsers produced — all parsers use the
-                        // same identity (projectId, "File", relPath) by convention, so this
-                        // NodeUpsert merges into the existing record's property map.
-                        if (currentHash != null) {
-                            NodeKey fk = new NodeKey(ctx.projectId(), "File", relPath);
-                            Map<String, Object> hashProp = new HashMap<>();
-                            // Use fileContentHash, NOT contentHash -- the latter is the per-node
-                            // property-map hash that the ingestor computes internally.
-                            hashProp.put("fileContentHash", currentHash);
-                            sink.accept(new GraphEvent.NodeUpsert(fk, hashProp));
-                        }
+                // Content-hash skip: if a prior scan recorded this exact bytes-hash for
+                // this file, the parser output would be byte-identical, so re-parsing is
+                // pure waste. Mark the prior nodes as still-alive and move on.
+                if (canSkip) {
+                    FileSnapshot prior = existingFiles.get(relPath);
+                    if (prior != null && prior.contentHash() != null
+                            && currentHash != null && currentHash.equals(prior.contentHash())) {
+                        skipTouchedIds.addAll(prior.nodeIds());
+                        skipped.incrementAndGet();
                         fileCount.incrementAndGet();
-                    });
-        }
+                        return;
+                    }
+                }
+
+                for (Parser p : ps) p.parse(file, ctx, sink);
+
+                // Stamp the file's contentHash so the NEXT scan can skip it. We piggyback
+                // on whichever File NodeKey the parsers produced — all parsers use the
+                // same identity (projectId, "File", relPath) by convention, so this
+                // NodeUpsert merges into the existing record's property map.
+                if (currentHash != null) {
+                    NodeKey fk = new NodeKey(ctx.projectId(), "File", relPath);
+                    Map<String, Object> hashProp = new HashMap<>();
+                    // Use fileContentHash, NOT contentHash -- the latter is the per-node
+                    // property-map hash that the ingestor computes internally.
+                    hashProp.put("fileContentHash", currentHash);
+                    sink.accept(new GraphEvent.NodeUpsert(fk, hashProp));
+                }
+                fileCount.incrementAndGet();
+            } catch (Throwable t) {
+                // Catch-all so one bad file (parser bug, ingestor failure, OOM on a huge
+                // input, unexpected RuntimeException) cannot short-circuit the parallel
+                // stream and skip every remaining file. Per-parser IOException handling
+                // already covers normal "couldn't read this file" cases; this is the
+                // backstop for everything else.
+                System.err.printf("scan: failed processing %s: %s%n", file, t);
+            }
+        });
         for (Parser p : parsers) p.finish();
         int skippedCount = skipped.get();
         if (skippedCount > 0) {
@@ -622,6 +635,57 @@ public class ScanCommand implements Callable<Integer> {
         props.put("rootPath", ctx.rootPath().toString());
         if (head != null) props.put("lastScanCommit", head);
         sink.accept(new GraphEvent.NodeUpsert(projectKey, props));
+    }
+
+    /**
+     * Walk {@code scanRoot} and return every regular file we should consider for parsing.
+     *
+     * <p>Uses {@link Files#walkFileTree} rather than {@link Files#walk} so that I/O failures
+     * encountered during the walk do not abort the entire scan. {@code Files.walk} surfaces
+     * directory-listing errors as {@code UncheckedIOException} thrown from the stream pipeline
+     * — a single permission-denied subdirectory (common on Windows, or when scanning paths
+     * outside the user's home) would terminate the walk and silently drop every file the
+     * walker hadn't reached yet. {@code walkFileTree} gives us {@code visitFileFailed} which
+     * returns {@code CONTINUE}, so the walk keeps going.
+     *
+     * <p>Ignored directories are also pruned at {@code preVisitDirectory} time. The previous
+     * {@code Files.walk(...).filter(notInIgnored)} pipeline still descended into
+     * {@code node_modules}, {@code .git}, {@code target}, etc. and enumerated their full
+     * contents before filtering — wasted I/O and a source of permission errors. Returning
+     * {@code SKIP_SUBTREE} for those directories avoids both.
+     */
+    private static List<Path> collectScanFiles(Path scanRoot) throws IOException {
+        List<Path> out = new ArrayList<>();
+        Files.walkFileTree(scanRoot, new SimpleFileVisitor<Path>() {
+            @Override
+            public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
+                if (!notInIgnored(dir)) return FileVisitResult.SKIP_SUBTREE;
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+                if (attrs.isRegularFile() && notInIgnored(file)) out.add(file);
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult visitFileFailed(Path file, IOException exc) {
+                // Permission denied, broken symlink, file deleted mid-walk, Windows ACL
+                // weirdness, etc. Log and keep going so we still scan everything else.
+                System.err.printf("scan: skipping unreadable entry %s: %s%n", file, exc.getMessage());
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult postVisitDirectory(Path dir, IOException exc) {
+                if (exc != null) {
+                    System.err.printf("scan: incomplete read of %s: %s%n", dir, exc.getMessage());
+                }
+                return FileVisitResult.CONTINUE;
+            }
+        });
+        return out;
     }
 
     private static boolean notInIgnored(Path p) {

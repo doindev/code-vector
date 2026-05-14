@@ -16,6 +16,7 @@ import { ActivatedRoute } from '@angular/router';
 
 import { QueryCardComponent } from './query-card.component';
 import { CypherRefService } from '../../core/cypher-ref.service';
+import { formatCypher } from '../../core/cypher-format';
 
 interface QueryRecord {
   readonly id: string;
@@ -606,25 +607,17 @@ export class QueryComponent implements OnInit {
   }
 
   /**
-   * Minimal Cypher formatter — normalizes whitespace and uppercases the major clause
-   * keywords so a hand-typed query reads consistently. Stays on one line; for true
-   * multi-line layout, the user can open the Full screen editor.
+   * Rewrites the top-bar cypher so each top-level clause sits on its own line, AND/OR
+   * sub-predicates indent on continuation lines, and keywords are uppercased. Strings,
+   * back-tick identifiers, and comments are preserved exactly. Implemented in the pure
+   * {@link formatCypher} util so the same logic can be reused elsewhere (and tested).
+   *
+   * <p>The textarea auto-resizes through the constructor's effect on {@code topCypher},
+   * so the height grows to fit the new multi-line output without any extra plumbing.
    */
   formatTopCypher(): void {
     const src = this.topCypher();
     if (!src.trim()) return;
-    const keywords = [
-      'MATCH', 'OPTIONAL MATCH', 'WHERE', 'WITH', 'RETURN', 'ORDER BY', 'LIMIT', 'SKIP',
-      'CREATE', 'MERGE', 'DELETE', 'DETACH DELETE', 'SET', 'REMOVE', 'UNWIND',
-      'CALL', 'YIELD', 'FOREACH', 'UNION', 'AS', 'AND', 'OR', 'NOT',
-    ];
-    let out = src.replace(/\s+/g, ' ').trim();
-    for (const kw of keywords) {
-      // Word-boundary, case-insensitive replace — uppercases the keyword in place
-      // without touching identifiers that happen to contain the same letters.
-      const re = new RegExp(`\\b${kw.replace(/ /g, '\\s+')}\\b`, 'gi');
-      out = out.replace(re, kw);
-    }
-    this.topCypher.set(out);
+    this.topCypher.set(formatCypher(src));
   }
 }

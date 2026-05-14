@@ -116,8 +116,19 @@ public class GraphSliceController {
             }
         }
 
+        // One grouped query gives accurate "drillable from here" counts for every node in
+        // the slice — including the outermost BFS layer whose own callees were never visited
+        // (so the slice edges alone would report 0 for those nodes). Dashboard graph view
+        // renders this inside each node as a drill-discovery hint.
+        Map<String, Long> calleeCounts = store.bulkCalleeCounts(pid, new ArrayList<>(nodes.keySet()));
+        for (Map<String, Object> n : nodes.values()) {
+            Long count = calleeCounts.get(String.valueOf(n.get("id")));
+            n.put("calleeCount", count == null ? 0L : count);
+        }
+
+        Map<String, Object> seedNode = nodes.get(seedId);  // already enriched with calleeCount
         Map<String, Object> out = new LinkedHashMap<>();
-        out.put("seed", projectNode(seed, true));
+        out.put("seed", seedNode);
         out.put("nodes", new ArrayList<>(nodes.values()));
         out.put("edges", edges);
         out.put("requested", Map.of(

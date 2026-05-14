@@ -777,6 +777,30 @@ public final class KuzuGraphStore implements GraphStore {
     }
 
     @Override
+    public Map<String, Long> bulkCalleeCounts(String projectId, List<String> ids) {
+        Map<String, Long> out = new LinkedHashMap<>();
+        if (ids == null || ids.isEmpty()) return out;
+        String inList = quoteListOrEmpty(ids);
+        if (inList == null) return out;
+        try {
+            List<Map<String, Object>> rows = kuzu.read(
+                    "MATCH (src:Node)-[:CALLS]->(dst:Node) "
+                            + "WHERE src.id IN " + inList + " "
+                            + "RETURN src.id AS sourceId, count(dst) AS cnt");
+            for (String id : ids) out.put(id, 0L);
+            for (Map<String, Object> r : rows) {
+                Object sid = r.get("sourceId");
+                if (sid == null) continue;
+                long cnt = (r.get("cnt") instanceof Number n) ? n.longValue() : 0L;
+                out.put(sid.toString(), cnt);
+            }
+            return out;
+        } catch (RuntimeException ignored) {
+            return GraphStore.super.bulkCalleeCounts(projectId, ids);
+        }
+    }
+
+    @Override
     public Map<String, java.util.Set<String>> bulkImpactedIds(String projectId, List<String> ids, int depth) {
         Map<String, java.util.Set<String>> out = new LinkedHashMap<>();
         if (ids == null || ids.isEmpty()) return out;
