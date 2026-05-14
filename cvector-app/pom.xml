@@ -133,43 +133,32 @@
                         `mvn clean` (which would invalidate the rest of the reactor's compiled
                         output and add ~30 s to every rebuild).
 
-                        Uses antrun rather than maven-clean-plugin because Windows Defender
-                        real-time scanning holds a transient handle on a freshly-jpackaged
-                        cvector.exe for several seconds. maven-clean-plugin retries 10× with a
-                        100 ms gap (~1 s total) which isn't always enough; antrun's `<delete>`
-                        with `failonerror="false"` + a 2 s sleep + a final authoritative delete
-                        gives Defender time to release the handle on iterative rebuilds.
+                        Windows note: if you're on Windows with Defender real-time scanning
+                        enabled, this delete can fail when Defender holds an open handle to a
+                        freshly-built cvector.exe from a prior build. Easiest permanent fix is
+                        to add {@code cvector-app/target/} to Defender's folder exclusions
+                        (Settings → Windows Security → Virus & threat protection → Manage
+                        settings → Exclusions → Add an exclusion → Folder). Without that, the
+                        one-shot workaround is {@code rm -rf cvector-app/target/dist} before
+                        the rebuild, or {@code mvn clean -Pdist install} for a full clean.
                     -->
                     <plugin>
                         <groupId>org.apache.maven.plugins</groupId>
-                        <artifactId>maven-antrun-plugin</artifactId>
+                        <artifactId>maven-clean-plugin</artifactId>
                         <executions>
                             <execution>
                                 <id>clean-dist-before-jpackage</id>
                                 <phase>pre-integration-test</phase>
                                 <goals>
-                                    <goal>run</goal>
+                                    <goal>clean</goal>
                                 </goals>
                                 <configuration>
-                                    <target>
-                                        <!--
-                                            Poll-delete loop. Windows Defender real-time scan can
-                                            hold a freshly-built cvector.exe for 5–15 seconds; one
-                                            attempt isn't enough. Five attempts spaced 3 s apart
-                                            (~12 s max wait) covers the typical hold window. Only
-                                            the final delete fails the build — earlier failures are
-                                            swallowed so we keep retrying.
-                                        -->
-                                        <delete dir="${project.build.directory}/dist" failonerror="false"/>
-                                        <sleep seconds="3"/>
-                                        <delete dir="${project.build.directory}/dist" failonerror="false"/>
-                                        <sleep seconds="3"/>
-                                        <delete dir="${project.build.directory}/dist" failonerror="false"/>
-                                        <sleep seconds="3"/>
-                                        <delete dir="${project.build.directory}/dist" failonerror="false"/>
-                                        <sleep seconds="3"/>
-                                        <delete dir="${project.build.directory}/dist"/>
-                                    </target>
+                                    <excludeDefaultDirectories>true</excludeDefaultDirectories>
+                                    <filesets>
+                                        <fileset>
+                                            <directory>${project.build.directory}/dist</directory>
+                                        </fileset>
+                                    </filesets>
                                 </configuration>
                             </execution>
                         </executions>

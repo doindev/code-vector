@@ -127,6 +127,16 @@ Zip the `cvector/` directory and hand it to anyone on Windows — they unzip, ru
 
 The plugin is `org.panteleyev:jpackage-maven-plugin`, bound to the `verify` phase under the `dist` profile so a normal `mvn package` skips it. Builds for the host OS only — to produce a Linux or macOS distributable, run the same `mvn -Pdist` on that host.
 
+#### Windows: `Unable to delete cvector.exe` on rebuild
+
+On Windows, a second `mvn -Pdist install` against an existing `target/dist/` can fail with `Unable to delete ...\dist\cvector\cvector.exe`. The cause is Windows Defender (or another AV) holding a real-time-scan handle on the freshly-built `cvector.exe` from the prior run — `<delete>` retries don't help because each retry re-touches the file and re-triggers the scan.
+
+Three ways out (top to bottom: most permanent → most ad-hoc):
+
+1. **Add `cvector-app/target/` to Defender's folder exclusions** *(recommended for active dev)*. Settings → Windows Security → Virus & threat protection → Manage settings → Exclusions → Add an exclusion → Folder → pick `<repo>\cvector-app\target`. One-time setup; subsequent rebuilds run unimpeded.
+2. **Full clean every time.** `mvn clean -Pdist,dashboard-ui -DskipTests install`. Adds ~30 s to recompile the reactor but works without any Defender tweaks.
+3. **Manual nuke between builds.** `rm -rf cvector-app/target/dist && mvn -Pdist,dashboard-ui -DskipTests install`. Skips the recompile cost; just deletes the conflicting dist tree (Defender releases the handle once the rebuild isn't active).
+
 ---
 
 ## Backends & settings.json
