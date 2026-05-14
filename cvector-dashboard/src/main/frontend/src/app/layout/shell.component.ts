@@ -1,9 +1,13 @@
 import { ChangeDetectionStrategy, Component, computed, inject, signal } from '@angular/core';
+import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { NgClass } from '@angular/common';
-import { Router, RouterLink, RouterLinkActive, RouterOutlet } from '@angular/router';
+import { NavigationEnd, Router, RouterLink, RouterLinkActive, RouterOutlet } from '@angular/router';
+import { filter } from 'rxjs';
 
 import { ThemeService } from '../core/theme.service';
+import { CypherRefService } from '../core/cypher-ref.service';
 import { CommandPaletteComponent } from './command-palette.component';
+import { CypherRefPanelComponent } from './cypher-ref-panel.component';
 
 interface NavItem {
   readonly label: string;
@@ -85,7 +89,7 @@ const HIDE_DELAY_MS = 400;
 @Component({
   selector: 'cv-shell',
   standalone: true,
-  imports: [NgClass, RouterLink, RouterLinkActive, RouterOutlet, CommandPaletteComponent],
+  imports: [NgClass, RouterLink, RouterLinkActive, RouterOutlet, CommandPaletteComponent, CypherRefPanelComponent],
   changeDetection: ChangeDetectionStrategy.OnPush,
   template: `
     <div class="cv-shell">
@@ -141,6 +145,9 @@ const HIDE_DELAY_MS = 400;
           </button>
         </div>
       </aside>
+      @if (cypherRef.visible() && isQueryRoute()) {
+        <cv-cypher-ref-panel />
+      }
       <main class="cv-content" (click)="closeFlyout()">
         <router-outlet />
       </main>
@@ -152,11 +159,29 @@ const HIDE_DELAY_MS = 400;
 export class ShellComponent {
   readonly nav = NAV;
   readonly theme = inject(ThemeService);
+  readonly cypherRef = inject(CypherRefService);
   readonly themeIcon = computed(() =>
     this.theme.theme() === 'dark' ? 'bi-sun' : 'bi-moon-stars'
   );
 
   private readonly router = inject(Router);
+
+  /** Current top-level URL (updated on NavigationEnd) — drives the per-route gating of
+      the Cypher Reference panel which only exists on /query. */
+  private readonly currentUrl = signal(this.router.url);
+  readonly isQueryRoute = computed(() => {
+    const u = this.currentUrl();
+    return u === '/query' || u.startsWith('/query?') || u.startsWith('/query/') || u.startsWith('/query#');
+  });
+
+  constructor() {
+    this.router.events
+      .pipe(
+        filter((e): e is NavigationEnd => e instanceof NavigationEnd),
+        takeUntilDestroyed(),
+      )
+      .subscribe((e) => this.currentUrl.set(e.urlAfterRedirects));
+  }
 
   /** Which section's flyout is currently visible (title), or '' for none. */
   readonly openSection = signal<string>('');

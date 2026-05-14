@@ -7,10 +7,18 @@
 .cv-shell {
   display: grid;
   // Narrow icon-rail sidebar — flyouts overlay the content area so the rail itself
-  // doesn't need to be wide enough to fit a full menu.
-  grid-template-columns: 84px 1fr;
+  // doesn't need to be wide enough to fit a full menu. The optional middle column
+  // (auto) is the Cypher Reference panel; CSS Grid collapses it to 0 width when
+  // the column has no contents because the panel uses an @if in the template.
+  // The children are explicitly pinned to their columns below so that main always
+  // lives in the 1fr track regardless of whether the panel is rendered.
+  grid-template-columns: 84px auto 1fr;
   height: 100%;
 }
+
+.cv-shell > .cv-sidebar { grid-column: 1; }
+.cv-shell > cv-cypher-ref-panel { grid-column: 2; }
+.cv-shell > .cv-content { grid-column: 3; }
 
 .cv-sidebar {
   position: relative;  // anchor for the absolutely-positioned flyout
@@ -203,4 +211,11 @@
   overflow-y: auto;
   padding: var(--cv-content-pad);
   background: var(--bs-body-bg);
+
+  // When the query view is mounted, drop the right inset so the scrolling card list
+  // can extend flush to the right edge. The qbar restores its own right padding
+  // internally so the textarea stays visually aligned.
+  &:has(cv-query) {
+    padding-right: 0;
+  }
 }

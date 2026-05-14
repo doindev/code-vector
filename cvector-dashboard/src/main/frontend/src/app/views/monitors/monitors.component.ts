@@ -3,6 +3,7 @@ import {
   Component,
   DestroyRef,
   OnInit,
+  computed,
   inject,
   signal,
 } from '@angular/core';
@@ -19,6 +20,14 @@ interface MonitoredPath {
   readonly path: string;
   readonly enabled: boolean;
   readonly addedAt: string;
+}
+
+interface ProjectsResponse {
+  readonly active?: {
+    readonly projectId?: string;
+    readonly name?: string;
+    readonly rootPath?: string;
+  };
 }
 
 interface WatcherStats {
@@ -61,19 +70,32 @@ interface StatusPayload {
       <div class="cv-surface mb-3">
         <div class="row g-2 align-items-end">
           <div class="col-md-9">
-            <label class="form-label small text-secondary">Absolute path</label>
+            <label class="form-label small text-secondary">
+              Absolute path
+              @if (projectRoot()) {
+                <span class="ms-2 text-secondary">
+                  · must be inside <code>{{ projectRoot() }}</code>
+                </span>
+              }
+            </label>
             <div class="input-group">
               <input class="form-control"
                      [ngModel]="newPath()"
                      (ngModelChange)="newPath.set($event)"
                      (keydown.enter)="add()"
-                     placeholder="C:\\path\\to\\project" />
+                     [placeholder]="projectRoot() || 'C:\\path\\to\\project'" />
               <button class="btn btn-outline-secondary" type="button"
                       (click)="pickerOpen.set(true)"
                       title="Browse for a folder">
                 <i class="bi bi-folder2-open"></i>
               </button>
             </div>
+            @if (newPath() && projectRoot() && !pathInsideProject()) {
+              <div class="form-text text-warning">
+                <i class="bi bi-exclamation-triangle"></i>
+                This path is outside the active project — the monitor will be rejected.
+              </div>
+            }
           </div>
           <div class="col-md-3 d-flex gap-2">
             <button class="btn btn-primary flex-grow-1" (click)="add()"
@@ -162,7 +184,8 @@ interface StatusPayload {
       Persisted at <code>~/.cvector/dashboard.json</code>. Counters update every 3 seconds.
     </p>
 
-    <cv-folder-picker [open]="pickerOpen()" [initialPath]="newPath()"
+    <cv-folder-picker [open]="pickerOpen()"
+                      [initialPath]="newPath() || projectRoot()"
                       (selected)="onPickerSelect($event)"
                       (cancel)="pickerOpen.set(false)" />
   `,
@@ -175,6 +198,17 @@ export class MonitorsComponent implements OnInit {
   readonly showAdd = signal(false);
   readonly newPath = signal('');
   readonly pickerOpen = signal(false);
+  /** Active project root — gates which paths the backend will accept as monitor targets. */
+  readonly projectRoot = signal<string>('');
+  /** True when the typed path is the project root or a descendant. Pure visual prefix check. */
+  readonly pathInsideProject = computed(() => {
+    const root = this.projectRoot();
+    const path = this.newPath().trim();
+    if (!root || !path) return true;  // nothing to flag yet
+    const sep = root.includes('\\') ? '\\' : '/';
+    const normRoot = root.replace(/[\\/]+$/, '');
+    return path === normRoot || path.startsWith(normRoot + sep);
+  });
   readonly loading = signal(true);
   readonly saving = signal(false);
   readonly error = signal('');
@@ -184,11 +218,19 @@ export class MonitorsComponent implements OnInit {
   ngOnInit(): void {
     this.refresh();
     this.refreshStatus();
+    this.fetchProjectRoot();
     // 3-second polling for live counters. Component-scoped via takeUntilDestroyed -- no
     // explicit unsubscribe needed; Angular tears down with the view.
     visiblePoll(3000)
       .pipe(takeUntilDestroyed(this.destroyRef))
       .subscribe(() => this.refreshStatus());
+  }
+
+  private fetchProjectRoot(): void {
+    this.http.get<ProjectsResponse>('/api/projects').subscribe({
+      next: (r) => this.projectRoot.set(r?.active?.rootPath ?? ''),
+      error: () => {},  // non-fatal — backend still gates the path
+    });
   }
 
   refresh(): void {

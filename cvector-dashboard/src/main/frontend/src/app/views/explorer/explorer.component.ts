@@ -18,6 +18,7 @@ import { Router, RouterLink } from '@angular/router';
 import cytoscape, { Core, ElementDefinition } from 'cytoscape';
 
 import { ApiService } from '../../core/api.service';
+import { ThemeService } from '../../core/theme.service';
 
 interface LabelRow { readonly name: string; readonly count: number; }
 interface ConnRow {
@@ -279,6 +280,7 @@ export class ExplorerComponent implements OnInit, AfterViewInit, OnDestroy {
   private readonly http = inject(HttpClient);
   private readonly router = inject(Router);
   private readonly injector = inject(Injector);
+  private readonly themeSvc = inject(ThemeService);
   private readonly schemaCanvas = viewChild<ElementRef<HTMLDivElement>>('schemaCy');
   private schemaCy?: Core;
 
@@ -299,6 +301,65 @@ export class ExplorerComponent implements OnInit, AfterViewInit, OnDestroy {
         this.renderMetaGraph(s.connectivity);
       }
     });
+    // Cytoscape doesn't resolve CSS variables at draw time — its renderer treats them
+    // as opaque strings — so edge / node labels read as near-black regardless of the
+    // active Bootstrap theme. Reapply concrete colours whenever the theme flips.
+    effect(() => {
+      this.themeSvc.theme();  // dependency
+      if (this.schemaCy) this.schemaCy.style().fromJson(this.cyStyle()).update();
+    });
+  }
+
+  /** Concrete colour palette for cytoscape, keyed off the active Bootstrap theme. */
+  private cyStyle(): cytoscape.StylesheetJson {
+    const dark = this.themeSvc.theme() === 'dark';
+    const labelColor = dark ? '#e9ecef' : '#212529';
+    const edgeColor = dark ? '#cbd1d7' : '#495057';
+    const lineColor = dark ? '#5b6470' : '#ced4da';
+    const bodyBg = dark ? '#212529' : '#ffffff';
+    const borderColor = dark ? '#495057' : '#dee2e6';
+    return [
+      {
+        selector: 'node',
+        style: {
+          'background-color': 'data(color)',
+          'label': 'data(label)',
+          'color': labelColor,
+          /* Font size tracks node weight so heavier-weighted labels read larger; range
+             is tuned to fit the 28-70px diameter mapping below. */
+          'font-size': 'mapData(weight, 1, 5000, 9, 18)',
+          'font-weight': 700,
+          'text-halign': 'center',
+          'text-valign': 'center',
+          'text-wrap': 'wrap',
+          'text-max-width': 'mapData(weight, 1, 5000, 26, 66)',
+          'text-outline-color': bodyBg,
+          'text-outline-width': 1.5,
+          'width': 'mapData(weight, 1, 5000, 28, 70)',
+          'height': 'mapData(weight, 1, 5000, 28, 70)',
+          'border-width': 2,
+          'border-color': borderColor,
+        },
+      },
+      {
+        selector: 'edge',
+        style: {
+          'width': 'mapData(weight, 1, 10000, 1, 8)',
+          'line-color': lineColor,
+          'curve-style': 'bezier',
+          'target-arrow-shape': 'triangle',
+          'target-arrow-color': lineColor,
+          'label': 'data(label)',
+          'font-size': 9,
+          'color': edgeColor,
+          'text-rotation': 'autorotate',
+          'text-background-color': bodyBg,
+          'text-background-opacity': 0.85,
+          'text-background-padding': '2',
+          'opacity': 0.95,
+        },
+      },
+    ];
   }
 
   ngOnInit(): void {
@@ -327,45 +388,7 @@ export class ExplorerComponent implements OnInit, AfterViewInit, OnDestroy {
     this.schemaCy = cytoscape({
       container: el,
       elements: [],
-      style: [
-        {
-          selector: 'node',
-          style: {
-            // Per-label deterministic colour set via element data.color (see renderMetaGraph).
-            // Falls back to accent if a node didn't get one assigned for some reason.
-            'background-color': 'data(color)',
-            'label': 'data(label)',
-            'color': 'var(--bs-body-color, #1a1a1a)',
-            'font-size': 12,
-            'font-weight': 600,
-            'text-margin-y': -10,
-            'text-halign': 'center',
-            'text-valign': 'top',
-            'width': 'mapData(weight, 1, 5000, 28, 70)',
-            'height': 'mapData(weight, 1, 5000, 28, 70)',
-            'border-width': 2,
-            'border-color': 'var(--bs-border-color, #888)',
-          },
-        },
-        {
-          selector: 'edge',
-          style: {
-            'width': 'mapData(weight, 1, 10000, 1, 8)',
-            'line-color': 'var(--bs-border-color, #888)',
-            'curve-style': 'bezier',
-            'target-arrow-shape': 'triangle',
-            'target-arrow-color': 'var(--bs-border-color, #888)',
-            'label': 'data(label)',
-            'font-size': 9,
-            'color': 'var(--bs-secondary-color, #888)',
-            'text-rotation': 'autorotate',
-            'text-background-color': 'var(--bs-body-bg, #fff)',
-            'text-background-opacity': 0.85,
-            'text-background-padding': '2',
-            'opacity': 0.85,
-          },
-        },
-      ],
+      style: this.cyStyle(),
     });
     // Tap-to-drill: clicking a label node in the schema graph hops to the Query view with
     // a "show me 25 nodes of this label" Cypher pre-loaded. Lets the user go from "what

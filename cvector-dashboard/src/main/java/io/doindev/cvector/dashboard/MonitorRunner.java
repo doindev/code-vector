@@ -19,6 +19,9 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Activates live file-system watchers for every enabled {@link DashboardStore.Monitor}.
@@ -45,6 +48,18 @@ public class MonitorRunner {
     private final List<Parser> parsers;
     private final GraphStore graphStore;
     private final Map<String, CvectorWatcher> active = new ConcurrentHashMap<>();
+    /**
+     * Single-thread executor so monitor (de)activations don't block REST request threads.
+     * Building a {@code DirectoryWatcher} over a large source tree walks the whole tree to
+     * register per-directory watches and can take several seconds; doing that inline made
+     * POST /api/dashboard/monitors look hung. Single-threaded preserves ordering so a
+     * deactivate immediately following an activate runs after, never concurrently.
+     */
+    private final ExecutorService activator = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "monitor-activator");
+        t.setDaemon(true);
+        return t;
+    });
 
     public MonitorRunner(DashboardStore store,
                          ActiveProject project,
@@ -64,6 +79,8 @@ public class MonitorRunner {
 
     @PreDestroy
     void onStop() {
+        activator.shutdownNow();
+        try { activator.awaitTermination(2, TimeUnit.SECONDS); } catch (InterruptedException ignore) { Thread.currentThread().interrupt(); }
         for (CvectorWatcher w : active.values()) {
             try { w.close(); } catch (Exception ignore) { /* shutdown best-effort */ }
         }
@@ -83,6 +100,22 @@ public class MonitorRunner {
             log.warn("monitor '{}' is not a directory; skipping (refresh after the path exists to retry)", m.path());
             return;
         }
+        // Defensive: file events from this watcher will be attributed to ActiveProject's
+        // projectId. If the monitored path is outside the active project root the graph
+        // would be contaminated with unrelated nodes, so we silently skip — the controller
+        // is the gatekeeper for new monitors, this catches stored-then-project-switched cases.
+        Path activeRoot;
+        try {
+            activeRoot = Paths.get(project.rootPath()).toRealPath();
+            Path candidate = root.toRealPath();
+            if (!candidate.equals(activeRoot) && !candidate.startsWith(activeRoot)) {
+                log.warn("monitor '{}' is outside the active project root ({}); skipping", root, activeRoot);
+                return;
+            }
+        } catch (java.io.IOException e) {
+            log.warn("monitor '{}' path-resolution failed; skipping: {}", root, e.getMessage());
+            return;
+        }
         ProjectContext ctx = new ProjectContext(project.projectId(), project.name(), root);
         CvectorWatcher w = new CvectorWatcher(ctx, parsers, graphStore, DEBOUNCE_MS);
         try {
@@ -99,6 +132,21 @@ public class MonitorRunner {
         CvectorWatcher w = active.remove(id);
         if (w == null) return;
         try { w.close(); } catch (Exception ignore) { /* best-effort */ }
+    }
+
+    /**
+     * Fire-and-forget variant of {@link #activate(DashboardStore.Monitor)} for REST callers
+     * that don't want to wait the full DirectoryWatcher setup time. The watcher appears in
+     * {@link #status()} once it's actually running; the dashboard UI polls /status to learn
+     * when that happens.
+     */
+    public void activateAsync(DashboardStore.Monitor m) {
+        activator.submit(() -> activate(m));
+    }
+
+    /** Async counterpart to {@link #deactivate(String)} for symmetry with {@link #activateAsync}. */
+    public void deactivateAsync(String id) {
+        activator.submit(() -> deactivate(id));
     }
 
     /** Diagnostic snapshot for the dashboard. Exposed at {@code GET /api/dashboard/monitors/status}. */

@@ -1,5 +1,6 @@
 package io.doindev.cvector.dashboard;
 
+import io.doindev.cvector.rest.ActiveProject;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -10,6 +11,9 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.io.IOException;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.List;
 import java.util.Map;
 
@@ -29,16 +33,18 @@ public class DashboardController {
     private final ScanRunner scans;
     private final DiffRunner diffs;
     private final RestartRunner restarts;
+    private final ActiveProject project;
 
     public DashboardController(DashboardStore store, ScheduleRunner scheduler,
                                MonitorRunner monitors, ScanRunner scans, DiffRunner diffs,
-                               RestartRunner restarts) {
+                               RestartRunner restarts, ActiveProject project) {
         this.store = store;
         this.scheduler = scheduler;
         this.monitors = monitors;
         this.scans = scans;
         this.diffs = diffs;
         this.restarts = restarts;
+        this.project = project;
     }
 
     // Monitors -----------------------------------------------------------------------
@@ -49,30 +55,57 @@ public class DashboardController {
     }
 
     @PostMapping("/monitors")
-    public DashboardStore.Monitor addMonitor(@RequestBody Map<String, String> body) {
-        String path = body.getOrDefault("path", "").trim();
-        if (path.isEmpty()) {
-            throw new IllegalArgumentException("path is required");
+    public ResponseEntity<?> addMonitor(@RequestBody Map<String, String> body) {
+        String raw = body == null ? "" : body.getOrDefault("path", "").trim();
+        if (raw.isEmpty()) {
+            return ResponseEntity.badRequest().body(Map.of("message", "path is required"));
         }
-        DashboardStore.Monitor m = store.addMonitor(path);
-        monitors.activate(m);
-        return m;
+        Path proposed;
+        Path root;
+        try {
+            proposed = Paths.get(raw).toRealPath();
+        } catch (IOException e) {
+            return ResponseEntity.badRequest().body(Map.of(
+                    "message", "path does not exist: " + raw));
+        }
+        try {
+            root = Paths.get(project.rootPath()).toRealPath();
+        } catch (IOException e) {
+            return ResponseEntity.badRequest().body(Map.of(
+                    "message", "active project root is not accessible: " + project.rootPath()));
+        }
+        // Monitors must live inside the active project's tree — otherwise file events would
+        // be attributed to the wrong projectId in the graph, contaminating queries. See
+        // MonitorRunner: events use ActiveProject.projectId() regardless of monitor path.
+        if (!proposed.equals(root) && !proposed.startsWith(root)) {
+            return ResponseEntity.badRequest().body(Map.of(
+                    "message", "Monitor path must be inside the active project root: " + root,
+                    "projectRoot", root.toString(),
+                    "proposed", proposed.toString()));
+        }
+        DashboardStore.Monitor m = store.addMonitor(proposed.toString());
+        // Async — DirectoryWatcher.build() walks the tree to register per-dir watches
+        // and can take seconds on large repos. The UI polls /monitors/status to learn
+        // when the watcher actually comes up.
+        monitors.activateAsync(m);
+        return ResponseEntity.ok(m);
     }
 
     @PostMapping("/monitors/{id}/toggle")
     public ResponseEntity<DashboardStore.Monitor> toggleMonitor(@PathVariable String id) {
         DashboardStore.Monitor m = store.toggleMonitor(id);
         if (m == null) return ResponseEntity.notFound().build();
-        // activate() is idempotent and cancels any prior watcher, so toggle off-then-on
-        // here cleanly stops + restarts the file watcher in lockstep with persistence.
-        monitors.activate(m);
+        // activate() is idempotent and cancels any prior watcher; toggling off-then-on
+        // restarts the watcher in lockstep with persistence. Async for the same reason
+        // as add — full DirectoryWatcher rebuild is slow.
+        monitors.activateAsync(m);
         return ResponseEntity.ok(m);
     }
 
     @DeleteMapping("/monitors/{id}")
     public ResponseEntity<Void> removeMonitor(@PathVariable String id) {
         boolean removed = store.removeMonitor(id);
-        if (removed) monitors.deactivate(id);
+        if (removed) monitors.deactivateAsync(id);
         return removed ? ResponseEntity.noContent().build() : ResponseEntity.notFound().build();
     }
 
