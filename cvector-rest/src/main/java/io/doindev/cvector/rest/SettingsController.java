@@ -137,7 +137,7 @@ public class SettingsController {
                     : String.valueOf(passObj);
             neo = new CvectorConfig.Neo4jConfig(uri, user, password);
         }
-        return new CvectorConfig(activeProject, before.projects(), neo, backend, rest, mcp, docker, before.rules());
+        return new CvectorConfig(activeProject, before.projects(), neo, backend, rest, mcp, docker, before.rules(), before.kuzu());
     }
 
     private static boolean needsRestart(Map<String, Object> patch) {

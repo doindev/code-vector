@@ -46,7 +46,7 @@ public class McpServerConfig {
         if (embeddedRequested()) {
             Path db = EmbeddedKuzu.defaultDbPath(project.projectId());
             try {
-                EmbeddedKuzu kuzu = new EmbeddedKuzu(db);
+                EmbeddedKuzu kuzu = new EmbeddedKuzu(db, EmbeddedKuzu.bufferSizeFromConfig(cfg));
                 new KuzuSchemaBootstrap(kuzu).bootstrap();
                 return new KuzuGraphStore(kuzu);
             } catch (IOException e) {

@@ -28,7 +28,8 @@ public record CvectorConfig(
         RestConfig rest,
         McpConfig mcp,
         DockerConfig docker,
-        RulesPolicy rules
+        RulesPolicy rules,
+        KuzuConfig kuzu
 ) {
 
     public CvectorConfig {
@@ -37,8 +38,9 @@ public record CvectorConfig(
 
     /**
      * Legacy 7-arg constructor for callers written before the per-workspace {@code rules}
-     * section existed. Equivalent to passing {@code null} for {@code rules}, which causes
-     * the resolver to fall through to defaults / rules.yml / per-project overrides.
+     * and {@code kuzu} sections existed. Both fields default to {@code null}, which causes
+     * the resolvers to fall through to defaults / rules.yml / per-project overrides / RAM-
+     * based auto-sizing.
      */
     public CvectorConfig(String activeProject,
                          Map<String, ProjectEntry> projects,
@@ -47,7 +49,19 @@ public record CvectorConfig(
                          RestConfig rest,
                          McpConfig mcp,
                          DockerConfig docker) {
-        this(activeProject, projects, neo4j, backend, rest, mcp, docker, null);
+        this(activeProject, projects, neo4j, backend, rest, mcp, docker, null, null);
+    }
+
+    /** 8-arg constructor for callers that carry {@code rules} but not {@code kuzu}. */
+    public CvectorConfig(String activeProject,
+                         Map<String, ProjectEntry> projects,
+                         Neo4jConfig neo4j,
+                         String backend,
+                         RestConfig rest,
+                         McpConfig mcp,
+                         DockerConfig docker,
+                         RulesPolicy rules) {
+        this(activeProject, projects, neo4j, backend, rest, mcp, docker, rules, null);
     }
 
     /** Backend mode: {@code embedded} (default), {@code remote}, or {@code docker}. */
@@ -138,6 +152,20 @@ public record CvectorConfig(
             String cypher,
             String cypherKuzu
     ) {}
+
+    /**
+     * Embedded KuzuDB tuning knobs. All fields optional — when absent, cvector's defaults
+     * apply (auto-sized buffer pool from system RAM, see {@code EmbeddedKuzu.resolveBufferSize}).
+     *
+     * <p>{@code bufferSizeMb} is the most common tuning: large projects on a small buffer
+     * pool can hit {@code Buffer manager exception: Unable to allocate memory!} during the
+     * bulk-load COPY phase. Setting this in {@code settings.json} pins the pool size for
+     * the workspace so the user doesn't have to remember the system-property override on
+     * every invocation. Kuzu's pool is fixed at database-open time and cannot grow at
+     * runtime — pick a size up front, restart cvector if you change it.
+     */
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    public record KuzuConfig(Integer bufferSizeMb) {}
 
     @JsonInclude(JsonInclude.Include.NON_NULL)
     public record Neo4jConfig(String uri, String user, String password) {

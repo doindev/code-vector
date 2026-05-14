@@ -63,7 +63,7 @@ public class EmbeddedCommand implements Callable<Integer> {
         public Integer call() throws IOException {
             String pid = activeProjectId(runtime);
             Path db = EmbeddedKuzu.defaultDbPath(pid);
-            try (EmbeddedKuzu k = new EmbeddedKuzu(db)) {
+            try (EmbeddedKuzu k = new EmbeddedKuzu(db, EmbeddedKuzu.bufferSizeFromConfig(runtime.loadConfig()))) {
                 new KuzuSchemaBootstrap(k).bootstrap();
             }
             System.out.println("initialized: " + db);
@@ -87,7 +87,7 @@ public class EmbeddedCommand implements Callable<Integer> {
             long bytes = directorySize(db.getParent());
             System.out.printf("path:   %s%n", db);
             System.out.printf("size:   %.2f MB%n", bytes / (1024.0 * 1024.0));
-            try (EmbeddedKuzu k = new EmbeddedKuzu(db)) {
+            try (EmbeddedKuzu k = new EmbeddedKuzu(db, EmbeddedKuzu.bufferSizeFromConfig(runtime.loadConfig()))) {
                 List<Map<String, Object>> tables = k.read("CALL SHOW_TABLES() RETURN *");
                 System.out.printf("tables: %d%n", tables.size());
                 for (Map<String, Object> t : tables) {
@@ -119,7 +119,7 @@ public class EmbeddedCommand implements Callable<Integer> {
         public Integer call() throws IOException {
             String pid = activeProjectId(runtime);
             Path db = EmbeddedKuzu.defaultDbPath(pid);
-            try (EmbeddedKuzu k = new EmbeddedKuzu(db)) {
+            try (EmbeddedKuzu k = new EmbeddedKuzu(db, EmbeddedKuzu.bufferSizeFromConfig(runtime.loadConfig()))) {
                 List<Map<String, Object>> rows = k.read(cypher);
                 if (rows.isEmpty()) {
                     System.out.println("(no rows)");

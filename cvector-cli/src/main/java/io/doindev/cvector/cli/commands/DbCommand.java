@@ -67,7 +67,7 @@ public class DbCommand implements Callable<Integer> {
                 : CvectorConfig.DockerConfig.defaults();
         CvectorConfig updated = svc.update(root, cfg -> new CvectorConfig(
                 cfg.activeProject(), cfg.projects(), cfg.neo4j(),
-                target, cfg.rest(), cfg.mcp(), dockerCfg, cfg.rules()));
+                target, cfg.rest(), cfg.mcp(), dockerCfg, cfg.rules(), cfg.kuzu()));
         System.out.println("backend switched to '" + updated.backendOrDefault() + "'");
         if (CvectorConfig.BACKEND_DOCKER.equals(target)) {
             CvectorConfig.DockerConfig d = updated.dockerOrDefault();
