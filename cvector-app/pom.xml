@@ -125,6 +125,35 @@
             <id>dist</id>
             <build>
                 <plugins>
+                    <!--
+                        jpackage refuses to overwrite an existing destination directory, so a
+                        second `mvn -Pdist install` against a populated target/ fails with
+                        "Application destination directory ... already exists". Wipe target/dist
+                        before jpackage runs so the build is idempotent without forcing a full
+                        `mvn clean` (which would invalidate the rest of the reactor's compiled
+                        output and add ~30 s to every rebuild).
+                    -->
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-clean-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>clean-dist-before-jpackage</id>
+                                <phase>pre-integration-test</phase>
+                                <goals>
+                                    <goal>clean</goal>
+                                </goals>
+                                <configuration>
+                                    <excludeDefaultDirectories>true</excludeDefaultDirectories>
+                                    <filesets>
+                                        <fileset>
+                                            <directory>${project.build.directory}/dist</directory>
+                                        </fileset>
+                                    </filesets>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
                     <plugin>
                         <groupId>org.panteleyev</groupId>
                         <artifactId>jpackage-maven-plugin</artifactId>
