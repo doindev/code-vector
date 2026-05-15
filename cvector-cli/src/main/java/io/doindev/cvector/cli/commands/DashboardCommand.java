@@ -40,7 +40,7 @@ public class DashboardCommand implements Callable<Integer> {
         int effectivePort = port != null ? port : 2969;
         String backend = CvectorRuntime.isEmbeddedRequested()
                 ? "kuzu (embedded)"
-                : "neo4j @ " + (cfg.neo4j() != null ? cfg.neo4j().uri() : "default");
+                : "neo4j @ " + cfg.neo4jOrDefault().uri();
         String base = "http://localhost:" + effectivePort;
         System.out.println("cvector dashboard running");
         System.out.println("  project:    " + active.name() + " (" + active.projectId() + ")");

@@ -63,7 +63,7 @@ public class McpServerConfig {
                 throw new UncheckedIOException("failed to open embedded kuzu at " + db, e);
             }
         }
-        CvectorConfig.Neo4jConfig n = cfg.neo4j() != null ? cfg.neo4j() : CvectorConfig.Neo4jConfig.defaults();
+        CvectorConfig.Neo4jConfig n = cfg.neo4jOrDefault();
         return new Neo4jGraphStore(new Neo4jClient(n.uri(), n.user(), n.password()));
     }
 

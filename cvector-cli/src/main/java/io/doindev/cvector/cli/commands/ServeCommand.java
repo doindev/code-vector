@@ -40,7 +40,7 @@ public class ServeCommand implements Callable<Integer> {
         // Logs go to stderr so stdout is free for MCP JSON-RPC.
         System.err.println("cvector mcp server (stdio) ready");
         System.err.println("  project: " + active.name() + " (" + active.projectId() + ")");
-        System.err.println("  neo4j:   " + cfg.neo4j().uri());
+        System.err.println("  neo4j:   " + cfg.neo4jOrDefault().uri());
         System.err.println("  log:     " + System.getProperty("user.home") + "/.cvector/mcp-server.log");
 
         if (openBrowser) {

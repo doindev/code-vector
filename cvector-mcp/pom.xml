@@ -31,9 +31,25 @@
             <groupId>io.doindev</groupId>
             <artifactId>cvector-rules</artifactId>
         </dependency>
+        <!--
+            Base stdio MCP transport for `cvector serve` (JSON-RPC over System.in / System.out).
+        -->
         <dependency>
             <groupId>org.springframework.ai</groupId>
             <artifactId>spring-ai-starter-mcp-server</artifactId>
+        </dependency>
+        <!--
+            HTTP (SSE + Streamable) MCP transport for the dashboard co-host scenario:
+            `cvector dashboard` activates the `mcp` profile alongside Tomcat and Spring AI
+            auto-wires the MCP endpoint into the same servlet container. Without this dep,
+            the `mcp` profile would have no HTTP handler and clients POSTing to /mcp would
+            hit the 404 fallback. Coexists with the base stdio starter — Spring AI picks the
+            transport at runtime based on `spring.ai.mcp.server.stdio` (true = stdio only,
+            false = HTTP/SSE wired into Spring WebMVC).
+        -->
+        <dependency>
+            <groupId>org.springframework.ai</groupId>
+            <artifactId>spring-ai-starter-mcp-server-webmvc</artifactId>
         </dependency>
         <dependency>
             <groupId>com.fasterxml.jackson.core</groupId>

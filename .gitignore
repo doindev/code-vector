@@ -31,8 +31,11 @@ buildNumber.properties
 .gradle/
 
 # --- cvector workspace ---
-# Project config can be safely committed, but local Neo4j credentials and runtime
-# state should not. Adjust if your team prefers to track project.json directly.
+# settings.json (and the legacy project.json filename) carries machine-specific
+# absolute rootPaths and Neo4j credentials — don't track them. Each dev runs
+# `cvector init` locally to generate their own. Workspace-shared config that
+# IS safe to commit (rules.yml, docker-compose.yml) stays tracked.
+.cvector/settings.json
 .cvector/project.json
 .cvector/mcp-server.log
 .cvector/*.snapshot.json

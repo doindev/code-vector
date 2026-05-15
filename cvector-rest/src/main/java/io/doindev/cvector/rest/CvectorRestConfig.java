@@ -74,7 +74,7 @@ public class CvectorRestConfig {
         }
         // Both "remote" and "docker" connect through the Neo4j driver — the difference is that
         // "docker" implies the app is responsible for the container lifecycle (handled above).
-        CvectorConfig.Neo4jConfig n = cfg.neo4j() != null ? cfg.neo4j() : CvectorConfig.Neo4jConfig.defaults();
+        CvectorConfig.Neo4jConfig n = cfg.neo4jOrDefault();
         return new Neo4jGraphStore(new Neo4jClient(n.uri(), n.user(), n.password()));
     }
 

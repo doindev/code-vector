@@ -107,7 +107,7 @@ java -jar cvector-app/target/cvector.jar rules    # should report 0 violations
 
 | Task | Where to start |
 |---|---|
-| Add a new language | Copy a grammar from `grammars-v4` cache (host-local at `/c/Users/timhj/grammars-cache/grammars-v4`) into `cvector-parser-<lang>/src/main/antlr4/.../internal/`, add base class with `package` declaration, write `*ParserAdapter` implementing `Parser`, register `@Bean` in `CliConfiguration`. |
+| Add a new language | Copy a grammar from `grammars-v4` cache (host-local at `~/grammars-cache/grammars-v4`) into `cvector-parser-<lang>/src/main/antlr4/.../internal/`, add base class with `package` declaration, write `*ParserAdapter` implementing `Parser`, register `@Bean` in `CliConfiguration`. |
 | Add a CLI command | New class in `cvector-cli/src/main/java/.../commands/` annotated `@Component @Command(name = ...)` implementing `Callable<Integer>`. Picocli + Spring autowire pick it up. |
 | Add an MCP tool | New `@Tool` method on `CvectorTools`. |
 | Add a rule | New class in `cvector-rules/.../builtin/` implementing `Rule`, register in the `RulesEngine` builtin list. Remember `isPathExcluded`. |

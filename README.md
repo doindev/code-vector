@@ -150,6 +150,8 @@ cvector keeps all per-workspace state in a single file: `.cvector/settings.json`
 
 > **Legacy filename.** Older installs used `.cvector/project.json`. The loader still reads that name as a fallback so existing workspaces keep working, but every write goes to `settings.json`. If you have both, `settings.json` wins.
 
+> **Not tracked in git.** `.cvector/settings.json` carries a machine-specific absolute `rootPath` and (for `remote`/`docker` backends) Neo4j credentials, so the repo's `.gitignore` excludes it. Each developer runs `cvector init` locally to generate their own. `.cvector/rules.yml` and `.cvector/docker-compose.yml` *are* tracked because they're team-shared policy / infrastructure config.
+
 ### Picking a backend
 
 The `backend` field decides where the graph is stored. Three modes:
@@ -182,7 +184,12 @@ You can switch any time without changing your data model — the parsers emit th
   },
   "rest": {
     "port": 2969,
-    "host": "127.0.0.1"
+    "host": "127.0.0.1",
+    "server": {
+      "ssl": { "enabled": false },
+      "compression": { "min-response-size": 1024 },
+      "tomcat": { "max-threads": 200 }
+    }
   },
   "mcp": {
     "url": "http://127.0.0.1:2969/mcp",
@@ -211,6 +218,7 @@ You can switch any time without changing your data model — the parsers emit th
 | `neo4j.password` | string | `"neo4j"` | Bolt password. **REST `GET /api/settings` masks this as `"***"`; sending `"***"` back via `PUT /api/settings` is treated as "keep existing".** |
 | `rest.port` | integer | `2969` | Port the dashboard / REST API binds to. |
 | `rest.host` | string | `"127.0.0.1"` | Bind address. `127.0.0.1` keeps the dashboard loopback-only; use `0.0.0.0` to expose on the network. Easier: `cvector host 0.0.0.0`. |
+| `rest.server` | object | `null` | Free-form Spring Boot `server.*` overrides — any property the Boot binder accepts (e.g. `server.ssl.*`, `server.compression.*`, `server.servlet.session.*`, `server.tomcat.*`). Nested objects are flattened to dotted keys; lists are comma-joined. On boot, each entry is promoted to a JVM system property — Spring Boot precedence slot 6 — so settings.json values **override matching OS environment variables** (slot 7). Explicit `-Dserver.foo=…` on the cvector command line still wins (already-set system properties aren't overwritten). |
 | `mcp.url` | string | `"http://127.0.0.1:2969/mcp"` | Informational URL clients can use to reach the MCP server. The server itself binds at `rest.host:rest.port`. |
 | `mcp.transport` | string | `"http"` | One of `"http"` / `"sse"` / `"stdio"`. Drives how MCP clients connect. |
 | `docker.image` | string | `"neo4j"` | Docker image name (without tag). |
@@ -508,6 +516,8 @@ When something goes wrong in the dashboard (404 to a typo'd URL, an uncaught exc
 
 The same info is **also printed to stderr** as a multi-line block, so the terminal that started `cvector dashboard` shows the failure live — no log file to dig through. JSON clients (`Accept: application/json`) get a structured `{ timestamp, status, error, path, exception, message, stackTrace }` payload instead.
 
+The controller has two `@RequestMapping("/error")` handlers: one with `produces = text/html` for browsers, and a second with **no `produces` filter** as a fallback for everything else (curl's `*/*`, MCP clients, scripts with no `Accept` header). Without the fallback, requests whose Accept header didn't include `text/html` slipped through to Spring's default 404-for-`/error` and the operator was left with no diagnostic — the fallback closes that hole.
+
 This surface is implemented in `cvector-rest/CvectorErrorController` so it loads whenever the REST API is up, regardless of the `dashboard-ui` profile.
 
 ### `.cvector/rules.yml`
@@ -623,8 +633,10 @@ Invoke as `java -jar cvector.jar <command> [args]`.
 
 | Command | Purpose |
 |---|---|
-| `dashboard` | Start the REST API on port 2969. |
-| `serve` | Start the MCP server over stdio (for IDE/AI integration). |
+| `dashboard` | Start the REST API + Angular SPA on port 2969. **Also activates the `mcp` Spring profile**, so a stdio MCP server runs in the same JVM on `System.in`/`System.out` alongside HTTP. Don't type into the launching terminal — anything you type goes to the MCP JSON-RPC reader. Use Ctrl-C to stop. |
+| `serve` | Start the MCP server over stdio with **no** dashboard / REST listener. For when an MCP client (Claude Desktop, Cursor, Windsurf, etc.) launches cvector as a subprocess and you don't want the extra HTTP listener. |
+
+Both modes share a single `GraphStore` bean — when `dashboard` co-hosts MCP, the MCP beans reuse the REST module's open Kuzu/Neo4j connection via `@ConditionalOnMissingBean(GraphStore.class)`, so the embedded DB is only opened once (avoids the Kuzu file-lock collision that a duplicate open would trigger).
 
 ### Embedded KuzuDB
 
