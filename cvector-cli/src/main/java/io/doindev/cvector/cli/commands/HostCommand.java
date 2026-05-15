@@ -52,7 +52,7 @@ public class HostCommand implements Callable<Integer> {
             CvectorConfig.RestConfig next = new CvectorConfig.RestConfig(current.port(), normalized);
             return new CvectorConfig(
                     before.activeProject(), before.projects(), before.neo4j(),
-                    before.backend(), next, before.mcp(), before.docker(), before.rules());
+                    before.backend(), next, before.mcp(), before.docker(), before.rules(), before.kuzu());
         });
         CvectorConfig.RestConfig rest = updated.restOrDefault();
         System.out.println("host set to " + rest.host() + " (port " + rest.port() + ")");

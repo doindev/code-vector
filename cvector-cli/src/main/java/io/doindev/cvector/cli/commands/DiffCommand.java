@@ -153,20 +153,20 @@ public class DiffCommand implements Callable<Integer> {
 
             // Phase 1: scan snapshot A. Open-close so the COPY-FROM bulk path is exercised against
             // a freshly-bootstrapped empty DB.
-            try (EmbeddedKuzu kuzu = new EmbeddedKuzu(dbA)) {
+            try (EmbeddedKuzu kuzu = new EmbeddedKuzu(dbA, EmbeddedKuzu.bufferSizeFromConfig(cfg))) {
                 new KuzuSchemaBootstrap(kuzu).bootstrap();
                 checkoutAndScanKuzu(repo, fullA, worktreeA, pidA,
                         active.name() + "@" + shortSha(fullA), kuzu);
             }
             // Phase 2: scan snapshot B into its own DB.
-            try (EmbeddedKuzu kuzu = new EmbeddedKuzu(dbB)) {
+            try (EmbeddedKuzu kuzu = new EmbeddedKuzu(dbB, EmbeddedKuzu.bufferSizeFromConfig(cfg))) {
                 new KuzuSchemaBootstrap(kuzu).bootstrap();
                 checkoutAndScanKuzu(repo, fullB, worktreeB, pidB,
                         active.name() + "@" + shortSha(fullB), kuzu);
             }
             // Phase 3: reopen both side-by-side and diff in Java.
-            try (EmbeddedKuzu kuzuA = new EmbeddedKuzu(dbA);
-                 EmbeddedKuzu kuzuB = new EmbeddedKuzu(dbB)) {
+            try (EmbeddedKuzu kuzuA = new EmbeddedKuzu(dbA, EmbeddedKuzu.bufferSizeFromConfig(cfg));
+                 EmbeddedKuzu kuzuB = new EmbeddedKuzu(dbB, EmbeddedKuzu.bufferSizeFromConfig(cfg))) {
                 renderDiffKuzu(kuzuA, kuzuB);
             }
 

@@ -7,6 +7,7 @@ import com.kuzudb.FlatTuple;
 import com.kuzudb.PreparedStatement;
 import com.kuzudb.QueryResult;
 import com.kuzudb.Value;
+import io.doindev.cvector.core.config.CvectorConfig;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -55,8 +56,16 @@ public final class EmbeddedKuzu implements AutoCloseable {
      */
     private final Map<String, PreparedStatement> stmtCache = new ConcurrentHashMap<>();
 
-    /** Default buffer pool size — 512 MB. Kuzu's default is much smaller and starves ingest. */
-    private static final long DEFAULT_BUFFER_SIZE = 512L * 1024 * 1024;
+    /**
+     * Buffer pool size — bytes of RAM Kuzu can use to cache pages. Default 1 GB; the
+     * previous 512 MB starved bulk COPY on projects with ~10k+ nodes (the failing
+     * scan was a {@code COPY Node FROM ... (PARALLEL=FALSE)} hitting "Buffer manager
+     * exception: Unable to allocate memory! The buffer pool is full and no memory
+     * could be freed!"). Override at the command line with
+     * {@code -Dcvector.kuzu.bufferSizeMb=2048} or via the {@code CVECTOR_KUZU_BUFFER_MB}
+     * env var if a very large project still hits the cap.
+     */
+    private static final long DEFAULT_BUFFER_SIZE = 1024L * 1024 * 1024;
     /** Max DB size on disk — 64 GB. Effectively a virtual address-space cap, not a real allocation. */
     private static final long DEFAULT_MAX_DB_SIZE = 64L * 1024 * 1024 * 1024;
     /**
@@ -67,15 +76,35 @@ public final class EmbeddedKuzu implements AutoCloseable {
      */
     private static final long DEFAULT_CHECKPOINT_THRESHOLD = 4L * 1024 * 1024 * 1024;
 
+    /**
+     * Open Kuzu with the auto-resolved buffer pool size. Picks up overrides from
+     * {@code -Dcvector.kuzu.bufferSizeMb}, {@code CVECTOR_KUZU_BUFFER_MB}, or auto-sizes
+     * from system RAM. Use {@link #EmbeddedKuzu(Path, Long)} when the caller knows the
+     * size explicitly (e.g. from {@code settings.json}).
+     */
     public EmbeddedKuzu(Path dbPath) throws IOException {
+        this(dbPath, null);
+    }
+
+    /**
+     * Open Kuzu with an explicit buffer pool size (in bytes). Highest precedence among the
+     * sizing knobs — when {@code bufferSizeBytes} is non-null and positive, it wins over
+     * the {@code -D…} system property, the {@code CVECTOR_…} env var, and the RAM-based
+     * auto-sized default. Used by {@code EmbeddedKuzuFactory} when the workspace's
+     * {@code settings.json} pins {@code kuzu.bufferSizeMb} to a specific value.
+     */
+    public EmbeddedKuzu(Path dbPath, Long bufferSizeBytes) throws IOException {
         this.dbPath = dbPath;
         Files.createDirectories(dbPath.getParent());
+        long bufferSize = (bufferSizeBytes != null && bufferSizeBytes > 0)
+                ? bufferSizeBytes
+                : resolveBufferSize();
         try {
             // Database(path, buffer_size, enableCompression, readOnly, maxDbSize, autoCheckpoint, checkpointThreshold).
             // autoCheckpoint=true is fine; the threshold is what controls how often we fsync.
             this.database = new Database(
                     dbPath.toString(),
-                    DEFAULT_BUFFER_SIZE,
+                    bufferSize,
                     /* enableCompression */ true,
                     /* readOnly */ false,
                     DEFAULT_MAX_DB_SIZE,
@@ -91,6 +120,89 @@ public final class EmbeddedKuzu implements AutoCloseable {
             throw new IOException("failed to open Kuzu database at " + dbPath + ": " + e.getMessage(), e);
         }
         log.debug("opened Kuzu database at {}", dbPath);
+    }
+
+    /**
+     * Decide the buffer-pool size for this Database instance. Kuzu's pool is fixed at open
+     * (no live grow), so we have to commit to a number up front. Resolution order, highest
+     * precedence first:
+     * <ol>
+     *   <li>{@code -Dcvector.kuzu.bufferSizeMb=<N>} system property — explicit override in MB.
+     *       Use case: a CI machine where you know exactly how much RAM is budgeted.</li>
+     *   <li>{@code CVECTOR_KUZU_BUFFER_MB=<N>} env var — same idea, friendlier for shell
+     *       scripts and Docker entrypoints.</li>
+     *   <li>Auto-sized at 25% of total system RAM, clamped to {@code [512 MB, 4 GB]}.
+     *       25% gives Kuzu enough headroom for bulk COPY of a several-thousand-node project
+     *       without starving the JVM heap, the parsers, or other apps on the host. The 4 GB
+     *       upper cap protects against runaway allocation on workstation-class machines
+     *       with 64+ GB of RAM where Kuzu doesn't actually need that much.</li>
+     *   <li>{@link #DEFAULT_BUFFER_SIZE} (1 GB) when total RAM can't be queried — bare-metal
+     *       JREs without {@code com.sun.management} or sandboxed JVMs.</li>
+     * </ol>
+     */
+    private static long resolveBufferSize() {
+        // Explicit override via system property.
+        String sysProp = System.getProperty("cvector.kuzu.bufferSizeMb");
+        Long fromSysProp = parseMb(sysProp);
+        if (fromSysProp != null) {
+            log.info("Kuzu buffer pool size: {} MB (from -Dcvector.kuzu.bufferSizeMb)", fromSysProp);
+            return fromSysProp * 1024L * 1024L;
+        }
+        // Explicit override via environment.
+        Long fromEnv = parseMb(System.getenv("CVECTOR_KUZU_BUFFER_MB"));
+        if (fromEnv != null) {
+            log.info("Kuzu buffer pool size: {} MB (from CVECTOR_KUZU_BUFFER_MB)", fromEnv);
+            return fromEnv * 1024L * 1024L;
+        }
+        // Auto-size from system RAM. com.sun.management is in java.management which we
+        // already addModules in the jpackage build, so this is available on the .exe too.
+        try {
+            java.lang.management.OperatingSystemMXBean osBean =
+                    java.lang.management.ManagementFactory.getOperatingSystemMXBean();
+            if (osBean instanceof com.sun.management.OperatingSystemMXBean sun) {
+                long totalRam = sun.getTotalMemorySize();
+                if (totalRam > 0) {
+                    long target = totalRam / 4;                          // 25% of RAM
+                    long min = 512L * 1024 * 1024;                       // never below 512 MB
+                    long max = 4L * 1024 * 1024 * 1024;                  // never above 4 GB
+                    long chosen = Math.max(min, Math.min(max, target));
+                    log.info("Kuzu buffer pool size: {} MB (auto-sized from {} MB total RAM)",
+                            chosen / (1024 * 1024), totalRam / (1024 * 1024));
+                    return chosen;
+                }
+            }
+        } catch (Throwable ignored) {
+            // Fall through to fixed default.
+        }
+        log.info("Kuzu buffer pool size: {} MB (default — could not detect system RAM)",
+                DEFAULT_BUFFER_SIZE / (1024 * 1024));
+        return DEFAULT_BUFFER_SIZE;
+    }
+
+    private static Long parseMb(String raw) {
+        if (raw == null || raw.isBlank()) return null;
+        try {
+            long mb = Long.parseLong(raw.trim());
+            return mb > 0 ? mb : null;
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    /**
+     * Translate the workspace's optional {@code kuzu.bufferSizeMb} setting into the byte
+     * count the {@link #EmbeddedKuzu(Path, Long)} constructor wants. Returns {@code null}
+     * (meaning "no override; auto-resolve from system property / env / RAM") when the
+     * setting is absent or invalid. Lets callers fold this in one line:
+     * {@snippet :
+     *   EmbeddedKuzu kuzu = new EmbeddedKuzu(db, EmbeddedKuzu.bufferSizeFromConfig(cfg));
+     * }
+     */
+    public static Long bufferSizeFromConfig(CvectorConfig cfg) {
+        if (cfg == null || cfg.kuzu() == null) return null;
+        Integer mb = cfg.kuzu().bufferSizeMb();
+        if (mb == null || mb <= 0) return null;
+        return mb.longValue() * 1024L * 1024L;
     }
 
     public static Path defaultDataRoot() {

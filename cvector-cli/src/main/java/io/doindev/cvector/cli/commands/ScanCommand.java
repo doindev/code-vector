@@ -69,7 +69,7 @@ public class ScanCommand implements Callable<Integer> {
                 return 1;
             }
             cfg = new CvectorConfig(project, cfg.projects(), cfg.neo4j(),
-                    cfg.backend(), cfg.rest(), cfg.mcp(), cfg.docker(), cfg.rules());
+                    cfg.backend(), cfg.rest(), cfg.mcp(), cfg.docker(), cfg.rules(), cfg.kuzu());
         }
         ProjectContext ctx = runtime.projectContext(cfg);
         Path scanRoot = path.toAbsolutePath().normalize();
@@ -78,7 +78,7 @@ public class ScanCommand implements Callable<Integer> {
         System.out.println("parsers: " + parsers.stream().map(Parser::name).toList());
 
         return CvectorRuntime.isEmbeddedRequested()
-                ? scanEmbedded(ctx, scanRoot)
+                ? scanEmbedded(cfg, ctx, scanRoot)
                 : scanNeo4j(cfg, ctx, scanRoot);
     }
 
@@ -194,11 +194,11 @@ public class ScanCommand implements Callable<Integer> {
      * when the project's Kuzu DB is empty — ~10-100× faster than per-row MERGE on Windows. Falls
      * back to the MERGE-based ingestor on re-scans.
      */
-    private Integer scanEmbedded(ProjectContext ctx, Path scanRoot) throws Exception {
+    private Integer scanEmbedded(CvectorConfig cfg, ProjectContext ctx, Path scanRoot) throws Exception {
         Path db = EmbeddedKuzu.defaultDbPath(ctx.projectId());
         System.out.println("backend: embedded kuzu @ " + db);
         java.time.Instant scanStartInstant = java.time.Instant.now();
-        try (EmbeddedKuzu kuzu = new EmbeddedKuzu(db)) {
+        try (EmbeddedKuzu kuzu = new EmbeddedKuzu(db, EmbeddedKuzu.bufferSizeFromConfig(cfg))) {
             new KuzuSchemaBootstrap(kuzu).bootstrap();
             boolean empty = isKuzuEmpty(kuzu);
             String mode = empty ? "bulk" : "merge";

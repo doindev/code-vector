@@ -81,7 +81,7 @@ public class WorkspaceSwitcher {
         try {
             configService.save(root, new CvectorConfig(
                     key, cfg.projects(), cfg.neo4j(),
-                    cfg.backend(), cfg.rest(), cfg.mcp(), cfg.docker(), cfg.rules()));
+                    cfg.backend(), cfg.rest(), cfg.mcp(), cfg.docker(), cfg.rules(), cfg.kuzu()));
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }

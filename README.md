@@ -112,6 +112,9 @@ The Neo4j password defaults to `cvector_admin_pw`; override with `NEO4J_AUTH=neo
 ```bash
 # Build a self-contained directory with cvector.exe + bundled JRE
 mvn -Pdist -DskipTests install
+
+# Same, but bundle the Angular dashboard into the .exe as well
+mvn -pl cvector-app -am -Pdashboard-ui,dist -DskipTests package
 ```
 
 Output lands at `cvector-app/target/dist/cvector/`:
@@ -191,6 +194,9 @@ You can switch any time without changing your data model — the parsers emit th
     "neo4jVersion": "5",
     "boltPort": 7687,
     "httpPort": 7474
+  },
+  "kuzu": {
+    "bufferSizeMb": 2048
   }
 }
 ```
@@ -212,6 +218,7 @@ You can switch any time without changing your data model — the parsers emit th
 | `docker.neo4jVersion` | string | `"5"` | Image tag — used as `{image}:{neo4jVersion}`. |
 | `docker.boltPort` | integer | `7687` | Host port the container's Bolt listener is mapped to. |
 | `docker.httpPort` | integer | `7474` | Host port for Neo4j HTTP / Browser. |
+| `kuzu.bufferSizeMb` | integer | *(auto-sized)* | Kuzu's buffer pool size in MB. Optional — when absent, cvector auto-sizes to 25% of system RAM (clamped to 512 MB – 4 GB). Set this when a large project's bulk-load COPY hits `Buffer manager exception: Unable to allocate memory!` or you want a deterministic ceiling per machine. Kuzu's pool is fixed at database-open time; changing this value requires restarting cvector. |
 | `rules` | object | `null` | **Workspace-wide** architecture-rules policy — see [Rules policy](#rules-policy). Applies to every project in `projects`. |
 | `projects.<name>.rules` | object | `null` | **Per-project** rules override — same shape as the workspace `rules` field, layered on top of it so a single project can raise thresholds or disable rules without touching the workspace policy. |
 
@@ -460,6 +467,48 @@ Effective `longMethodLines` per project:
 | Same workspace, two projects with different tolerances | Workspace `rules` (baseline) + per-project `rules` for the relaxed one. |
 | Mix of standards across many workspaces | Per-workspace `rules` in each `settings.json`. |
 | Existing project on rules.yml | Keep using `.cvector/rules.yml`. Optionally layer settings.json on top (e.g. per-project disable a rule without touching the shared YAML). |
+
+### Tuning Kuzu memory
+
+The embedded Kuzu backend keeps a **buffer pool** in RAM that caches pages and absorbs the bulk-load `COPY Node FROM ... (PARALLEL=FALSE)` step `cvector scan` runs on a fresh database. When this pool is too small for the project's size, the scan fails with:
+
+```
+java.lang.RuntimeException: Kuzu write failed: Buffer manager exception:
+  Unable to allocate memory! The buffer pool is full and no memory could be freed!
+```
+
+Kuzu's pool is **fixed at database-open time** — it can't grow at runtime. To raise it, set a larger size up front and restart cvector. Four ways to do that, in precedence order (highest wins):
+
+1. **`kuzu.bufferSizeMb` in `settings.json`** *(recommended for persistence)*:
+   ```json
+   {
+     "backend": "embedded",
+     "kuzu": { "bufferSizeMb": 2048 }
+   }
+   ```
+2. **`-Dcvector.kuzu.bufferSizeMb=N`** system property — one-shot CLI override:
+   ```bash
+   cvector.exe -J-Dcvector.kuzu.bufferSizeMb=2048 scan
+   ```
+3. **`CVECTOR_KUZU_BUFFER_MB=N`** env var — convenient for shell scripts and Docker entrypoints.
+4. **Auto-sized default** — when none of the above is set, cvector uses **25% of system RAM**, clamped to **`[512 MB, 4 GB]`**. A line on stderr at startup tells you what got picked: `Kuzu buffer pool size: 2048 MB (auto-sized from 8192 MB total RAM)`.
+
+Most users on modern machines (8 GB+ RAM) won't need to set anything — the auto-sized default handles projects up to several thousand source files. Reach for an explicit value when a very large monorepo blows past the 4 GB cap, or when you want a deterministic ceiling on a CI runner.
+
+### Diagnostic error page
+
+When something goes wrong in the dashboard (404 to a typo'd URL, an uncaught exception inside a controller, the SPA not on classpath because the build wasn't done with `-Pdashboard-ui`, etc.), cvector replaces Spring Boot's bland Whitelabel Error Page with a self-contained HTML page that shows:
+
+- Status code + reason.
+- Request URI that triggered the error.
+- Exception class + message (when present).
+- Collapsible **stack trace**.
+- Context-aware hint — e.g. a 404 under `/dashboard/` suggests rebuilding with `-Pdashboard-ui`; a 5xx suggests checking the terminal log.
+- Links to known-good endpoints (`/api/health`, `/api/stats`, `/api/projects`, `/dashboard/`).
+
+The same info is **also printed to stderr** as a multi-line block, so the terminal that started `cvector dashboard` shows the failure live — no log file to dig through. JSON clients (`Accept: application/json`) get a structured `{ timestamp, status, error, path, exception, message, stackTrace }` payload instead.
+
+This surface is implemented in `cvector-rest/CvectorErrorController` so it loads whenever the REST API is up, regardless of the `dashboard-ui` profile.
 
 ### `.cvector/rules.yml`
 
