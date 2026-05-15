@@ -47,6 +47,10 @@ The dashboard build is opt-in. A plain `mvn package` produces a backend-only fat
 ```bash
 # From the repo root
 mvn -P dashboard-ui clean package
+
+# To also produce a standalone cvector.exe with the dashboard bundled in,
+# combine with the dist profile and run through the verify phase (install):
+mvn -pl cvector-app -am -Pdashboard-ui,dist -DskipTests install
 ```
 
 What happens:
