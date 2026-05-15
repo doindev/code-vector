@@ -13,6 +13,7 @@ import io.modelcontextprotocol.server.McpServerFeatures;
 import org.springframework.ai.tool.ToolCallback;
 import org.springframework.ai.tool.ToolCallbackProvider;
 import org.springframework.ai.tool.method.MethodToolCallbackProvider;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Profile;
@@ -40,7 +41,16 @@ public class McpServerConfig {
         return env != null && env.equalsIgnoreCase("true");
     }
 
+    /**
+     * Only created when no other {@link GraphStore} bean exists in the context. When the
+     * {@code mcp} profile is co-active with the dashboard (e.g. {@code cvector dashboard}
+     * also activates {@code mcp} so stdio MCP can run alongside REST), the rest module's
+     * {@code restGraphStore} bean already owns the live Kuzu/Neo4j connection — reuse it
+     * instead of opening a second one (Kuzu file-locks the DB directory, so a duplicate
+     * open would crash startup).
+     */
     @Bean(destroyMethod = "close")
+    @ConditionalOnMissingBean(GraphStore.class)
     public GraphStore mcpGraphStore(CvectorConfigService configService, McpActiveProject project) {
         CvectorConfig cfg = loadConfig(configService);
         if (embeddedRequested()) {
@@ -68,10 +78,10 @@ public class McpServerConfig {
     }
 
     @Bean
-    public CvectorTools cvectorTools(GraphStore mcpGraphStore,
+    public CvectorTools cvectorTools(GraphStore graphStore,
                                      McpActiveProject mcpActiveProject,
                                      CvectorConfigService configService) {
-        return new CvectorTools(mcpGraphStore, mcpActiveProject, configService);
+        return new CvectorTools(graphStore, mcpActiveProject, configService);
     }
 
     @Bean
@@ -80,8 +90,8 @@ public class McpServerConfig {
     }
 
     @Bean
-    public CvectorResources cvectorResources(GraphStore mcpGraphStore, McpActiveProject mcpActiveProject) {
-        return new CvectorResources(mcpGraphStore, mcpActiveProject);
+    public CvectorResources cvectorResources(GraphStore graphStore, McpActiveProject mcpActiveProject) {
+        return new CvectorResources(graphStore, mcpActiveProject);
     }
 
     @Bean

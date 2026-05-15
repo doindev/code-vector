@@ -83,7 +83,9 @@ public class CvectorApplication implements CommandLineRunner, ExitCodeGenerator 
             props.add("server.compression.enabled=true");
             props.add("server.compression.mime-types=application/json,application/javascript,text/css,text/html,text/javascript");
             props.add("server.compression.min-response-size=1024");
-            builder.web(WebApplicationType.SERVLET).properties(props.toArray(String[]::new));
+            builder.web(WebApplicationType.SERVLET)
+                    .profiles("mcp")
+                    .properties(props.toArray(String[]::new));
         } else if (mcpMode) {
             builder.web(WebApplicationType.NONE)
                     .profiles("mcp");
