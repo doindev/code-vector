@@ -114,7 +114,7 @@ The Neo4j password defaults to `cvector_admin_pw`; override with `NEO4J_AUTH=neo
 mvn -Pdist -DskipTests install
 
 # Same, but bundle the Angular dashboard into the .exe as well
-mvn -pl cvector-app -am -Pdashboard-ui,dist -DskipTests package
+mvn -pl cvector-app -am -Pdashboard-ui,dist -DskipTests install
 ```
 
 Output lands at `cvector-app/target/dist/cvector/`:

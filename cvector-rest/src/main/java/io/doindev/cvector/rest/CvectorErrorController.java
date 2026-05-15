@@ -2,7 +2,6 @@ package io.doindev.cvector.rest;
 
 import jakarta.servlet.RequestDispatcher;
 import jakarta.servlet.http.HttpServletRequest;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplication;
 import org.springframework.boot.web.servlet.error.ErrorController;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
@@ -50,12 +49,15 @@ import java.util.Map;
  * point: the error page is most useful exactly when the dashboard module isn't there).
  */
 @Controller
-@ConditionalOnWebApplication
 public class CvectorErrorController implements ErrorController {
 
     private static final String ERROR_PATH = "/error";
 
-    /** HTML branch: browsers (Accept: text/html) land here. */
+    /**
+     * HTML branch: browsers (Accept: text/html) land here. Mirrors Spring Boot's
+     * {@code BasicErrorController.errorHtml} signature so content negotiation
+     * picks this when the client explicitly prefers HTML.
+     */
     @RequestMapping(value = ERROR_PATH, produces = MediaType.TEXT_HTML_VALUE)
     @ResponseBody
     public ResponseEntity<String> errorHtml(HttpServletRequest request) {
@@ -66,10 +68,17 @@ public class CvectorErrorController implements ErrorController {
                 .body(renderHtml(info));
     }
 
-    /** JSON branch: API clients, fetch from the SPA, curl with -H Accept land here. */
-    @RequestMapping(value = ERROR_PATH, produces = MediaType.APPLICATION_JSON_VALUE)
+    /**
+     * Fallback branch with no {@code produces} filter — matches every other Accept
+     * header (JSON, {@code * / *}, missing entirely). Without this, requests whose
+     * Accept header doesn't include {@code text/html} fall through to Spring's
+     * default 404 for {@code /error}, leaving the operator with no diagnostic.
+     * Returns JSON because most non-browser callers (curl, the SPA's fetch, monitoring
+     * scripts) want a structured payload.
+     */
+    @RequestMapping(value = ERROR_PATH)
     @ResponseBody
-    public ResponseEntity<Map<String, Object>> errorJson(HttpServletRequest request) {
+    public ResponseEntity<Map<String, Object>> errorFallback(HttpServletRequest request) {
         ErrorInfo info = collect(request);
         logToStderr(info);
         return ResponseEntity.status(info.status()).body(renderJson(info));
