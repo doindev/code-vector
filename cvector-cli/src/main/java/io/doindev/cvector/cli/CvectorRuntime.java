@@ -65,7 +65,7 @@ public class CvectorRuntime {
     }
 
     public Neo4jClient openNeo4j(CvectorConfig cfg) {
-        CvectorConfig.Neo4jConfig n = cfg.neo4j() != null ? cfg.neo4j() : CvectorConfig.Neo4jConfig.defaults();
+        CvectorConfig.Neo4jConfig n = cfg.neo4jOrDefault();
         return new Neo4jClient(n.uri(), n.user(), n.password());
     }
 

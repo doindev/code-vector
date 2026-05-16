@@ -84,6 +84,11 @@ public record CvectorConfig(
         return rest != null ? rest.withDefaults() : RestConfig.defaults();
     }
 
+    /** Neo4j section with defaults applied where absent — embedded workspaces omit the section entirely. */
+    public Neo4jConfig neo4jOrDefault() {
+        return neo4j != null ? neo4j : Neo4jConfig.defaults();
+    }
+
     /** MCP section with defaults applied where absent. */
     public McpConfig mcpOrDefault() {
         return mcp != null ? mcp.withDefaults() : McpConfig.defaults();
@@ -179,18 +184,32 @@ public record CvectorConfig(
      * REST API + dashboard listener config. {@code host = 127.0.0.1} keeps the server bound to
      * localhost so the API isn't exposed without the user explicitly opting in via
      * {@code cvector host 0.0.0.0}.
+     *
+     * <p>{@code port} and {@code host} are shortcuts for {@code server.port} and
+     * {@code server.address}. The free-form {@code server} map carries any other Spring Boot
+     * {@code server.*} property the user wants to pin in {@code settings.json} — for example
+     * {@code server.ssl.enabled}, {@code server.compression.*}, {@code server.servlet.session.*}.
+     * Nested objects are flattened to dotted keys by {@code CvectorApplication.main}, then
+     * promoted to {@code --server.<key>=<value>} command-line args so they sit at the top of
+     * Spring Boot's property-source precedence and override any matching environment variable.
      */
     @JsonInclude(JsonInclude.Include.NON_NULL)
-    public record RestConfig(Integer port, String host) {
+    public record RestConfig(Integer port, String host, Map<String, Object> server) {
+
+        /** Legacy 2-arg constructor for callers / config files written before the {@code server} map existed. */
+        public RestConfig(Integer port, String host) {
+            this(port, host, null);
+        }
 
         public static RestConfig defaults() {
-            return new RestConfig(2969, "127.0.0.1");
+            return new RestConfig(2969, "127.0.0.1", null);
         }
 
         public RestConfig withDefaults() {
             return new RestConfig(
                     port == null ? 2969 : port,
-                    host == null || host.isBlank() ? "127.0.0.1" : host);
+                    host == null || host.isBlank() ? "127.0.0.1" : host,
+                    server);
         }
     }
 
