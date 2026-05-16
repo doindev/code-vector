@@ -1,1 +1,0 @@
-import{O as i,Oa as s}from"./chunk-JSL6NE55.js";var l=(()=>{class t{constructor(){this.visible=s(!1)}toggle(){this.visible.update(e=>!e)}close(){this.visible.set(!1)}static{this.\u0275fac=function(o){return new(o||t)}}static{this.\u0275prov=i({token:t,factory:t.\u0275fac,providedIn:"root"})}}return t})();export{l as a};
