@@ -189,9 +189,9 @@ interface SettingsPatch {
             <div class="mb-3">
               <label class="form-label small text-secondary">Transport</label>
               <select class="form-select" [(ngModel)]="mcpTransport" name="mcpTransport">
-                <option value="http">http (default)</option>
-                <option value="sse">sse</option>
-                <option value="stdio">stdio</option>
+                <option value="sse">sse (default — Spring AI 1.0.0 only supports SSE)</option>
+                <option value="http">http (alias for sse — kept for back-compat)</option>
+                <option value="stdio">stdio (use cvector serve instead)</option>
               </select>
             </div>
             <div class="mb-3">
@@ -254,7 +254,7 @@ export class SettingsComponent implements OnInit {
   readonly restHost = signal<string>('127.0.0.1');
   readonly restPort = signal<number>(2969);
   readonly mcpUrl = signal<string>('');
-  readonly mcpTransport = signal<Transport>('http');
+  readonly mcpTransport = signal<Transport>('sse');
   readonly dockerImage = signal<string>('neo4j');
   readonly dockerVersion = signal<string>('5');
   readonly dockerContainer = signal<string>('cvector-neo4j');
@@ -286,7 +286,7 @@ export class SettingsComponent implements OnInit {
     this.restHost.set(d.rest?.host ?? '127.0.0.1');
     this.restPort.set(d.rest?.port ?? 2969);
     this.mcpUrl.set(d.mcp?.url ?? '');
-    this.mcpTransport.set(d.mcp?.transport ?? 'http');
+    this.mcpTransport.set(d.mcp?.transport ?? 'sse');
     this.dockerImage.set(d.docker?.image ?? 'neo4j');
     this.dockerVersion.set(d.docker?.neo4jVersion ?? '5');
     this.dockerContainer.set(d.docker?.containerName ?? 'cvector-neo4j');

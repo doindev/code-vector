@@ -62,7 +62,8 @@ public class CvectorApplication implements CommandLineRunner, ExitCodeGenerator 
             int port = 2969;
             String host = "127.0.0.1";
             Map<String, Object> serverMap = null;
-            String mcpTransport = CvectorConfig.McpConfig.TRANSPORT_HTTP;
+            String mcpTransport = CvectorConfig.McpConfig.TRANSPORT_SSE;
+            String mcpSseEndpoint = null;
             try {
                 CvectorConfigService svc = new CvectorConfigService();
                 Path root = svc.findConfigRoot(Paths.get("").toAbsolutePath());
@@ -72,7 +73,9 @@ public class CvectorApplication implements CommandLineRunner, ExitCodeGenerator 
                     if (rest.port() != null && rest.port() > 0 && rest.port() <= 65_535) port = rest.port();
                     if (rest.host() != null && !rest.host().isBlank()) host = rest.host();
                     serverMap = rest.server();
-                    mcpTransport = cfg.mcpOrDefault().transport();
+                    CvectorConfig.McpConfig mcpCfg = cfg.mcpOrDefault();
+                    mcpTransport = mcpCfg.transport();
+                    mcpSseEndpoint = extractMcpSsePath(mcpCfg.url(), host, port);
                 }
             } catch (Exception ignored) {
                 // Boot with defaults; the operator can fix settings.json and restart.
@@ -114,6 +117,15 @@ public class CvectorApplication implements CommandLineRunner, ExitCodeGenerator 
             // an explicit -Dspring.ai… on the cvector command line take priority.
             if (coHostMcp) {
                 serverOverrides.put("spring.ai.mcp.server.stdio", "false");
+                // SSE subscription endpoint: derived from settings.json mcp.url path so
+                // operators who want the SSE handler at a non-default path (e.g.
+                // /mcp/cvector) can express that in one place. Falls back to /sse when
+                // mcp.url is absent or its path is empty.
+                serverOverrides.put("spring.ai.mcp.server.sse-endpoint",
+                        mcpSseEndpoint != null && !mcpSseEndpoint.isBlank() ? mcpSseEndpoint : "/sse");
+                // Message POST endpoint: stays at /mcp. Spring AI emits a session-keyed
+                // URL like /mcp?sessionId=… in the `endpoint` SSE event, so clients
+                // never need to know this path verbatim.
                 serverOverrides.put("spring.ai.mcp.server.sse-message-endpoint", "/mcp");
             }
             applySystemProperties(serverOverrides);
@@ -149,6 +161,46 @@ public class CvectorApplication implements CommandLineRunner, ExitCodeGenerator 
             } else {
                 out.put(key, String.valueOf(val));
             }
+        }
+    }
+
+    /**
+     * Parses the path component out of {@code mcp.url} so it can drive Spring AI's
+     * {@code spring.ai.mcp.server.sse-endpoint} property — i.e. the URL the operator
+     * configures in {@code settings.json} actually relocates the SSE handler instead
+     * of being a label that drifts away from the real endpoint.
+     *
+     * <p>Behaviour:
+     * <ul>
+     *   <li>Bad / unparseable URL → returns {@code null}, caller falls back to {@code /sse}.</li>
+     *   <li>URL without a path or with just {@code "/"} → returns {@code null} (default).</li>
+     *   <li>URL host:port differs from the listener's host:port → prints a warning so
+     *       the operator notices the mismatch (the server still listens on its own
+     *       host:port — only the path is honored).</li>
+     * </ul>
+     */
+    private static String extractMcpSsePath(String mcpUrl, String listenerHost, int listenerPort) {
+        if (mcpUrl == null || mcpUrl.isBlank()) return null;
+        try {
+            java.net.URI uri = java.net.URI.create(mcpUrl.trim());
+            String path = uri.getPath();
+            if (path == null || path.isBlank() || "/".equals(path)) return null;
+            String urlHost = uri.getHost();
+            int urlPort = uri.getPort();
+            boolean hostMismatch = urlHost != null && !urlHost.equalsIgnoreCase(listenerHost)
+                    && !("localhost".equalsIgnoreCase(urlHost) && listenerHost.startsWith("127."))
+                    && !("127.0.0.1".equals(urlHost) && "localhost".equalsIgnoreCase(listenerHost));
+            boolean portMismatch = urlPort > 0 && urlPort != listenerPort;
+            if (hostMismatch || portMismatch) {
+                System.err.println("warning: mcp.url host/port (" + urlHost + ":" + urlPort
+                        + ") differs from rest.host:rest.port (" + listenerHost + ":" + listenerPort
+                        + "); the server still binds at the rest.* values, only the path '" + path + "' is honored.");
+            }
+            return path;
+        } catch (Exception e) {
+            System.err.println("warning: could not parse mcp.url '" + mcpUrl + "': " + e.getMessage()
+                    + " — falling back to /sse");
+            return null;
         }
     }
 

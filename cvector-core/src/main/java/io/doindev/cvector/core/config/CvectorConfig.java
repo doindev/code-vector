@@ -214,9 +214,16 @@ public record CvectorConfig(
     }
 
     /**
-     * MCP server config. {@code transport} ∈ {@code http} | {@code sse} | {@code stdio}.
-     * {@code url} is informational for clients — the server still binds to {@link RestConfig#host}
-     * and {@link RestConfig#port} (plus the MCP path) by default.
+     * MCP server config. {@code transport} ∈ {@code sse} | {@code stdio} | {@code http}.
+     * <p>{@code sse} is the default when co-hosted with the dashboard: Spring AI 1.0.0's
+     * MCP server only implements the SSE transport (client opens {@code GET /sse},
+     * server emits an {@code endpoint} event with a {@code /mcp?sessionId=…} URL,
+     * client POSTs JSON-RPC there). The newer "Streamable HTTP" single-endpoint
+     * transport from MCP spec 2024-11-05+ is not yet supported by Spring AI; the
+     * server treats {@code http} as an alias for {@code sse} so existing config files
+     * keep working, but {@code sse} is the accurate label.
+     * <p>{@code url} is informational for clients — the server still binds to
+     * {@link RestConfig#host} and {@link RestConfig#port} regardless.
      */
     @JsonInclude(JsonInclude.Include.NON_NULL)
     public record McpConfig(String url, String transport) {
@@ -225,14 +232,16 @@ public record CvectorConfig(
         public static final String TRANSPORT_SSE = "sse";
         public static final String TRANSPORT_STDIO = "stdio";
 
+        private static final String DEFAULT_URL = "http://127.0.0.1:2969/sse";
+
         public static McpConfig defaults() {
-            return new McpConfig("http://127.0.0.1:2969/mcp", TRANSPORT_HTTP);
+            return new McpConfig(DEFAULT_URL, TRANSPORT_SSE);
         }
 
         public McpConfig withDefaults() {
             return new McpConfig(
-                    url == null || url.isBlank() ? "http://127.0.0.1:2969/mcp" : url,
-                    transport == null || transport.isBlank() ? TRANSPORT_HTTP : transport.toLowerCase());
+                    url == null || url.isBlank() ? DEFAULT_URL : url,
+                    transport == null || transport.isBlank() ? TRANSPORT_SSE : transport.toLowerCase());
         }
 
         /** Validates the transport string is one of the supported values. */

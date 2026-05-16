@@ -51,8 +51,11 @@ public class DashboardCommand implements Callable<Integer> {
         // don't have to cross-reference the settings.json file to figure out what their
         // running process actually exposes.
         boolean mcpCoHosted = !CvectorConfig.McpConfig.TRANSPORT_STDIO.equalsIgnoreCase(mcp.transport());
+        // Surface the actual SSE URL the operator put in mcp.url, so the banner doesn't
+        // drift from configuration. Falls back to the listener host/port + /sse default.
+        String mcpEffectiveUrl = (mcp.url() != null && !mcp.url().isBlank()) ? mcp.url() : (base + "/sse");
         String mcpLine = mcpCoHosted
-                ? "sse @ " + base + "/sse  (transport=" + mcp.transport() + ")"
+                ? "sse @ " + mcpEffectiveUrl + "  (transport=" + mcp.transport() + ")"
                 : "stdio only — run `cvector serve` for MCP";
         System.out.println("cvector dashboard running");
         System.out.println("  project:    " + active.name() + " (" + active.projectId() + ")");
