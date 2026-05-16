@@ -684,6 +684,78 @@ All responses are JSON. Role-based access via `cvector_role` env var (see [Roles
 
 ---
 
+## Multi-project workflows
+
+Every cvector workspace can hold many projects (`projects.<name>` map in `settings.json`). As of 0.2.0, both the CLI and the MCP tool surface treat the workspace as a multi-project catalog:
+
+- **Shared Kuzu DB by default.** All non-isolated projects live in one `~/.cvector/kuzu-data/graph.kuzu/` partitioned by `projectId`. Zero-cost project switching, native cross-project Cypher, single backup directory. Per-project escape hatch: set `projects.<name>.isolated: true` (or `cvector project create --isolated`) for the legacy per-project-directory layout — useful when concurrent CI scans need file-lock isolation.
+- **Default project resolution.** Both CLI commands and MCP tools accept an optional project argument (name, UUID, or rootPath). When omitted, they fall back to `activeProject` in `settings.json`. Set the default with `cvector project switch <name>` or the `cv_set_default_project` MCP tool.
+- **Sub-directory overlap is rejected.** `cvector project create` and `cv_add_project` both refuse a rootPath that equals, lives inside, or contains an existing project's rootPath — onboarding overlapping ranges produces ambiguous ownership for every file in the overlap.
+- **Cross-project queries.** Tools that support it (`cv_search`, `cv_stats`, `cv_health`, `cv_changes`, `cv_communities`, `cv_service_links`) accept the literal `"*"` for `project` to scope across every registered project. Each result row is tagged with its `project` block so the agent can disambiguate.
+- **Project context in every response.** Every MCP tool response that targets a specific project carries a top-level `project: { projectId, name, rootPath, isolated }` block. Confirms which project the result came from — defends against silent default-routing surprises.
+
+### Onboarding a new project (CLI)
+
+```bash
+cd /path/to/your/codebase
+cvector init --project my-app                    # bootstraps .cvector/settings.json
+cvector scan                                     # populates the graph
+
+# Add a second project to the same workspace
+cvector project create backend-api --root /work/backend --switch
+cvector scan                                     # against the new active project
+
+# Or use a one-shot override without flipping the default
+cvector --project my-app status                  # query a different project for one call
+```
+
+### Onboarding via the MCP server (AI agent)
+
+```jsonc
+// 1. Discover what's there
+{"name": "cv_list_projects"}
+
+// 2. New codebase — register + scan + brief in one call
+{"name": "cv_onboard_project",
+ "arguments": {"name": "auth-svc", "rootPath": "/work/auth-svc"}}
+
+// 3. Targeted query against the new project (project arg accepts name/UUID/path)
+{"name": "cv_search",
+ "arguments": {"project": "auth-svc", "query": "TokenStore"}}
+
+// 4. Cross-project query
+{"name": "cv_search",
+ "arguments": {"project": "*", "query": "org.slf4j"}}
+
+// 5. Change the workspace default so subsequent calls can omit `project`
+{"name": "cv_set_default_project",
+ "arguments": {"project": "auth-svc"}}
+```
+
+### Project lifecycle MCP tools
+
+| Tool | Purpose |
+|---|---|
+| `cv_list_projects` | Enumerate every project with name, projectId, rootPath, isolation flag, scan freshness, node/edge counts. The agent's primary discovery tool. |
+| `cv_find_project` | Look up a project by name, UUID, or directory path (path matching tolerates descendants of a registered rootPath). |
+| `cv_add_project` | Register a new project entry (no scan). Rejects overlapping rootPaths. |
+| `cv_scan_project` | (Re-)populate the graph for an existing project. Synchronous. |
+| `cv_onboard_project` | Register + scan + brief in one call — the convenience wrapper for IDE agents. |
+| `cv_remove_project` | Delete a project's graph data + workspace entry. Requires `confirm=true` for the actual delete (dry-run by default). |
+| `cv_set_default_project` | Update the workspace's active project so subsequent tool calls can omit `project`. |
+
+### Switching backends keeps projects intact
+
+The `projects` map in `settings.json` is backend-agnostic. Flipping `backend` between `embedded`, `remote`, and `docker` doesn't drop any project entries — the data just lives in a different store. After switching, re-run `cvector scan` against each project you want to repopulate.
+
+### Upgrading from 0.1.x
+
+The MCP tool API is breaking-changed in 0.2.0: every read tool now requires (or has an optional default fallback for) a `project` argument. AI agents wired against the old `cvector serve` will auto-rediscover the new tool descriptions on reconnect and adapt. Settings.json is forward-compatible — existing files keep working; the new `kuzu.sharedDb` and per-project `isolated` fields are both `null` by default with sensible interpretations.
+
+After upgrading, run `cvector scan` once per project to populate the new shared Kuzu DB. The old `~/.cvector/kuzu-data/<projectId>/` directories are left in place for rollback; delete them once you've confirmed the shared layout works for your workflow.
+
+---
+
 ## MCP server
 
 Run with `cvector serve` (stdio JSON-RPC). Default capabilities: **tools**, **resources**, **prompts**.
@@ -760,6 +832,96 @@ Each helper writes an MCP server entry that runs `java -jar <path>/cvector.jar s
   }
 }
 ```
+
+### Testing the stdio server with `@modelcontextprotocol/inspector`
+
+The official [MCP Inspector](https://github.com/modelcontextprotocol/inspector) is the quickest way to confirm `cvector serve` is wired correctly and to browse its tools / resources / prompts without involving an IDE. Run it from inside any project workspace that has a `.cvector/settings.json`:
+
+```bash
+cd /path/to/your/project
+
+# Windows .exe install
+npx @modelcontextprotocol/inspector "%LOCALAPPDATA%\Programs\cvector\cvector.exe" serve
+
+# Or against the fat jar (faster iteration, easier `-D` overrides)
+npx @modelcontextprotocol/inspector java -jar /path/to/cvector-app/target/cvector.jar serve
+```
+
+The Inspector spawns cvector as a child process, attaches to its stdin/stdout, and opens a web UI (default `http://localhost:6274`). With the connection panel pre-filled (Transport `STDIO`, the command + `serve` arg), click **Connect** — you should see:
+
+- **Server log** pane shows cvector's stderr banner: `cvector mcp server (stdio) ready` followed by `Registered tools: 23` / `Registered resources: 9` / `Registered prompts: 6`.
+- **Tools** tab lists all 23 `cv_*` tools, callable with form-rendered argument inputs.
+- **Resources** tab lists the 9 `cvector://*` URIs; click one to fetch its JSON.
+- **Prompts** tab lists the 6 prompts.
+
+#### Gotchas
+
+- **Working directory matters.** cvector's `.cvector/settings.json` is found by walking up from the cwd Inspector launched it from. Either `cd` into the project before invoking Inspector or set a working directory in the Inspector's "Configuration" panel once it's open.
+- **Don't type into the Inspector's terminal.** cvector's stdio MCP reads stdin as JSON-RPC; arbitrary input crashes the parser.
+- **Logs go to `~/.cvector/mcp-server.log`** plus the Inspector's "Server log" pane (stderr). cvector keeps stdout clean for JSON-RPC by design.
+- **Reconnects respawn the process.** `cvector serve` is single-shot — it exits when stdin closes, so each Inspector reconnect starts a fresh JVM. First start pays the JDK warm-up cost (~3.8 s on this repo).
+
+For a one-shot CLI sanity check without the web UI:
+
+```bash
+npx @modelcontextprotocol/inspector --cli "%LOCALAPPDATA%\Programs\cvector\cvector.exe" serve
+```
+
+That mode prints the JSON-RPC handshake to the terminal so you can verify `initialize` succeeds without opening a browser tab.
+
+### Testing the HTTP/SSE server (dashboard mode) with Inspector
+
+`cvector dashboard` exposes the same tools over Spring AI's WebMVC SSE transport. Start the dashboard, then point Inspector at the SSE URL:
+
+```bash
+cvector.exe dashboard                       # leave running in another terminal
+npx @modelcontextprotocol/inspector         # opens the web UI with no preset
+```
+
+In the Inspector connection panel:
+
+| Field | Value |
+|---|---|
+| Transport Type | `SSE` (**not** "Streamable HTTP" — Spring AI 1.0.0 only implements the SSE transport) |
+| URL | `http://localhost:2969/sse` (or whatever `mcp.url` is set to in your `.cvector/settings.json`) |
+
+Click **Connect**. The CORS headers cvector ships on `/sse`, `/mcp`, and `/mcp/**` (allowed origin patterns: `*`) let the Inspector's browser tab complete the handshake.
+
+If you get **"Failed to fetch"**, you're almost always on the wrong transport — switch from "Streamable HTTP" to "SSE" in the dropdown. If you get a 404 on `/sse`, your `mcp.url` in `settings.json` is pointing at a different path; either match the URL or restart the dashboard after editing.
+
+### GitHub Copilot for Eclipse
+
+No `setup-*` helper exists for Eclipse Copilot yet (the plugin's MCP support is new and the settings location depends on the plugin version), but every MCP-aware client consumes the same server-definition JSON. Paste the snippet below wherever your Copilot for Eclipse install accepts MCP server configuration:
+
+```json
+{
+  "mcpServers": {
+    "cvector": {
+      "command": "C:\\Users\\<your-user>\\AppData\\Local\\Programs\\cvector\\cvector.exe",
+      "args": ["serve"]
+    }
+  }
+}
+```
+
+(Linux / macOS: replace the `command` with the absolute path to the installed `cvector` binary — no `.exe`.)
+
+**Where to put it** — try these in order, the right location varies by plugin version:
+
+1. **Eclipse → Preferences → GitHub Copilot → Model Context Protocol** (or `MCP Servers`). If you see an `Edit JSON` / `Configure` button, paste the snippet directly into the editor.
+2. **Workspace file**: `<workspace>/.metadata/.plugins/com.github.copilot/mcp.json`. The plugin id varies — search your workspace `.metadata/.plugins/` for a directory containing `copilot` or `mcp`.
+3. **User-home fallback**: `~/.github-copilot/mcp.json` or `~/.copilot/mcp.json`. Some Copilot ports share settings here across IDEs.
+
+**Verify it's working:**
+
+- Restart Eclipse (or use the plugin's "Reload MCP Servers" command if present).
+- Open Copilot Chat and ask "what tools do you have?" — `cv_search`, `cv_explain`, `cv_impact`, etc. should show up alongside Copilot's built-in tools.
+- First-launch traces appear in `~/.cvector/mcp-server.log` — look for `cvector mcp server (stdio) ready` followed by `Registered tools: 23`.
+
+**If your Copilot plugin version doesn't expose MCP yet**, two workarounds:
+
+- Bridge stdio → SSE via a proxy like [`mcp-proxy`](https://github.com/sparfenyuk/mcp-proxy) and point Copilot at the SSE URL once the plugin gains SSE support.
+- Use [Continue.dev for Eclipse](https://www.continue.dev) instead — it has full first-party MCP support and consumes the same JSON snippet.
 
 ---
 

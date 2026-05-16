@@ -1108,8 +1108,27 @@ public final class KuzuGraphStore implements GraphStore {
 
     @Override
     public boolean isEmpty(String projectId) {
-        List<Map<String, Object>> rows = kuzu.read("MATCH (n:Node) RETURN count(n) AS c");
+        // Scope to projectId so shared-DB workspaces with project-A data already present
+        // still let project-B report empty (and qualify for bulk-load mode on its first scan).
+        List<Map<String, Object>> rows = kuzu.read(
+                "MATCH (n:Node) WHERE n.projectId = $pid RETURN count(n) AS c",
+                Map.of("pid", projectId));
         return rows.isEmpty() || asLong(rows.get(0).get("c")) == 0;
+    }
+
+    @Override
+    public int deleteProjectSubtree(String projectId) {
+        // Surgical "remove this project's rows from the (possibly shared) Kuzu DB" used by
+        // cv_remove_project and embedded wipe. Counts first so we can report what got
+        // removed; then DETACH DELETE in a single statement.
+        List<Map<String, Object>> count = kuzu.read(
+                "MATCH (n:Node) WHERE n.projectId = $pid RETURN count(n) AS c",
+                Map.of("pid", projectId));
+        long total = count.isEmpty() ? 0L : asLong(count.get(0).get("c"));
+        if (total == 0) return 0;
+        kuzu.write("MATCH (n:Node) WHERE n.projectId = $pid DETACH DELETE n",
+                Map.of("pid", projectId));
+        return (int) total;
     }
 
     @Override

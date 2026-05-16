@@ -41,6 +41,10 @@ public class ProjectCreateCommand implements Callable<Integer> {
             description = "Skip seeding a (paused) directory monitor for the new project root. Default: a monitor is added in disabled state so it shows up in the dashboard's Monitors view, ready to be toggled on later.")
     private boolean skipMonitor;
 
+    @Option(names = "--isolated",
+            description = "Give this project its own Kuzu DB directory at ~/.cvector/kuzu-data/<projectId>/ instead of sharing the workspace's shared DB. Useful for very large projects or CI workflows running parallel scans. Default: shared.")
+    private boolean isolated;
+
     private final CvectorRuntime runtime;
 
     public ProjectCreateCommand(CvectorRuntime runtime) {
@@ -58,16 +62,23 @@ public class ProjectCreateCommand implements Callable<Integer> {
             return 1;
         }
         Path rootPath = root != null ? root.toAbsolutePath().normalize() : Paths.get(".").toAbsolutePath().normalize();
+        String overlapError = findOverlap(cfg, rootPath);
+        if (overlapError != null) {
+            System.err.println(overlapError);
+            return 1;
+        }
         Map<String, CvectorConfig.ProjectEntry> projects = new LinkedHashMap<>(cfg.projects());
         String projectId = UUID.randomUUID().toString();
-        projects.put(name, new CvectorConfig.ProjectEntry(projectId, name, rootPath.toString()));
+        Boolean isolatedFlag = isolated ? Boolean.TRUE : null;
+        projects.put(name, new CvectorConfig.ProjectEntry(projectId, name, rootPath.toString(), null, isolatedFlag));
 
         String activeProject = switchAfter ? name : cfg.activeProject();
         CvectorConfig updated = new CvectorConfig(activeProject, projects, cfg.neo4j(),
                 cfg.backend(), cfg.rest(), cfg.mcp(), cfg.docker(), cfg.rules(), cfg.kuzu());
         svc.save(configRoot, updated);
 
-        System.out.println("created project '" + name + "' (" + projectId + ") at " + rootPath);
+        System.out.println("created project '" + name + "' (" + projectId + ") at " + rootPath
+                + (isolated ? " [isolated Kuzu DB]" : ""));
         if (switchAfter) System.out.println("active project is now '" + name + "'");
 
         if (!skipMonitor) {
@@ -91,6 +102,45 @@ public class ProjectCreateCommand implements Callable<Integer> {
      * project itself is still created — monitor seeding is best-effort, not critical).
      * If the same path is already monitored, no new entry is added.
      */
+    /**
+     * Returns a descriptive error message if {@code rootPath} overlaps with an existing
+     * project (equals it, is a descendant of it, or contains it), or {@code null} when the
+     * path is safe to register. Mirrors {@code ProjectResolver.validateAddable} from the
+     * MCP module — duplicated here so cvector-cli doesn't depend on cvector-mcp just for
+     * this one check.
+     */
+    private static String findOverlap(CvectorConfig cfg, Path normalizedNewRoot) {
+        Path candidate = tryRealOrNormalize(normalizedNewRoot);
+        if (candidate == null) return "rootPath could not be resolved: " + normalizedNewRoot;
+        for (CvectorConfig.ProjectEntry e : cfg.projects().values()) {
+            if (e.rootPath() == null) continue;
+            Path existing = tryRealOrNormalize(Paths.get(e.rootPath()));
+            if (existing == null) continue;
+            if (candidate.equals(existing)) {
+                return "rootPath '" + normalizedNewRoot + "' is already registered as project '"
+                        + e.name() + "' (" + e.projectId() + ").";
+            }
+            if (candidate.startsWith(existing)) {
+                return "rootPath '" + normalizedNewRoot + "' is inside an existing project '"
+                        + e.name() + "' (rooted at " + e.rootPath()
+                        + "). Sub-directories of existing projects cannot be onboarded — query the parent project instead.";
+            }
+            if (existing.startsWith(candidate)) {
+                return "rootPath '" + normalizedNewRoot + "' would contain an existing project '"
+                        + e.name() + "' (rooted at " + e.rootPath()
+                        + "). Onboarding a parent of an existing project is not allowed — remove the inner project first, or pick a non-overlapping rootPath.";
+            }
+        }
+        return null;
+    }
+
+    private static Path tryRealOrNormalize(Path p) {
+        if (p == null) return null;
+        Path abs = p.toAbsolutePath().normalize();
+        try { return abs.toRealPath(); }
+        catch (java.io.IOException ignored) { return abs; }
+    }
+
     private static String appendPausedMonitor(Path projectRoot) {
         Path storeFile = Paths.get(System.getProperty("user.home"), ".cvector", "dashboard.json");
         ObjectMapper mapper = new ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT);

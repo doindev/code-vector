@@ -99,6 +99,29 @@ public record CvectorConfig(
         return docker != null ? docker.withDefaults() : DockerConfig.defaults();
     }
 
+    /** Kuzu section with defaults applied where absent — the section is entirely optional. */
+    public KuzuConfig kuzuOrDefault() {
+        return kuzu != null ? kuzu : new KuzuConfig(null, null);
+    }
+
+    /**
+     * Whether the given project should use the shared Kuzu DB layout or its own directory.
+     * Shared mode is the default unless either (a) {@code kuzu.sharedDb} is explicitly
+     * {@code false} workspace-wide or (b) the project entry sets {@code isolated: true}.
+     *
+     * <p>The lookup tolerates an unknown {@code projectId} (returns the workspace-level
+     * default) so freshly-created projects that haven't been added to {@code projects}
+     * yet still get sensible routing.
+     */
+    public boolean isSharedDbMode(String projectId) {
+        if (!kuzuOrDefault().sharedDbOrDefault()) return false;
+        if (projectId == null) return true;
+        for (ProjectEntry e : projects.values()) {
+            if (projectId.equals(e.projectId())) return !e.isolatedOrDefault();
+        }
+        return true;
+    }
+
     public ProjectEntry active() {
         if (activeProject == null) return null;
         return projects.get(activeProject);
@@ -114,10 +137,28 @@ public record CvectorConfig(
      * null field that confuses new users reading their first config file.
      */
     @JsonInclude(JsonInclude.Include.NON_NULL)
-    public record ProjectEntry(String projectId, String name, String rootPath, RulesPolicy rules) {
+    public record ProjectEntry(String projectId, String name, String rootPath, RulesPolicy rules, Boolean isolated) {
         /** Legacy 3-arg constructor for callers that don't carry rules. */
         public ProjectEntry(String projectId, String name, String rootPath) {
-            this(projectId, name, rootPath, null);
+            this(projectId, name, rootPath, null, null);
+        }
+
+        /** 4-arg constructor for callers that carry rules but not the isolated flag. */
+        public ProjectEntry(String projectId, String name, String rootPath, RulesPolicy rules) {
+            this(projectId, name, rootPath, rules, null);
+        }
+
+        /**
+         * When {@code true}, this project's Kuzu graph lives in its own directory at
+         * {@code ~/.cvector/kuzu-data/<projectId>/} (the pre-0.2.0 layout) instead of
+         * sharing the workspace-level {@code ~/.cvector/kuzu-data/graph.kuzu/} with other
+         * projects. Useful for very large projects you want isolated from the shared
+         * file-lock contention, or CI workflows running parallel scans.
+         *
+         * <p>{@code null} is equivalent to {@code false}.
+         */
+        public boolean isolatedOrDefault() {
+            return Boolean.TRUE.equals(isolated);
         }
     }
 
@@ -170,7 +211,31 @@ public record CvectorConfig(
      * runtime — pick a size up front, restart cvector if you change it.
      */
     @JsonInclude(JsonInclude.Include.NON_NULL)
-    public record KuzuConfig(Integer bufferSizeMb) {}
+    public record KuzuConfig(Integer bufferSizeMb, Boolean sharedDb) {
+        /** Legacy 1-arg constructor for callers that don't carry the sharedDb flag. */
+        public KuzuConfig(Integer bufferSizeMb) {
+            this(bufferSizeMb, null);
+        }
+
+        /**
+         * When {@code true} (the default for new installs as of 0.2.0), all non-isolated
+         * projects share a single Kuzu database at {@code ~/.cvector/kuzu-data/graph.kuzu/}
+         * partitioned by node {@code projectId}. Enables zero-cost project switching and
+         * native cross-project queries.
+         *
+         * <p>When {@code false}, each project gets its own directory at
+         * {@code ~/.cvector/kuzu-data/<projectId>/graph.kuzu/} (the pre-0.2.0 layout).
+         * Use this if you run parallel scans across projects and the shared file-lock
+         * contention hurts.
+         *
+         * <p>{@code null} is treated as {@code true} so upgrading users get the new
+         * topology automatically. Per-project opt-out is via
+         * {@link ProjectEntry#isolated}.
+         */
+        public boolean sharedDbOrDefault() {
+            return sharedDb == null || Boolean.TRUE.equals(sharedDb);
+        }
+    }
 
     @JsonInclude(JsonInclude.Include.NON_NULL)
     public record Neo4jConfig(String uri, String user, String password) {

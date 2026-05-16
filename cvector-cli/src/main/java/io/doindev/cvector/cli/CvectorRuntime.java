@@ -54,6 +54,20 @@ public class CvectorRuntime {
     }
 
     public CvectorConfig.ProjectEntry requireActiveProject(CvectorConfig cfg) {
+        // One-shot override: a {@code --project <name|uuid|rootPath>} root-level flag (or
+        // any caller that set {@code cvector.project} as a system property) takes priority
+        // over the persistent activeProject field. Lets a user run e.g.
+        // {@code cvector --project frontend search Foo} without committing the switch to
+        // settings.json. Mirrors the MCP tools' optional-project-arg behaviour.
+        String override = System.getProperty("cvector.project");
+        if (override != null && !override.isBlank()) {
+            CvectorConfig.ProjectEntry hit = resolveProjectOverride(cfg, override.trim());
+            if (hit != null) return hit;
+            throw new IllegalArgumentException(
+                    "--project '" + override + "' did not match any project in settings.json. "
+                            + "Valid projects: " + String.join(", ", cfg.projects().keySet())
+                            + ". (Tools accept name, UUID, or absolute rootPath.)");
+        }
         if (cfg.activeProject() == null) {
             throw new IllegalStateException("No active project. Use `cvector project switch <name>` or set one.");
         }
@@ -62,6 +76,49 @@ public class CvectorRuntime {
             throw new IllegalStateException("Active project '" + cfg.activeProject() + "' not in config.projects map.");
         }
         return entry;
+    }
+
+    /**
+     * Resolve a one-shot project override (--project flag value) against the workspace.
+     * Tries name → UUID → exact rootPath → ancestor-rootPath match in order. Returns
+     * {@code null} when nothing matches; the caller throws with a list of candidates.
+     */
+    private static CvectorConfig.ProjectEntry resolveProjectOverride(CvectorConfig cfg, String input) {
+        if (cfg.projects().containsKey(input)) return cfg.projects().get(input);
+        for (CvectorConfig.ProjectEntry e : cfg.projects().values()) {
+            if (input.equals(e.projectId())) return e;
+        }
+        Path candidate = tryNormalize(input);
+        if (candidate != null) {
+            CvectorConfig.ProjectEntry ancestor = null;
+            int bestDepth = Integer.MAX_VALUE;
+            for (CvectorConfig.ProjectEntry e : cfg.projects().values()) {
+                if (e.rootPath() == null) continue;
+                Path existing = tryNormalize(e.rootPath());
+                if (existing == null) continue;
+                if (candidate.equals(existing)) return e;
+                if (candidate.startsWith(existing)) {
+                    int depth = candidate.getNameCount() - existing.getNameCount();
+                    if (depth >= 0 && depth < bestDepth) {
+                        bestDepth = depth;
+                        ancestor = e;
+                    }
+                }
+            }
+            if (ancestor != null) return ancestor;
+        }
+        return null;
+    }
+
+    private static Path tryNormalize(String s) {
+        if (s == null || s.isBlank()) return null;
+        try {
+            Path p = Paths.get(s).toAbsolutePath().normalize();
+            try { return p.toRealPath(); }
+            catch (IOException ignored) { return p; }
+        } catch (java.nio.file.InvalidPathException e) {
+            return null;
+        }
     }
 
     public Neo4jClient openNeo4j(CvectorConfig cfg) {
@@ -78,7 +135,7 @@ public class CvectorRuntime {
         String backend = resolveBackend(cfg);
         if (CvectorConfig.BACKEND_EMBEDDED.equals(backend)) {
             CvectorConfig.ProjectEntry entry = requireActiveProject(cfg);
-            Path db = EmbeddedKuzu.defaultDbPath(entry.projectId());
+            Path db = EmbeddedKuzu.defaultDbPath(cfg, entry.projectId());
             try {
                 EmbeddedKuzu kuzu = new EmbeddedKuzu(db, EmbeddedKuzu.bufferSizeFromConfig(cfg));
                 new KuzuSchemaBootstrap(kuzu).bootstrap();
@@ -112,13 +169,26 @@ public class CvectorRuntime {
     /**
      * Back-compat shim for callers that pre-date the backend field. Returns true when the
      * effective backend is {@code embedded}.
+     *
+     * <p>Earlier this method only consulted the legacy {@code -Dcvector.backend} system
+     * property and defaulted to {@code true} when nothing was set — which meant
+     * {@code "backend": "remote"} in {@code settings.json} was silently ignored by
+     * {@code cvector scan}, {@code cvector diff}, and the dashboard banner. Now it
+     * delegates to {@link #resolveBackend} which DOES read the loaded config, falling
+     * back through the same precedence chain (system property → env → settings.json →
+     * default embedded).
+     */
+    public static boolean isEmbeddedRequested(CvectorConfig cfg) {
+        return CvectorConfig.BACKEND_EMBEDDED.equals(resolveBackend(cfg));
+    }
+
+    /**
+     * Legacy no-arg variant — retained so callers that genuinely have no {@link CvectorConfig}
+     * loaded (e.g. very early bootstrap) keep working, but they get only the system-property
+     * / env-var precedence and default to embedded. Prefer the {@code (cfg)} overload.
      */
     public static boolean isEmbeddedRequested() {
-        if (Boolean.getBoolean("cvector.embedded")) return true;
-        String env = System.getenv("CVECTOR_EMBEDDED");
-        if (env != null && env.equalsIgnoreCase("true")) return true;
-        String override = System.getProperty("cvector.backend");
-        return override == null || override.isBlank() || override.equalsIgnoreCase(CvectorConfig.BACKEND_EMBEDDED);
+        return isEmbeddedRequested(null);
     }
 
     public ProjectContext projectContext(CvectorConfig cfg) {

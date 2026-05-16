@@ -88,7 +88,16 @@ public class WorkspaceSwitcher {
 
         log.info("switching active project: {} → {} (id={})",
                 cfg.activeProject(), key, target.projectId());
-        store.swapToProject(target.projectId());
+        // Only swap the underlying GraphStore handle when the new project lives in a
+        // different physical store. In shared-DB mode, the same Kuzu handle serves every
+        // non-isolated project via projectId filtering — nothing to swap. In isolated
+        // mode (or Neo4j), the swap is a no-op or a driver re-target, handled by the
+        // store impl. Skipping the call here avoids closing and reopening the shared
+        // Kuzu handle every time the active project changes, which would invalidate the
+        // file lock and force a schema-bootstrap round-trip.
+        if (!cfg.isSharedDbMode(target.projectId())) {
+            store.swapToProject(target.projectId());
+        }
         activeProject.replaceFields(target.projectId(), target.name(), target.rootPath());
 
         // Flush both cache layers so subsequent reads compute against the new project.

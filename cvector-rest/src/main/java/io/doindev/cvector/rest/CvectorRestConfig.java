@@ -53,7 +53,7 @@ public class CvectorRestConfig {
         CvectorConfig cfg = loadConfig(configService);
         String backend = resolveBackend(cfg);
         if (CvectorConfig.BACKEND_EMBEDDED.equals(backend)) {
-            Path db = EmbeddedKuzu.defaultDbPath(activeProject.projectId());
+            Path db = EmbeddedKuzu.defaultDbPath(cfg, activeProject.projectId());
             try {
                 EmbeddedKuzu kuzu = new EmbeddedKuzu(db, EmbeddedKuzu.bufferSizeFromConfig(cfg));
                 new KuzuSchemaBootstrap(kuzu).bootstrap();
@@ -85,11 +85,22 @@ public class CvectorRestConfig {
         return null;
     }
 
+    /**
+     * Active-project holder bean. Returns a placeholder {@code ActiveProject(null, null, null)}
+     * when the workspace has no projects registered yet (or activeProject points at a
+     * deleted entry) — that lets the dashboard / REST server / MCP boot fine for an
+     * empty workspace so the user can immediately call {@code cv_add_project} /
+     * {@code cv_onboard_project} or hit the dashboard's "add project" flow.
+     *
+     * <p>Controllers reading {@link ActiveProject#projectId()} get {@code null} in that
+     * case and are expected to return a clean 4xx/empty payload — see {@link CacheWarmer}
+     * for the existing "skip work if no project" pattern.
+     */
     @Bean
     public ActiveProject activeProject(CvectorConfigService configService) {
         CvectorConfig cfg = loadConfig(configService);
         if (cfg.activeProject() == null || !cfg.projects().containsKey(cfg.activeProject())) {
-            throw new IllegalStateException("No active project in cvector config — run `cvector init` and a `cvector scan` first.");
+            return new ActiveProject(null, null, null);
         }
         CvectorConfig.ProjectEntry e = cfg.projects().get(cfg.activeProject());
         return new ActiveProject(e.projectId(), e.name(), e.rootPath());

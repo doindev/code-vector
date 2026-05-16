@@ -116,10 +116,48 @@ public final class EmbeddedKuzu implements AutoCloseable {
             try {
                 this.connection.setMaxNumThreadForExec(Runtime.getRuntime().availableProcessors());
             } catch (RuntimeException ignored) { /* older Kuzu builds may not expose this */ }
+            writeLockfile();
         } catch (RuntimeException e) {
+            // Kuzu's open-time failure on a held file lock is opaque ("Could not set lock on
+            // file"); enrich it with the PID + timestamp from a sibling .cvector-lock file
+            // that we write at successful open. Helps users figure out which other process
+            // owns the DB without grepping for `cvector` in their task list.
+            String msg = e.getMessage() != null ? e.getMessage() : "";
+            if (msg.contains("Could not set lock")) {
+                String diag = readLockfile(dbPath);
+                throw new IOException("Kuzu database at " + dbPath + " is held by another cvector process"
+                        + (diag != null ? " (" + diag + ")" : "")
+                        + ". Stop the other process first, or set kuzu.sharedDb=false / isolated=true on this project to use its own DB.", e);
+            }
             throw new IOException("failed to open Kuzu database at " + dbPath + ": " + e.getMessage(), e);
         }
         log.debug("opened Kuzu database at {}", dbPath);
+    }
+
+    /**
+     * Drop a {@code .cvector-lock} sibling file with PID + timestamp so a future open
+     * attempt that hits Kuzu's file lock can surface a useful "owned by PID X" error.
+     * Best-effort: failure is logged but doesn't abort the open.
+     */
+    private void writeLockfile() {
+        Path lock = dbPath.resolveSibling(".cvector-lock");
+        try {
+            String pid = String.valueOf(ProcessHandle.current().pid());
+            String content = "pid=" + pid + "\ntimestamp=" + java.time.Instant.now() + "\n";
+            Files.writeString(lock, content);
+            // Best-effort cleanup on shutdown; if the JVM crashes the file leaks but the
+            // next successful open overwrites it.
+            lock.toFile().deleteOnExit();
+        } catch (IOException ignored) { }
+    }
+
+    private static String readLockfile(Path dbPath) {
+        Path lock = dbPath.resolveSibling(".cvector-lock");
+        try {
+            if (!Files.exists(lock)) return null;
+            String content = Files.readString(lock).trim().replace("\n", ", ");
+            return content;
+        } catch (IOException ignored) { return null; }
     }
 
     /**
@@ -209,8 +247,41 @@ public final class EmbeddedKuzu implements AutoCloseable {
         return Path.of(System.getProperty("user.home"), ".cvector", "kuzu-data");
     }
 
-    public static Path defaultDbPath(String projectId) {
+    /**
+     * Path to a single shared Kuzu DB that holds every non-isolated project, partitioned
+     * by the {@code projectId} node property. Introduced in 0.2.0; the previous
+     * per-project directory layout is still reachable via {@link #isolatedDbPath}.
+     */
+    public static Path sharedDbPath() {
+        return defaultDataRoot().resolve("graph.kuzu");
+    }
+
+    /** Pre-0.2.0 per-project DB path. Used when a project sets {@code isolated: true}. */
+    public static Path isolatedDbPath(String projectId) {
         return defaultDataRoot().resolve(projectId).resolve("graph.kuzu");
+    }
+
+    /**
+     * Resolves the on-disk Kuzu DB path for a project, honoring the workspace-level
+     * {@code kuzu.sharedDb} flag and the per-project {@code isolated} override.
+     *
+     * <p>{@code cfg} may be {@code null} (very early bootstrap) — in that case we
+     * fall back to the shared path so freshly-created projects land in the default
+     * topology.
+     */
+    public static Path defaultDbPath(CvectorConfig cfg, String projectId) {
+        if (cfg == null || cfg.isSharedDbMode(projectId)) return sharedDbPath();
+        return isolatedDbPath(projectId);
+    }
+
+    /**
+     * @deprecated Pass the loaded {@link CvectorConfig} so the shared/isolated routing
+     *     can be honored; this overload always returns the pre-0.2.0 per-project path
+     *     and is retained only for callers in early bootstrap paths.
+     */
+    @Deprecated
+    public static Path defaultDbPath(String projectId) {
+        return isolatedDbPath(projectId);
     }
 
     public Path dbPath() { return dbPath; }

@@ -22,7 +22,27 @@ public class StatusCommand implements Callable<Integer> {
     @Override
     public Integer call() {
         CvectorConfig cfg = runtime.loadConfig();
-        CvectorConfig.ProjectEntry active = runtime.requireActiveProject(cfg);
+        // Empty-workspace tolerance: with no projects registered (and no --project override)
+        // `requireActiveProject` throws. Status should still print something useful — the
+        // workspace summary — so the user can confirm cvector found their settings.json
+        // and then run `cvector init` or `cvector project create`.
+        CvectorConfig.ProjectEntry active;
+        try { active = runtime.requireActiveProject(cfg); }
+        catch (RuntimeException ex) { active = null; }
+
+        if (active == null) {
+            System.out.println("workspace: " + cfg.projects().size() + " project(s) registered");
+            if (cfg.projects().isEmpty()) {
+                System.out.println("  (none — run `cvector init` from your codebase directory, or `cvector project create <name> --root <path>`)");
+            } else {
+                System.out.println("  no active project set. Use `cvector project switch <name>` or pass --project <name> on the next call.");
+                System.out.println("  registered:");
+                cfg.projects().forEach((name, p) ->
+                        System.out.printf("    %-30s %s%n", name, p.rootPath()));
+            }
+            return 0;
+        }
+
         try (GraphStore store = runtime.openGraphStore(cfg)) {
             if (!store.ping()) {
                 System.err.println("graph backend unreachable at " + store.displayUri());

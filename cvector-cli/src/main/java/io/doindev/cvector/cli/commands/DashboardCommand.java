@@ -36,10 +36,15 @@ public class DashboardCommand implements Callable<Integer> {
     @Override
     public Integer call() throws InterruptedException {
         CvectorConfig cfg = runtime.loadConfig();
-        CvectorConfig.ProjectEntry active = runtime.requireActiveProject(cfg);
+        // Tolerate empty workspaces — the dashboard boots fine and the SPA can guide the
+        // user through onboarding a first project via the REST API / MCP tools. Try
+        // requireActiveProject best-effort; fall back to a placeholder banner.
+        CvectorConfig.ProjectEntry active;
+        try { active = runtime.requireActiveProject(cfg); }
+        catch (RuntimeException e) { active = null; }
 
         int effectivePort = port != null ? port : 2969;
-        String backend = CvectorRuntime.isEmbeddedRequested()
+        String backend = CvectorRuntime.isEmbeddedRequested(cfg)
                 ? "kuzu (embedded)"
                 : "neo4j @ " + cfg.neo4jOrDefault().uri();
         String base = "http://localhost:" + effectivePort;
@@ -58,7 +63,11 @@ public class DashboardCommand implements Callable<Integer> {
                 ? "sse @ " + mcpEffectiveUrl + "  (transport=" + mcp.transport() + ")"
                 : "stdio only — run `cvector serve` for MCP";
         System.out.println("cvector dashboard running");
-        System.out.println("  project:    " + active.name() + " (" + active.projectId() + ")");
+        if (active != null) {
+            System.out.println("  project:    " + active.name() + " (" + active.projectId() + ")");
+        } else {
+            System.out.println("  project:    <none registered — use the SPA or cv_add_project to add one>");
+        }
         System.out.println("  backend:    " + backend);
         System.out.println("  api:        " + base + "/api");
         System.out.println("  dashboard:  " + base + "/dashboard");

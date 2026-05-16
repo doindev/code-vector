@@ -56,7 +56,7 @@ public class McpServerConfig {
     public GraphStore mcpGraphStore(CvectorConfigService configService, McpActiveProject project) {
         CvectorConfig cfg = loadConfig(configService);
         if (embeddedRequested()) {
-            Path db = EmbeddedKuzu.defaultDbPath(project.projectId());
+            Path db = EmbeddedKuzu.defaultDbPath(cfg, project.projectId());
             try {
                 EmbeddedKuzu kuzu = new EmbeddedKuzu(db, EmbeddedKuzu.bufferSizeFromConfig(cfg));
                 new KuzuSchemaBootstrap(kuzu).bootstrap();
@@ -69,21 +69,39 @@ public class McpServerConfig {
         return new Neo4jGraphStore(new Neo4jClient(n.uri(), n.user(), n.password()));
     }
 
+    /**
+     * Resolves project name / UUID / path arguments supplied by MCP clients to canonical
+     * {@link CvectorConfig.ProjectEntry} records. Single source of truth for "what is the
+     * agent talking about" across every tool — the previous {@code McpActiveProject} bean
+     * (single, frozen at boot) is gone in 0.2.0 because the API now requires tools to be
+     * explicit about which project they target.
+     */
+    @Bean
+    public ProjectResolver projectResolver(CvectorConfigService configService, GraphStore mcpGraphStore) {
+        return new ProjectResolver(configService, mcpGraphStore);
+    }
+
+    /**
+     * Back-compat shim for callers (notably {@link CvectorResources}) that still need
+     * "the active project on boot" until they migrate to per-call projectId. New code
+     * should depend on {@link ProjectResolver} instead.
+     */
     @Bean
     public McpActiveProject mcpActiveProject(CvectorConfigService configService) {
         CvectorConfig cfg = loadConfig(configService);
         if (cfg.activeProject() == null || !cfg.projects().containsKey(cfg.activeProject())) {
-            throw new IllegalStateException("No active project — run `cvector init` and `cvector scan` first.");
+            // Empty-workspace placeholder so `cvector serve` / `cvector dashboard` boot
+            // without an existing project. The agent's first move can be cv_add_project
+            // or cv_onboard_project — neither requires an existing active project.
+            return new McpActiveProject(null, null, null);
         }
         CvectorConfig.ProjectEntry e = cfg.projects().get(cfg.activeProject());
         return new McpActiveProject(e.projectId(), e.name(), e.rootPath());
     }
 
     @Bean
-    public CvectorTools cvectorTools(GraphStore graphStore,
-                                     McpActiveProject mcpActiveProject,
-                                     CvectorConfigService configService) {
-        return new CvectorTools(graphStore, mcpActiveProject, configService);
+    public CvectorTools cvectorTools(GraphStore graphStore, ProjectResolver projectResolver) {
+        return new CvectorTools(graphStore, projectResolver);
     }
 
     @Bean
@@ -167,6 +185,7 @@ public class McpServerConfig {
      */
     @org.springframework.stereotype.Component
     @Lazy(false)
+    @Profile("mcp")
     public static class McpSyncServerEagerInitializer {
         public McpSyncServerEagerInitializer(McpSyncServer mcpSyncServer) {
             // Intentionally empty — the constructor parameter alone is the trigger.

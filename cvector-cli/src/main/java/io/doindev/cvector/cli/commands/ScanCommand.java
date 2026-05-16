@@ -46,8 +46,13 @@ public class ScanCommand implements Callable<Integer> {
     @Parameters(index = "0", arity = "0..1", description = "Directory to scan (default: current directory).")
     private Path path = Paths.get(".");
 
-    @Option(names = "--project", description = "Project name to scan into (defaults to active project).")
-    private String project;
+    // The local --project option was removed in 0.2.0 in favour of the root-level
+    // `--project` flag declared on {@link io.doindev.cvector.cli.CvectorCommand} with
+    // {@code scope = INHERIT}. That sets {@code cvector.project} as a system property,
+    // which {@link CvectorRuntime#requireActiveProject} reads before falling back to
+    // {@code activeProject} — same behaviour, with the bonus of working for every
+    // command consistently. Existing {@code cvector scan --project foo} invocations
+    // need to switch to {@code cvector --project foo scan}.
 
     @Option(names = "--no-clean", description = "Skip removing nodes that became stale (default: clean).")
     private boolean noClean;
@@ -63,21 +68,16 @@ public class ScanCommand implements Callable<Integer> {
     @Override
     public Integer call() throws Exception {
         CvectorConfig cfg = runtime.loadConfig();
-        if (project != null) {
-            if (!cfg.projects().containsKey(project)) {
-                System.err.println("project '" + project + "' not found in config");
-                return 1;
-            }
-            cfg = new CvectorConfig(project, cfg.projects(), cfg.neo4j(),
-                    cfg.backend(), cfg.rest(), cfg.mcp(), cfg.docker(), cfg.rules(), cfg.kuzu());
-        }
+        // No local --project handling: the root-level `--project` flag (scope=INHERIT)
+        // sets a system property that runtime.projectContext / requireActiveProject
+        // reads transparently.
         ProjectContext ctx = runtime.projectContext(cfg);
         Path scanRoot = path.toAbsolutePath().normalize();
 
         System.out.println("scanning " + scanRoot + " into project '" + ctx.projectName() + "' (" + ctx.projectId() + ")");
         System.out.println("parsers: " + parsers.stream().map(Parser::name).toList());
 
-        return CvectorRuntime.isEmbeddedRequested()
+        return CvectorRuntime.isEmbeddedRequested(cfg)
                 ? scanEmbedded(cfg, ctx, scanRoot)
                 : scanNeo4j(cfg, ctx, scanRoot);
     }
@@ -195,12 +195,12 @@ public class ScanCommand implements Callable<Integer> {
      * back to the MERGE-based ingestor on re-scans.
      */
     private Integer scanEmbedded(CvectorConfig cfg, ProjectContext ctx, Path scanRoot) throws Exception {
-        Path db = EmbeddedKuzu.defaultDbPath(ctx.projectId());
+        Path db = EmbeddedKuzu.defaultDbPath(cfg, ctx.projectId());
         System.out.println("backend: embedded kuzu @ " + db);
         java.time.Instant scanStartInstant = java.time.Instant.now();
         try (EmbeddedKuzu kuzu = new EmbeddedKuzu(db, EmbeddedKuzu.bufferSizeFromConfig(cfg))) {
             new KuzuSchemaBootstrap(kuzu).bootstrap();
-            boolean empty = isKuzuEmpty(kuzu);
+            boolean empty = isKuzuEmpty(kuzu, ctx.projectId());
             String mode = empty ? "bulk" : "merge";
             System.out.println("ingest mode: " + mode + (empty ? " (empty DB → COPY FROM)" : " (incremental → MERGE)"));
 
@@ -364,8 +364,16 @@ public class ScanCommand implements Callable<Integer> {
         return out;
     }
 
-    private static boolean isKuzuEmpty(EmbeddedKuzu kuzu) {
-        List<Map<String, Object>> rows = kuzu.read("MATCH (n:Node) RETURN count(n) AS c");
+    /**
+     * Whether the given project has no rows in the (possibly shared) Kuzu DB. Scoped by
+     * {@code projectId} so a shared-DB workspace with project-A data already loaded still
+     * lets project-B's first scan use the bulk-load fast path — bulk {@code COPY FROM}
+     * appends, and there's nothing for the new project to collide with.
+     */
+    private static boolean isKuzuEmpty(EmbeddedKuzu kuzu, String projectId) {
+        List<Map<String, Object>> rows = kuzu.read(
+                "MATCH (n:Node) WHERE n.projectId = $pid RETURN count(n) AS c",
+                Map.of("pid", projectId));
         if (rows.isEmpty()) return true;
         Object c = rows.get(0).get("c");
         return !(c instanceof Number) || ((Number) c).longValue() == 0;
