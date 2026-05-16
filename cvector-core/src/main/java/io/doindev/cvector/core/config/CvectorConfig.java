@@ -1,5 +1,6 @@
 package io.doindev.cvector.core.config;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonInclude;
 
 import java.util.LinkedHashMap;
@@ -157,6 +158,9 @@ public record CvectorConfig(
          *
          * <p>{@code null} is equivalent to {@code false}.
          */
+        @JsonIgnore  // Jackson's is-prefix bean introspection would otherwise expose this as
+                    // a serialised property called "olatedOrDefault" (stripping the leading
+                    // "is"), polluting every settings.json write.
         public boolean isolatedOrDefault() {
             return Boolean.TRUE.equals(isolated);
         }
@@ -232,6 +236,7 @@ public record CvectorConfig(
          * topology automatically. Per-project opt-out is via
          * {@link ProjectEntry#isolated}.
          */
+        @JsonIgnore  // same Jackson is-prefix concern as ProjectEntry.isolatedOrDefault.
         public boolean sharedDbOrDefault() {
             return sharedDb == null || Boolean.TRUE.equals(sharedDb);
         }
