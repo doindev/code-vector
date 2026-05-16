@@ -95,6 +95,21 @@ public class MonitorRunner {
     public synchronized void activate(DashboardStore.Monitor m) {
         deactivate(m.id());
         if (!m.enabled()) return;
+        // Empty-workspace tolerance: the active project can have a null rootPath when no
+        // project is registered yet. Skip the activation entirely — there's no project
+        // root to validate against, and file events would have no projectId to attribute
+        // ingestion to. The monitor stays in the store; once the user registers a project
+        // and a re-activation is triggered (via the controller) it'll wire up properly.
+        if (project.rootPath() == null || project.projectId() == null) {
+            log.info("monitor '{}' skipped: no active project. Register one via cv_add_project / `cvector project create`, then re-enable the monitor.", m.path());
+            return;
+        }
+        // Stored monitors with a null path (corrupted dashboard.json or pre-0.2.0 state)
+        // would crash Paths.get; defend against it too.
+        if (m.path() == null || m.path().isBlank()) {
+            log.warn("monitor id={} has a null/blank path; skipping. Edit ~/.cvector/dashboard.json to remove it.", m.id());
+            return;
+        }
         Path root = Paths.get(m.path());
         if (!Files.isDirectory(root)) {
             log.warn("monitor '{}' is not a directory; skipping (refresh after the path exists to retry)", m.path());

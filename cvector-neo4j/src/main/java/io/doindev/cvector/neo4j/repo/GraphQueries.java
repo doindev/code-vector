@@ -18,6 +18,11 @@ public class GraphQueries {
     }
 
     public Map<String, Long> nodeCounts(String projectId) {
+        // Empty-workspace tolerance: callers may pass null when no project is registered
+        // (the ActiveProject bean now uses a (null, null, null) placeholder). Cypher
+        // parameters can't carry null without driver rejection; short-circuit here so
+        // every consumer (REST controllers, MCP tools) gets a clean empty result.
+        if (projectId == null) return Map.of();
         var rows = client.read(
                 "MATCH (n) WHERE n.projectId = $pid RETURN labels(n)[0] AS label, count(*) AS c",
                 Map.of("pid", projectId)
@@ -30,6 +35,7 @@ public class GraphQueries {
     }
 
     public Map<String, Long> edgeCounts(String projectId) {
+        if (projectId == null) return Map.of();
         var rows = client.read(
                 "MATCH (a)-[r]->(b) WHERE a.projectId = $pid AND b.projectId = $pid "
                         + "RETURN type(r) AS type, count(*) AS c",

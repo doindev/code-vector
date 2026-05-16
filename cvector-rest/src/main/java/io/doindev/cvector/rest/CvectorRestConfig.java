@@ -86,6 +86,25 @@ public class CvectorRestConfig {
     }
 
     /**
+     * Bumps Tomcat's NIO socket write buffer from the 8 KiB default to 256 KiB so MCP
+     * SSE event frames carrying large tool responses (cv_list_projects with rich
+     * metadata, cv_onboard with full briefing, cv_search with many hits) don't blow up
+     * with {@code java.nio.BufferOverflowException} mid-write. The default ByteBuffer is
+     * too small once a single SSE event exceeds ~8 KiB AND we're running under virtual
+     * threads — the NIO connector's blocking-write path on a virtual thread doesn't
+     * gracefully chunk large payloads. A larger app buffer absorbs realistic MCP
+     * responses without touching client-side framing.
+     */
+    @Bean
+    public org.springframework.boot.web.server.WebServerFactoryCustomizer<
+            org.springframework.boot.web.embedded.tomcat.TomcatServletWebServerFactory> tomcatWriteBufferCustomizer() {
+        return factory -> factory.addConnectorCustomizers(connector -> {
+            connector.setProperty("socket.appWriteBufSize", "262144");
+            connector.setProperty("socket.appReadBufSize", "262144");
+        });
+    }
+
+    /**
      * Active-project holder bean. Returns a placeholder {@code ActiveProject(null, null, null)}
      * when the workspace has no projects registered yet (or activeProject points at a
      * deleted entry) — that lets the dashboard / REST server / MCP boot fine for an

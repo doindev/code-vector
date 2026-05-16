@@ -51,11 +51,20 @@ public class DoctorController {
     @GetMapping("/doctor")
     public Map<String, Object> doctor() {
         Map<String, Object> out = new LinkedHashMap<>();
-        out.put("project", Map.of(
-                "projectId", project.projectId(),
-                "name", project.name(),
-                "rootPath", project.rootPath()
-        ));
+        // Empty-workspace tolerance: ActiveProject fields can be null when settings.json
+        // has no projects yet. Map.of() rejects null values, so build a LinkedHashMap
+        // explicitly (which accepts them) and emit a null `project` when there's nothing
+        // to report. The rest of the doctor surface (jvm, cache, backend connectivity)
+        // is still meaningful without a project.
+        if (project.projectId() == null) {
+            out.put("project", null);
+        } else {
+            Map<String, Object> pInfo = new LinkedHashMap<>();
+            pInfo.put("projectId", project.projectId());
+            pInfo.put("name", project.name());
+            pInfo.put("rootPath", project.rootPath());
+            out.put("project", pInfo);
+        }
         out.put("backend", Map.of(
                 "kind", store.backend(),
                 "uri", store.displayUri()
@@ -100,10 +109,17 @@ public class DoctorController {
     private List<Map<String, Object>> runChecks() {
         List<Map<String, Object>> checks = new ArrayList<>();
 
-        // Active project is implicit — if ActiveProject couldn't resolve it, the bean
-        // would have failed to construct and we wouldn't be answering this request.
-        checks.add(check("Active project", "ok",
-                "resolved to " + project.name() + " (" + project.projectId() + ")"));
+        // Empty-workspace handling: ActiveProject may carry null fields when no project
+        // is registered yet. Surface that as a top-level "no active project" check so
+        // doctor still returns 200, then skip the per-project graph counts below.
+        boolean hasProject = project.projectId() != null;
+        if (hasProject) {
+            checks.add(check("Active project", "ok",
+                    "resolved to " + project.name() + " (" + project.projectId() + ")"));
+        } else {
+            checks.add(check("Active project", "warn",
+                    "no project registered yet — run `cvector init` or call cv_add_project / cv_onboard_project"));
+        }
 
         long pingStart = System.nanoTime();
         boolean pingOk;
@@ -121,14 +137,19 @@ public class DoctorController {
                 schemaOk ? "ok" : "fail",
                 schemaOk ? "all expected labels/relationships present" : "schema bootstrap missing — run cvector scan"));
 
-        long totalNodes = store.nodeCounts(project.projectId()).values().stream().mapToLong(Long::longValue).sum();
-        long totalEdges = store.edgeCounts(project.projectId()).values().stream().mapToLong(Long::longValue).sum();
-        boolean hasData = totalNodes > 0;
-        checks.add(check("Graph has data",
-                hasData ? "ok" : "warn",
-                hasData
-                        ? totalNodes + " node(s) / " + totalEdges + " edge(s)"
-                        : "no nodes in graph — run a cvector scan to populate"));
+        if (hasProject) {
+            long totalNodes = store.nodeCounts(project.projectId()).values().stream().mapToLong(Long::longValue).sum();
+            long totalEdges = store.edgeCounts(project.projectId()).values().stream().mapToLong(Long::longValue).sum();
+            boolean hasData = totalNodes > 0;
+            checks.add(check("Graph has data",
+                    hasData ? "ok" : "warn",
+                    hasData
+                            ? totalNodes + " node(s) / " + totalEdges + " edge(s)"
+                            : "no nodes in graph — run a cvector scan to populate"));
+        } else {
+            checks.add(check("Graph has data", "skip",
+                    "no active project — nothing to query yet"));
+        }
 
         checks.add(check("Virtual threads",
                 virtualThreadsEnabled ? "ok" : "warn",

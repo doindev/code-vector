@@ -78,17 +78,24 @@ public class StatsController {
     private Map<String, Object> buildProjects() {
         Map<String, Object> out = new LinkedHashMap<>();
         // Active project pulled from the bean — that's the one with a live GraphStore.
-        Map<String, Object> active = new LinkedHashMap<>();
-        active.put("projectId", project.projectId());
-        active.put("name", project.name());
-        active.put("rootPath", project.rootPath());
-        active.put("backend", store.backend());
-        active.put("uri", store.displayUri());
-        Map<String, Long> nodes = store.nodeCounts(project.projectId());
-        Map<String, Long> edges = store.edgeCounts(project.projectId());
-        active.put("nodes", nodes.values().stream().mapToLong(Long::longValue).sum());
-        active.put("edges", edges.values().stream().mapToLong(Long::longValue).sum());
-        out.put("active", active);
+        // Empty-workspace tolerance: ActiveProject can carry null fields when settings.json
+        // has no projects registered yet. Emit an "active: null" sentinel instead of NPE'ing
+        // on Map.of(...) with null values, and skip the GraphStore round-trip entirely.
+        if (project.projectId() == null) {
+            out.put("active", null);
+        } else {
+            Map<String, Object> active = new LinkedHashMap<>();
+            active.put("projectId", project.projectId());
+            active.put("name", project.name());
+            active.put("rootPath", project.rootPath());
+            active.put("backend", store.backend());
+            active.put("uri", store.displayUri());
+            Map<String, Long> nodes = store.nodeCounts(project.projectId());
+            Map<String, Long> edges = store.edgeCounts(project.projectId());
+            active.put("nodes", nodes.values().stream().mapToLong(Long::longValue).sum());
+            active.put("edges", edges.values().stream().mapToLong(Long::longValue).sum());
+            out.put("active", active);
+        }
 
         // Full workspace list from settings.json. Read defensively — if the file moved or is
         // mid-edit we'd rather degrade to "just the active project" than 500.
