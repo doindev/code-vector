@@ -7,10 +7,11 @@ import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
 
 import java.awt.Desktop;
+import java.net.HttpURLConnection;
 import java.net.URI;
+import java.net.URL;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
 
 @Component
 @Command(name = "dashboard",
@@ -42,11 +43,23 @@ public class DashboardCommand implements Callable<Integer> {
                 ? "kuzu (embedded)"
                 : "neo4j @ " + cfg.neo4jOrDefault().uri();
         String base = "http://localhost:" + effectivePort;
+        CvectorConfig.McpConfig mcp = cfg.mcpOrDefault();
+        // mcp.transport drives whether MCP is co-hosted with the dashboard. "stdio" opts
+        // out (dashboard runs alone, MCP is only available via `cvector serve`); anything
+        // else (http / sse) co-hosts the WebMvc SSE transport at /sse with the message
+        // endpoint at /mcp?sessionId=…. The banner reflects the live wiring so operators
+        // don't have to cross-reference the settings.json file to figure out what their
+        // running process actually exposes.
+        boolean mcpCoHosted = !CvectorConfig.McpConfig.TRANSPORT_STDIO.equalsIgnoreCase(mcp.transport());
+        String mcpLine = mcpCoHosted
+                ? "sse @ " + base + "/sse  (transport=" + mcp.transport() + ")"
+                : "stdio only — run `cvector serve` for MCP";
         System.out.println("cvector dashboard running");
         System.out.println("  project:    " + active.name() + " (" + active.projectId() + ")");
         System.out.println("  backend:    " + backend);
         System.out.println("  api:        " + base + "/api");
         System.out.println("  dashboard:  " + base + "/dashboard");
+        System.out.println("  mcp:        " + mcpLine);
         System.out.println();
         System.out.println("Endpoints:");
         for (String e : new String[]{
@@ -66,19 +79,22 @@ public class DashboardCommand implements Callable<Integer> {
 
         if (openBrowser) {
             // Launch in a background thread so a slow browser open doesn't block the
-            // shutdown latch below. The 600ms delay gives Tomcat a beat to bind the
-            // port -- without it Chrome often races and shows ERR_CONNECTION_REFUSED.
+            // shutdown latch below. CommandLineRunner runs after Spring's context refresh
+            // (which boots Tomcat), but on a cold start the banner can print seconds
+            // before the bind is actually accepting traffic -- and on slow machines the
+            // MCP profile's eager bean wiring extends boot to 30+ seconds. Poll
+            // /api/health until it responds (or give up after ~30 s) so the browser only
+            // opens once the user can actually see something.
+            URI url = URI.create(base + "/dashboard/");
             Thread opener = new Thread(() -> {
-                try {
-                    TimeUnit.MILLISECONDS.sleep(600);
-                    URI url = URI.create(base + "/dashboard/");
-                    if (openInBrowser(url)) {
-                        System.out.println("opened " + url + " in default browser");
-                    } else {
-                        System.out.println("(--open requested but no opener available; visit " + url + " manually)");
-                    }
-                } catch (Exception e) {
-                    System.err.println("failed to open browser: " + e.getMessage());
+                if (!waitForHealth(base + "/api/health", 30_000L)) {
+                    System.out.println("(--open requested but /api/health didn't respond in 30 s; visit " + url + " manually)");
+                    return;
+                }
+                if (openInBrowser(url)) {
+                    System.out.println("opened " + url + " in default browser");
+                } else {
+                    System.out.println("(--open requested but no opener available; visit " + url + " manually)");
                 }
             }, "cvector-open-browser");
             opener.setDaemon(true);
@@ -116,6 +132,38 @@ public class DashboardCommand implements Callable<Integer> {
      * Returns {@code false} only when every path fails, which is when the caller
      * tells the user to paste the URL manually.
      */
+    /**
+     * Polls {@code /api/health} every 500 ms until it returns 200 or {@code maxWaitMs}
+     * elapses. Used by the {@code --open} flow so we only open the browser after the
+     * server is actually accepting traffic; otherwise on slow boots (MCP profile eager
+     * init can stretch first-time startup past 20 s) the browser races Spring Boot and
+     * the user sees {@code ERR_CONNECTION_REFUSED} on the new tab.
+     */
+    private static boolean waitForHealth(String healthUrl, long maxWaitMs) {
+        long deadline = System.currentTimeMillis() + maxWaitMs;
+        URL url;
+        try { url = URI.create(healthUrl).toURL(); }
+        catch (Exception e) { return false; }
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                HttpURLConnection c = (HttpURLConnection) url.openConnection();
+                c.setRequestMethod("GET");
+                c.setConnectTimeout(500);
+                c.setReadTimeout(500);
+                int code = c.getResponseCode();
+                c.disconnect();
+                if (code == 200) return true;
+            } catch (Exception ignored) {
+                // Connection refused / SocketTimeoutException — keep polling.
+            }
+            try { Thread.sleep(500); } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+        return false;
+    }
+
     private static boolean openInBrowser(URI url) {
         try {
             if (Desktop.isDesktopSupported()

@@ -1,6 +1,7 @@
 package io.doindev.cvector.dashboard;
 
 import io.doindev.cvector.rest.ActiveProject;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -25,6 +26,7 @@ import java.util.Map;
  */
 @RestController
 @RequestMapping("/api/dashboard")
+@ConditionalOnBean(ActiveProject.class)
 public class DashboardController {
 
     private final DashboardStore store;
