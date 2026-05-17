@@ -86,21 +86,29 @@ public class CvectorRestConfig {
     }
 
     /**
-     * Bumps Tomcat's NIO socket write buffer from the 8 KiB default to 256 KiB so MCP
-     * SSE event frames carrying large tool responses (cv_list_projects with rich
-     * metadata, cv_onboard with full briefing, cv_search with many hits) don't blow up
-     * with {@code java.nio.BufferOverflowException} mid-write. The default ByteBuffer is
-     * too small once a single SSE event exceeds ~8 KiB AND we're running under virtual
-     * threads — the NIO connector's blocking-write path on a virtual thread doesn't
-     * gracefully chunk large payloads. A larger app buffer absorbs realistic MCP
-     * responses without touching client-side framing.
+     * Bumps Tomcat's NIO socket write buffer from the 8 KiB default to 64 KiB so MCP
+     * SSE event frames carrying tool responses (cv_list_projects with rich metadata,
+     * cv_onboard with full briefing, cv_search with many hits) don't blow up with
+     * {@code java.nio.BufferOverflowException} mid-write.
+     *
+     * <p><b>Why 64 KiB and not bigger.</b> An earlier version set this to 256 KiB.
+     * Under concurrent SSE writes that triggered a second, opposite NIO bug:
+     * {@code IllegalArgumentException: newPosition > limit: (262144 > 1871)} from
+     * {@code IOUtil.write} — Tomcat's app-level write buffer was much larger than the
+     * temporary direct buffer the JDK NIO layer allocated for the actual send,
+     * and the position-tracking code overflowed. 64 KiB covers every realistic
+     * MCP SSE event we produce (the largest measured is ~30 KiB) while staying
+     * close enough to typical OS SO_SNDBUF that the direct-buffer copy stays
+     * within bounds. If a future tool starts producing >64 KiB SSE events, watch
+     * for {@code BufferOverflowException} again and raise this value carefully —
+     * but pair the raise with a stress test of concurrent SSE writes.
      */
     @Bean
     public org.springframework.boot.web.server.WebServerFactoryCustomizer<
             org.springframework.boot.web.embedded.tomcat.TomcatServletWebServerFactory> tomcatWriteBufferCustomizer() {
         return factory -> factory.addConnectorCustomizers(connector -> {
-            connector.setProperty("socket.appWriteBufSize", "262144");
-            connector.setProperty("socket.appReadBufSize", "262144");
+            connector.setProperty("socket.appWriteBufSize", "65536");
+            connector.setProperty("socket.appReadBufSize", "65536");
         });
     }
 
