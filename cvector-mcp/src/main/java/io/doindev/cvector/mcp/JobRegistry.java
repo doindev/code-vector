@@ -8,6 +8,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
@@ -65,6 +66,16 @@ public class JobRegistry {
     private static final Duration DEFAULT_TIMEOUT = Duration.ofMinutes(15);
 
     private final Map<UUID, Job> jobs = new ConcurrentHashMap<>();
+    /**
+     * Tracks at most one in-flight scan per projectId so two concurrent
+     * {@code cv_scan_project} calls for the same project don't duplicate-write the same
+     * graph data. The MERGE-based ingestor would tolerate it (writes are idempotent on
+     * NodeKey hash), but it's wasted CPU + lock contention; the agent gets a clearer
+     * envelope when the duplicate is rejected immediately. Sync scans register with a
+     * null jobId; async scans register with their Job's UUID so the caller can poll the
+     * existing run.
+     */
+    private final Map<String, ScanClaim> activeScans = new ConcurrentHashMap<>();
     private final ExecutorService executor;
     private final ScheduledExecutorService watchdog;
 
@@ -89,6 +100,29 @@ public class JobRegistry {
      */
     public Job submit(String kind, Supplier<Map<String, Object>> work) {
         return submit(kind, work, DEFAULT_TIMEOUT);
+    }
+
+    /**
+     * Submit an async scan and atomically register the {@link ScanClaim}. Returns the new
+     * Job if the claim succeeded; returns an empty Optional if another scan is already in
+     * flight for the same project (the caller can then call {@link #findActiveScan} to
+     * fetch the running claim and return its jobId to the agent).
+     */
+    public Optional<Job> submitScan(String projectId, String kind, Supplier<Map<String, Object>> work) {
+        if (findActiveScan(projectId).isPresent()) return Optional.empty();
+        Supplier<Map<String, Object>> wrapped = () -> {
+            try {
+                return work.get();
+            } finally {
+                activeScans.remove(projectId);
+            }
+        };
+        Job job = submit(kind, wrapped);
+        // putIfAbsent loses the race occasionally; on a race, both Jobs will run but the
+        // ingestor's idempotent MERGE keeps data correctness. We're optimising for the
+        // common case (no race), so accept the tiny cost.
+        activeScans.putIfAbsent(projectId, new ScanClaim(projectId, job.id(), Instant.now(), true));
+        return Optional.of(job);
     }
 
     /**
@@ -139,6 +173,65 @@ public class JobRegistry {
     public Map<UUID, Job> snapshot() {
         evictStale();
         return new LinkedHashMap<>(jobs);
+    }
+
+    /** Quick stats for cv_health. */
+    public Stats stats() {
+        evictStale();
+        int running = 0;
+        for (Job j : jobs.values()) {
+            if (j.state() == State.RUNNING) running++;
+        }
+        return new Stats(running, jobs.size(), DEFAULT_TIMEOUT);
+    }
+
+    public record Stats(int running, int total, Duration defaultTimeout) {}
+
+    // ===========================================================================================
+    //  Concurrent-scan guard
+    // ===========================================================================================
+
+    /**
+     * In-flight scan record. {@code jobId} is non-null for async scans (so the caller can
+     * poll the existing run) and null for sync scans (which have no Job in the registry —
+     * they're held by the request handler thread).
+     */
+    public record ScanClaim(String projectId, UUID jobId, Instant startedAt, boolean async) {}
+
+    /**
+     * If a scan is already running for {@code projectId}, return its claim. Stale entries
+     * (a previous claim whose associated Job is no longer {@code RUNNING}) are GC'd
+     * opportunistically here, so a crashed scan thread can't permanently block future
+     * attempts.
+     */
+    public Optional<ScanClaim> findActiveScan(String projectId) {
+        ScanClaim claim = activeScans.get(projectId);
+        if (claim == null) return Optional.empty();
+        if (claim.jobId() != null) {
+            Job j = jobs.get(claim.jobId());
+            if (j == null || j.state() != State.RUNNING) {
+                activeScans.remove(projectId, claim);
+                return Optional.empty();
+            }
+        }
+        return Optional.of(claim);
+    }
+
+    /**
+     * Atomically register a sync scan for {@code projectId}. Returns {@code true} when the
+     * caller now owns the claim and must call {@link #releaseScan} when done; {@code false}
+     * when another scan is already in flight.
+     */
+    public boolean tryBeginSyncScan(String projectId) {
+        return activeScans.putIfAbsent(projectId, new ScanClaim(projectId, null, Instant.now(), false)) == null;
+    }
+
+    /**
+     * Release a previously-claimed scan slot. Idempotent; safe to call from a finally
+     * block whether or not the original {@code tryBegin*} succeeded.
+     */
+    public void releaseScan(String projectId) {
+        activeScans.remove(projectId);
     }
 
     private void evictStale() {

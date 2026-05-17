@@ -15,7 +15,8 @@
       "PowerShell(& 'C:\\\\Users\\\\timhj\\\\AppData\\\\Local\\\\Temp\\\\cvec-purge-wedge.ps1')",
       "PowerShell(& 'C:\\\\Users\\\\timhj\\\\AppData\\\\Local\\\\Temp\\\\cvec-async-smoke.ps1')",
       "PowerShell($bytes = [System.IO.File]::ReadAllBytes\\('C:\\\\Users\\\\timhj\\\\AppData\\\\Local\\\\Temp\\\\cvec-async-smoke.ps1'\\); Write-Host \"Total bytes: $\\($bytes.Length\\)\"; $nonAscii = $bytes | Where-Object { $_ -gt 127 -or \\($_ -lt 9 -and $_ -ne 0\\) }; if \\($nonAscii\\) { Write-Host \"Has non-ASCII bytes: $\\($nonAscii.Count\\)\" } else { Write-Host \"Pure ASCII\" })",
-      "PowerShell($bytes = [System.IO.File]::ReadAllBytes\\('C:\\\\Users\\\\timhj\\\\AppData\\\\Local\\\\Temp\\\\cvec-async-smoke.ps1'\\); for \\($i = 0; $i -lt $bytes.Length; $i++\\) { if \\($bytes[$i] -gt 127\\) { $start = [Math]::Max\\(0, $i-15\\); $end = [Math]::Min\\($bytes.Length-1, $i+15\\); $context = [System.Text.Encoding]::UTF8.GetString\\($bytes, $start, $end-$start+1\\); Write-Host \"byte at $i \\(0x{0:X2}\\): '$context'\" -f $bytes[$i] } })"
+      "PowerShell($bytes = [System.IO.File]::ReadAllBytes\\('C:\\\\Users\\\\timhj\\\\AppData\\\\Local\\\\Temp\\\\cvec-async-smoke.ps1'\\); for \\($i = 0; $i -lt $bytes.Length; $i++\\) { if \\($bytes[$i] -gt 127\\) { $start = [Math]::Max\\(0, $i-15\\); $end = [Math]::Min\\($bytes.Length-1, $i+15\\); $context = [System.Text.Encoding]::UTF8.GetString\\($bytes, $start, $end-$start+1\\); Write-Host \"byte at $i \\(0x{0:X2}\\): '$context'\" -f $bytes[$i] } })",
+      "PowerShell(& 'C:\\\\Users\\\\timhj\\\\AppData\\\\Local\\\\Temp\\\\cvec-guard-smoke.ps1')"
     ]
   }
 }

@@ -748,6 +748,22 @@ cvector --project my-app status                  # query a different project for
 | `cv_set_default_project` | Update the workspace's active project so subsequent tool calls can omit `project`. |
 | `cv_job_status` / `cv_jobs_list` | Poll an async job by id, or enumerate every job currently in the registry. See [Long-running tools: async + cv_job_status](#long-running-tools-async--cv_job_status). |
 
+### Multi-workspace orphans on a shared Kuzu DB
+
+The shared Kuzu DB at `~/.cvector/kuzu-data/graph.kuzu/` sits **below** the workspace boundary: each `.cvector/settings.json` is its own workspace registry, but all non-isolated workspaces use the same on-disk Kuzu directory partitioned by `projectId`. The consequence is that data from one workspace appears as "orphans" from another workspace's point of view.
+
+Concrete example: workspace **A** (rooted at `/work/auth-svc`) registers project `auth-svc` with `projectId=A123` and scans it. Workspace **B** (rooted at `/work/billing`) registers `billing` with `projectId=B456`. Both processes use the same `~/.cvector/kuzu-data/graph.kuzu/` because neither is isolated. From B's `cv_list_projects` perspective the `auth-svc` data is unowned — A123 isn't in B's `settings.json` — so `cv_purge_orphans` from B would offer to delete it. That's correct behaviour: every workspace queries through its own registry view, and the shared DB doesn't know about workspace boundaries.
+
+Three ways to handle this:
+
+| Want | Do |
+|---|---|
+| Each project isolated; no cross-workspace visibility at all | Add `"isolated": true` to the project entry, or pass `--isolated` to `cvector project create`. Project gets its own `~/.cvector/kuzu-data/<projectId>/` directory with its own file lock. |
+| One workspace, many projects | Register them all in a single `.cvector/settings.json` (e.g. a top-level repo's `.cvector/` directory) and use `cvector project create` to add each one. All projects share the same DB and registry. |
+| Multiple independent workspaces, same shared DB | Live with the orphan-from-other-workspace artifact. Run `cv_purge_orphans` from any workspace only when you genuinely want to forget another workspace's data; treat it as "delete projects this workspace doesn't recognise" rather than "garbage collect". |
+
+`cvector scan` and `cv_scan_project` both gate on the active project being in the current workspace's registry (via `requireActiveProject`) — so a workspace can never accidentally write data under a projectId it doesn't own. The orphan artifact only arises from running multiple workspaces against the same shared DB, which is supported but worth being aware of.
+
 ### Switching backends keeps projects intact
 
 The `projects` map in `settings.json` is backend-agnostic. Flipping `backend` between `embedded`, `remote`, and `docker` doesn't drop any project entries — the data just lives in a different store. After switching, re-run `cvector scan` against each project you want to repopulate.

@@ -391,24 +391,58 @@ public class CvectorTools {
     }
 
     @Tool(name = "cv_scan_project",
-            description = "Scan an existing registered project to (re)populate its graph data. Idempotent: re-scans use content-hash skipping for unchanged files. Synchronous by default — returns the full scan envelope when the work completes. Pass async=true to run in the background and get a jobId envelope back immediately; poll cv_job_status(jobId) for the result. Use async on large codebases that may exceed the client's HTTP timeout.")
+            description = "Scan an existing registered project to (re)populate its graph data. Idempotent: re-scans use content-hash skipping for unchanged files. Synchronous by default — returns the full scan envelope when the work completes. Pass async=true to run in the background and get a jobId envelope back immediately; poll cv_job_status(jobId) for the result. Use async on large codebases that may exceed the client's HTTP timeout. Concurrent invocations for the same project are rejected with a scanInProgress envelope pointing at the running job — avoids wasteful duplicate ingestion.")
     public Map<String, Object> scanProject(
             @ToolParam(description = "Project name, UUID, or rootPath. If omitted, falls back to the workspace's default project.", required = false) String project,
             @ToolParam(description = "Run in background; return a jobId immediately and let the scan complete asynchronously. Default false (synchronous).", required = false) Boolean async) {
         ProjectEntry target = projects.resolveOrDefault(project);
+        // Reject duplicates up front (covers sync vs sync, sync vs async, async vs async).
+        Map<String, Object> conflict = scanInProgressEnvelope(target);
+        if (conflict != null) return conflict;
         if (Boolean.TRUE.equals(async)) {
-            JobRegistry.Job job = jobs.submit("cv_scan_project", () -> scanProjectSync(target));
-            return acceptedEnvelope(job);
+            return jobs.submitScan(target.projectId(), "cv_scan_project", () -> scanProjectSync(target))
+                    .map(CvectorTools::acceptedEnvelope)
+                    .orElseGet(() -> scanInProgressEnvelope(target));
         }
-        long start = System.currentTimeMillis();
-        Map<String, Object> result = scanProjectSync(target);
-        return maybeAddAsyncHint(result, "cv_scan_project", System.currentTimeMillis() - start);
+        if (!jobs.tryBeginSyncScan(target.projectId())) {
+            return scanInProgressEnvelope(target);
+        }
+        try {
+            long start = System.currentTimeMillis();
+            Map<String, Object> result = scanProjectSync(target);
+            return maybeAddAsyncHint(result, "cv_scan_project", System.currentTimeMillis() - start);
+        } finally {
+            jobs.releaseScan(target.projectId());
+        }
     }
 
     private Map<String, Object> scanProjectSync(ProjectEntry target) {
         Map<String, Object> out = newResponse(target);
         out.putAll(scanService.scan(target));
         return out;
+    }
+
+    /**
+     * Build a structured "scan already in flight" response when a duplicate
+     * {@code cv_scan_project} arrives for the same projectId. Returns null when there's
+     * no in-flight scan and the caller should proceed normally.
+     */
+    private Map<String, Object> scanInProgressEnvelope(ProjectEntry target) {
+        return jobs.findActiveScan(target.projectId()).map(claim -> {
+            Map<String, Object> out = newResponse(target);
+            out.put("ok", false);
+            out.put("scanInProgress", true);
+            out.put("startedAt", claim.startedAt().toString());
+            out.put("async", claim.async());
+            if (claim.jobId() != null) {
+                out.put("runningJobId", claim.jobId().toString());
+                out.put("hint", "A scan for this project is already running (jobId=" + claim.jobId()
+                        + "). Poll cv_job_status({jobId}) for its status instead of starting a second scan.");
+            } else {
+                out.put("hint", "A synchronous scan for this project is already running; wait for it to finish or use async:true to track future scans by jobId.");
+            }
+            return out;
+        }).orElse(null);
     }
 
     @Tool(name = "cv_onboard_project",
@@ -490,6 +524,26 @@ public class CvectorTools {
         out.put("nodes", store.nodeCounts(p.projectId()));
         out.put("edges", store.edgeCounts(p.projectId()));
         out.put("lastScan", store.projectMeta(p.projectId()));
+        // Async-job snapshot — lets the operator (and the agent) see how many background
+        // jobs the server has in flight and the per-job timeout in effect, without a
+        // separate cv_jobs_list / cv_job_status poll. Useful when an agent isn't sure
+        // whether a prior async submission is still cooking or whether to retry.
+        JobRegistry.Stats js = jobs.stats();
+        Map<String, Object> jobsBlock = new LinkedHashMap<>();
+        jobsBlock.put("running", js.running());
+        jobsBlock.put("total", js.total());
+        jobsBlock.put("defaultTimeoutMinutes", js.defaultTimeout().toMinutes());
+        out.put("jobs", jobsBlock);
+        // Surface any in-flight scan for THIS project specifically so cv_health doubles as
+        // a "what's happening to my project right now?" probe — the agent doesn't need to
+        // know about cv_jobs_list for this common case.
+        jobs.findActiveScan(p.projectId()).ifPresent(claim -> {
+            Map<String, Object> scanBlock = new LinkedHashMap<>();
+            scanBlock.put("startedAt", claim.startedAt().toString());
+            scanBlock.put("async", claim.async());
+            if (claim.jobId() != null) scanBlock.put("jobId", claim.jobId().toString());
+            out.put("activeScan", scanBlock);
+        });
         return out;
     }
 
