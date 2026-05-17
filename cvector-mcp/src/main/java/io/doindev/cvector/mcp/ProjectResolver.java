@@ -149,37 +149,57 @@ public final class ProjectResolver {
         for (CvectorConfig.ProjectEntry e : cfg.projects().values()) {
             if (input.equals(e.projectId())) return e;
         }
-        // Pass 3: by path. Try exact match then "input is a descendant of project rootPath".
-        // Normalise both sides so different separator conventions / trailing-slash forms
-        // still match. Resolves symlinks where the file actually exists; falls back to
-        // plain normalisation otherwise (the path may not exist on this host).
-        Path inputPath = tryAbsoluteNormalize(input);
-        if (inputPath != null) {
-            CvectorConfig.ProjectEntry exact = null;
-            CvectorConfig.ProjectEntry ancestor = null;
-            int bestAncestorDepth = Integer.MAX_VALUE;
-            for (CvectorConfig.ProjectEntry e : cfg.projects().values()) {
-                if (e.rootPath() == null) continue;
-                Path candidate = tryAbsoluteNormalize(e.rootPath());
-                if (candidate == null) continue;
-                if (candidate.equals(inputPath)) {
-                    exact = e;
-                    break;
-                }
-                if (inputPath.startsWith(candidate)) {
-                    // Pick the deepest matching ancestor so /work/mono/services/auth wins
-                    // over /work/mono when both happen to be registered projects.
-                    int depth = inputPath.getNameCount() - candidate.getNameCount();
-                    if (depth >= 0 && depth < bestAncestorDepth) {
-                        bestAncestorDepth = depth;
-                        ancestor = e;
+        // Pass 3: by path. ONLY attempt path matching when the input is unambiguously an
+        // absolute filesystem path. Earlier revisions passed any string through
+        // {@link Paths#get(String)}{@code .toAbsolutePath()}, which silently joined a bare
+        // identifier with the JVM's current working directory — so an agent calling
+        // {@code cv_scan_project({project: "does-not-exist-xyzzy"})} from a dashboard whose
+        // CWD happened to be a registered project's root would get a "successful" scan of
+        // that project instead of a clear "no such project" error. Tightening to absolute-
+        // path-only matches the documented contract ("absolute path normalisation") and
+        // eliminates the footgun.
+        if (looksLikeAbsolutePath(input)) {
+            Path inputPath = tryAbsoluteNormalize(input);
+            if (inputPath != null) {
+                CvectorConfig.ProjectEntry exact = null;
+                CvectorConfig.ProjectEntry ancestor = null;
+                int bestAncestorDepth = Integer.MAX_VALUE;
+                for (CvectorConfig.ProjectEntry e : cfg.projects().values()) {
+                    if (e.rootPath() == null) continue;
+                    Path candidate = tryAbsoluteNormalize(e.rootPath());
+                    if (candidate == null) continue;
+                    if (candidate.equals(inputPath)) {
+                        exact = e;
+                        break;
+                    }
+                    if (inputPath.startsWith(candidate)) {
+                        // Pick the deepest matching ancestor so /work/mono/services/auth wins
+                        // over /work/mono when both happen to be registered projects.
+                        int depth = inputPath.getNameCount() - candidate.getNameCount();
+                        if (depth >= 0 && depth < bestAncestorDepth) {
+                            bestAncestorDepth = depth;
+                            ancestor = e;
+                        }
                     }
                 }
+                if (exact != null) return exact;
+                if (ancestor != null) return ancestor;
             }
-            if (exact != null) return exact;
-            if (ancestor != null) return ancestor;
         }
         return null;
+    }
+
+    /**
+     * True when the input is unambiguously an absolute filesystem path (POSIX, Windows
+     * drive-letter, or UNC). Bare names and UUIDs return false so they don't get joined
+     * with the JVM's CWD and accidentally match a registered project root.
+     */
+    private static boolean looksLikeAbsolutePath(String input) {
+        if (input == null || input.isEmpty()) return false;
+        char c0 = input.charAt(0);
+        if (c0 == '/' || c0 == '\\') return true;
+        if (input.length() >= 2 && Character.isLetter(c0) && input.charAt(1) == ':') return true;
+        return false;
     }
 
     /**

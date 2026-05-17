@@ -88,6 +88,12 @@ public class CvectorRuntime {
         for (CvectorConfig.ProjectEntry e : cfg.projects().values()) {
             if (input.equals(e.projectId())) return e;
         }
+        // Path matching is gated on the input being unambiguously absolute. A bare
+        // identifier like "does-not-exist" would otherwise get joined with the JVM's CWD
+        // by Paths.get(...).toAbsolutePath() and accidentally resolve to whichever
+        // registered project's rootPath is the CWD's ancestor. Mirrors the same guard in
+        // ProjectResolver.findInternal — see the comment there for the failure mode.
+        if (!isAbsolutePathInput(input)) return null;
         Path candidate = tryNormalize(input);
         if (candidate != null) {
             CvectorConfig.ProjectEntry ancestor = null;
@@ -108,6 +114,14 @@ public class CvectorRuntime {
             if (ancestor != null) return ancestor;
         }
         return null;
+    }
+
+    private static boolean isAbsolutePathInput(String input) {
+        if (input == null || input.isEmpty()) return false;
+        char c0 = input.charAt(0);
+        if (c0 == '/' || c0 == '\\') return true;
+        if (input.length() >= 2 && Character.isLetter(c0) && input.charAt(1) == ':') return true;
+        return false;
     }
 
     private static Path tryNormalize(String s) {
