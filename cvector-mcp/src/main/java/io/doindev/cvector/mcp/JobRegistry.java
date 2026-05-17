@@ -277,13 +277,21 @@ public class JobRegistry {
         public Map<String, Object> result() { return result; }
         public Throwable error() { return error; }
 
-        void complete(Map<String, Object> result) {
+        // State transitions are one-way (RUNNING -> DONE | FAILED). Once a job has reached a
+        // terminal state — typically because the watchdog expired it first — a late call from
+        // the worker thread completing must NOT overwrite the failure. Without this guard the
+        // race window between watchdog-fires-and-flips-to-FAILED and worker-thread-returns
+        // would let DONE clobber FAILED, so cv_job_status would report success for a job that
+        // had already been timed out.
+        synchronized void complete(Map<String, Object> result) {
+            if (state != State.RUNNING) return;
             this.result = result;
             this.finishedAt = Instant.now();
             this.state = State.DONE;
         }
 
-        void fail(Throwable error) {
+        synchronized void fail(Throwable error) {
+            if (state != State.RUNNING) return;
             this.error = error;
             this.finishedAt = Instant.now();
             this.state = State.FAILED;
