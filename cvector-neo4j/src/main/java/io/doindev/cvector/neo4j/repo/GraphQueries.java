@@ -49,12 +49,15 @@ public class GraphQueries {
     }
 
     public List<Map<String, Object>> findSymbol(String projectId, String symbol) {
-        // The fourth `STARTS WITH $sym + '('` predicate lets cv_explain resolve a partially-
-        // qualified Method like "io.foo.Bar.baz" when the graph stores it as
-        // "io.foo.Bar.baz(int, String)". Without it the only working shapes were the bare
-        // name and the full fqName-with-signature; the intermediate form an agent naturally
-        // types (it knows the class but not the parameter list) silently returned no hits.
-        var rows = client.read(
+        // Two-pass: fast indexable predicates first, slow CONTAINS scan only as fallback.
+        // The fast pass covers exact / bare-name / suffix / full-FQ-no-signature shapes
+        // (Neo4j can use index lookups on these). The slow pass is a CONTAINS substring
+        // scan for the partial-FQ-no-package shape "Class.method" → "...Class.method(args)";
+        // we only run it when (a) the fast pass returned nothing and (b) the input has a
+        // dot (otherwise it can't be the Class.method shape). OR'ing CONTAINS into the
+        // primary predicate forced every cv_explain to a full-graph scan and made parallel
+        // tool calls queue badly.
+        var fast = client.read(
                 "MATCH (n) WHERE n.projectId = $pid AND "
                         + "(n.fqName = $sym OR n.fqName ENDS WITH '.' + $sym OR n.name = $sym "
                         + " OR n.fqName STARTS WITH $sym + '(') "
@@ -62,7 +65,17 @@ public class GraphQueries {
                         + "n.id AS id, n.startLine AS startLine, n.fileId AS fileId LIMIT 25",
                 Map.of("pid", projectId, "sym", symbol)
         );
-        return toMaps(rows);
+        List<Map<String, Object>> fastMaps = toMaps(fast);
+        if (!fastMaps.isEmpty() || symbol == null || symbol.indexOf('.') < 0) {
+            return fastMaps;
+        }
+        var slow = client.read(
+                "MATCH (n) WHERE n.projectId = $pid AND n.fqName CONTAINS '.' + $sym + '(' "
+                        + "RETURN labels(n)[0] AS label, n.fqName AS fqName, n.name AS name, "
+                        + "n.id AS id, n.startLine AS startLine, n.fileId AS fileId LIMIT 25",
+                Map.of("pid", projectId, "sym", symbol)
+        );
+        return toMaps(slow);
     }
 
     public List<Map<String, Object>> callers(String projectId, String id) {

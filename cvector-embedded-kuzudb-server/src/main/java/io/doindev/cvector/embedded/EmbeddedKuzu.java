@@ -49,6 +49,25 @@ public final class EmbeddedKuzu implements AutoCloseable {
     private final Database database;
     private final Connection connection;
     /**
+     * Serializes every native call on {@link #connection}. Kuzu's Java {@code Connection} is a
+     * single-threaded session — its {@code prepare()}, {@code execute()}, {@code query()}, and
+     * {@code close()} entry points are not safe to call from multiple threads concurrently, and
+     * doing so in practice deadlocked the dashboard (four parallel MCP {@code cv_explain} calls
+     * each issuing three Kuzu reads → 12 JNI calls fighting over the same connection, all of them
+     * timing out at the client's 30 s ceiling). All other {@code EmbeddedKuzu} state
+     * ({@link #stmtCache}, {@link #paramRefCache}, {@link #colNamesCache}) lives in concurrent
+     * maps and doesn't need the lock — only the native calls do.
+     *
+     * <p>Holding the lock during {@code QueryResult} iteration too is the safe choice: Kuzu's
+     * result objects are tied to the connection's cursor and reusing the connection mid-iteration
+     * would invalidate them. The lock is fine-grained per-EmbeddedKuzu, so different project
+     * databases (isolated mode) still execute fully in parallel; only callers against the SAME
+     * project DB serialise here. That matches Kuzu's intrinsic single-writer semantics and keeps
+     * read throughput at single-connection-with-intra-query-parallelism levels — adequate for a
+     * single-user agent workflow without paying connection-pool complexity.
+     */
+    private final Object connLock = new Object();
+    /**
      * Prepared statements are cached by their Cypher text and reused across calls. KuzuDB's
      * {@code prepare} step parses and plans the query — when the ingest loop hits the same template
      * tens of thousands of times, amortising it gives a substantial speedup. The cache is bounded
@@ -287,10 +306,12 @@ public final class EmbeddedKuzu implements AutoCloseable {
     public Path dbPath() { return dbPath; }
 
     public boolean ping() {
-        try (QueryResult r = connection.query("RETURN 1")) {
-            return r.isSuccess();
-        } catch (RuntimeException e) {
-            return false;
+        synchronized (connLock) {
+            try (QueryResult r = connection.query("RETURN 1")) {
+                return r.isSuccess();
+            } catch (RuntimeException e) {
+                return false;
+            }
         }
     }
 
@@ -306,38 +327,40 @@ public final class EmbeddedKuzu implements AutoCloseable {
      * callers that need richer access can be extended later.
      */
     public List<Map<String, Object>> read(String cypher, Map<String, Object> params) {
-        try (QueryResult result = run(cypher, params)) {
-            if (!result.isSuccess()) {
-                throw new RuntimeException("Kuzu query failed: " + result.getErrorMessage()
-                        + "\nquery: " + cypher);
-            }
-            // Column names are stable per Cypher template (RETURN clause is fixed). Caching
-            // saves a per-call JNI loop -- meaningful for the read hot path, which 50+ call
-            // sites flow through. Validated against the live column count to fail loudly if
-            // a query ever returns a different shape (it shouldn't, but the cost is one int compare).
-            int cols = (int) result.getNumColumns();
-            String[] names = colNamesCache.get(cypher);
-            if (names == null || names.length != cols) {
-                names = new String[cols];
-                for (int i = 0; i < cols; i++) names[i] = result.getColumnName(i);
-                colNamesCache.put(cypher, names);
-            }
-            List<Map<String, Object>> rows = new ArrayList<>();
-            while (result.hasNext()) {
-                try (FlatTuple t = result.getNext()) {
-                    // Pre-size LinkedHashMap with the exact column count so we don't pay for
-                    // a rehash + table-double when {@code cols > 12}. Load factor 1.0 because
-                    // we never grow.
-                    Map<String, Object> row = new LinkedHashMap<>(cols, 1.0f);
-                    for (int i = 0; i < cols; i++) {
-                        try (Value v = t.getValue(i)) {
-                            row.put(names[i], unwrap(v));
-                        }
-                    }
-                    rows.add(row);
+        synchronized (connLock) {
+            try (QueryResult result = run(cypher, params)) {
+                if (!result.isSuccess()) {
+                    throw new RuntimeException("Kuzu query failed: " + result.getErrorMessage()
+                            + "\nquery: " + cypher);
                 }
+                // Column names are stable per Cypher template (RETURN clause is fixed). Caching
+                // saves a per-call JNI loop -- meaningful for the read hot path, which 50+ call
+                // sites flow through. Validated against the live column count to fail loudly if
+                // a query ever returns a different shape (it shouldn't, but the cost is one int compare).
+                int cols = (int) result.getNumColumns();
+                String[] names = colNamesCache.get(cypher);
+                if (names == null || names.length != cols) {
+                    names = new String[cols];
+                    for (int i = 0; i < cols; i++) names[i] = result.getColumnName(i);
+                    colNamesCache.put(cypher, names);
+                }
+                List<Map<String, Object>> rows = new ArrayList<>();
+                while (result.hasNext()) {
+                    try (FlatTuple t = result.getNext()) {
+                        // Pre-size LinkedHashMap with the exact column count so we don't pay for
+                        // a rehash + table-double when {@code cols > 12}. Load factor 1.0 because
+                        // we never grow.
+                        Map<String, Object> row = new LinkedHashMap<>(cols, 1.0f);
+                        for (int i = 0; i < cols; i++) {
+                            try (Value v = t.getValue(i)) {
+                                row.put(names[i], unwrap(v));
+                            }
+                        }
+                        rows.add(row);
+                    }
+                }
+                return rows;
             }
-            return rows;
         }
     }
 
@@ -345,10 +368,12 @@ public final class EmbeddedKuzu implements AutoCloseable {
     public void write(String cypher) { write(cypher, Map.of()); }
 
     public void write(String cypher, Map<String, Object> params) {
-        try (QueryResult result = run(cypher, params)) {
-            if (!result.isSuccess()) {
-                throw new RuntimeException("Kuzu write failed: " + result.getErrorMessage()
-                        + "\nquery: " + cypher);
+        synchronized (connLock) {
+            try (QueryResult result = run(cypher, params)) {
+                if (!result.isSuccess()) {
+                    throw new RuntimeException("Kuzu write failed: " + result.getErrorMessage()
+                            + "\nquery: " + cypher);
+                }
             }
         }
     }
@@ -467,11 +492,13 @@ public final class EmbeddedKuzu implements AutoCloseable {
 
     @Override
     public void close() {
-        for (PreparedStatement s : stmtCache.values()) {
-            try { s.close(); } catch (RuntimeException ignored) { }
+        synchronized (connLock) {
+            for (PreparedStatement s : stmtCache.values()) {
+                try { s.close(); } catch (RuntimeException ignored) { }
+            }
+            stmtCache.clear();
+            try { connection.close(); } catch (RuntimeException ignored) { }
+            try { database.close(); } catch (RuntimeException ignored) { }
         }
-        stmtCache.clear();
-        try { connection.close(); } catch (RuntimeException ignored) { }
-        try { database.close(); } catch (RuntimeException ignored) { }
     }
 }

@@ -178,24 +178,41 @@ public final class KuzuGraphStore implements GraphStore {
 
     @Override
     public List<Map<String, Object>> findSymbol(String projectId, String symbol) {
-        // Four candidate predicates, scoped to the caller's project:
-        //   * exact fqName                        — full match
-        //   * fqName ENDS WITH ".$symbol"         — bare name match anywhere in the FQ chain
-        //   * name = $symbol                      — simple name on the node itself
-        //   * fqName STARTS WITH "$symbol("       — class.method (no signature) matches the
-        //                                           Method whose fqName is class.method(args)
-        // The STARTS WITH branch is what lets cv_explain("io.foo.Bar.baz") resolve when the
-        // graph stores it as "io.foo.Bar.baz(int, String)". Kuzu doesn't support inline string
-        // concatenation in predicates, so the prefix is pre-built and passed as a param.
+        // Two-pass resolution. The fast pass covers every common input shape with predicates
+        // that Kuzu can plan efficiently (equality, prefix, suffix on indexable string columns):
+        //   * exact fqName                          — "io.foo.Bar.baz(int, String)"
+        //   * fqName ENDS WITH "." + sym            — bare-name suffix on non-Method labels
+        //   * name = sym                            — bare last-segment name
+        //   * fqName STARTS WITH sym + "("          — full-FQ-no-signature, e.g. "io.foo.Bar.baz"
+        //                                             matches Method "io.foo.Bar.baz(args)"
+        // The slow pass is a single `fqName CONTAINS "." + sym + "("` substring search that
+        // catches the partial-FQ-no-package shape "Class.method" → "...Class.method(args)".
+        // CONTAINS forces a full table scan on the polymorphic Node table, so we only run it
+        // when (a) the fast pass returned nothing and (b) the input contains a dot (without
+        // a dot it can't be the Class.method shape anyway). On a 20k-node project this keeps
+        // the typical cv_explain in the low-hundred-ms range while still resolving the partial-
+        // FQ form as a fallback. Earlier revisions OR'd the CONTAINS into the main predicate
+        // and every cv_explain paid for the full scan even when an exact/prefix match would
+        // have served — that made parallel cv_explain calls 100x slower and queued every
+        // tool call behind in-flight scans.
         // projectId predicate is mandatory in shared-DB mode — without it, every project's
         // duplicate-named symbols collide in the result set.
-        return kuzu.read(
+        List<Map<String, Object>> fast = kuzu.read(
                 "MATCH (n:Node) WHERE n.projectId = $pid "
                         + "AND (n.fqName = $sym OR n.fqName ENDS WITH $suffix "
                         + "     OR n.name = $sym OR n.fqName STARTS WITH $prefix) "
                         + "RETURN n.label AS label, n.fqName AS fqName, n.name AS name, "
                         + "n.id AS id, n.startLine AS startLine, n.fileId AS fileId LIMIT 25",
-                Map.of("pid", projectId, "sym", symbol, "suffix", "." + symbol, "prefix", symbol + "("));
+                Map.of("pid", projectId, "sym", symbol,
+                        "suffix", "." + symbol, "prefix", symbol + "("));
+        if (!fast.isEmpty() || symbol == null || symbol.indexOf('.') < 0) {
+            return fast;
+        }
+        return kuzu.read(
+                "MATCH (n:Node) WHERE n.projectId = $pid AND n.fqName CONTAINS $midPrefix "
+                        + "RETURN n.label AS label, n.fqName AS fqName, n.name AS name, "
+                        + "n.id AS id, n.startLine AS startLine, n.fileId AS fileId LIMIT 25",
+                Map.of("pid", projectId, "midPrefix", "." + symbol + "("));
     }
 
     @Override
