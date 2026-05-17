@@ -58,10 +58,12 @@ public class CvectorTools {
 
     private final GraphStore store;
     private final ProjectResolver projects;
+    private final CvectorScanService scanService;
 
-    public CvectorTools(GraphStore store, ProjectResolver projects) {
+    public CvectorTools(GraphStore store, ProjectResolver projects, CvectorScanService scanService) {
         this.store = store;
         this.projects = projects;
+        this.scanService = scanService;
     }
 
     // ===========================================================================================
@@ -177,8 +179,9 @@ public class CvectorTools {
             out.put("hint", "Pass confirm=true to actually remove this project.");
             return out;
         }
+        int deletedCount;
         try {
-            store.deleteProjectSubtree(target.projectId());
+            deletedCount = store.deleteProjectSubtree(target.projectId());
         } catch (RuntimeException e) {
             throw new RuntimeException("failed to delete graph data for project " + target.name() + ": " + e.getMessage(), e);
         }
@@ -197,7 +200,119 @@ public class CvectorTools {
             throw new UncheckedIOException(e);
         }
         out.put("removed", true);
+        // Report the actual delete count so the caller can verify the operation against the
+        // dry-run number — previously this just returned `removed: true` even if Kuzu's
+        // DETACH DELETE silently partial-failed on a huge subtree.
+        out.put("nodesDeleted", deletedCount);
         out.put("newDefault", nextActive);
+        return out;
+    }
+
+    @Tool(name = "cv_purge_project",
+            description = "Delete a project's graph data WITHOUT removing its registration in settings.json. Useful when a graph got corrupted (e.g. from prior buggy scans that left duplicate nodes) — pair it with cv_scan_project for a clean rebuild. Two-step like cv_remove_project: call without confirm for a dry-run, pass confirm=true to delete.")
+    public Map<String, Object> purgeProject(
+            @ToolParam(description = "Project name, UUID, or rootPath. If omitted, falls back to the workspace's default project.", required = false) String project,
+            @ToolParam(description = "Must be true to actually delete. Without this the tool reports what would be removed.", required = false) Boolean confirm) {
+        ProjectEntry target = projects.resolveOrDefault(project);
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("project", projectContext(target));
+        if (!Boolean.TRUE.equals(confirm)) {
+            try {
+                Map<String, Long> nodes = store.nodeCounts(target.projectId());
+                out.put("nodesPendingDelete", nodes.values().stream().mapToLong(Long::longValue).sum());
+            } catch (RuntimeException ignored) {
+                out.put("nodesPendingDelete", null);
+            }
+            out.put("dryRun", true);
+            out.put("hint", "Pass confirm=true to actually purge this project's graph data. The project registration in settings.json will remain so you can re-scan it.");
+            return out;
+        }
+        int deletedCount;
+        try {
+            deletedCount = store.deleteProjectSubtree(target.projectId());
+        } catch (RuntimeException e) {
+            throw new RuntimeException("failed to purge graph data for project " + target.name() + ": " + e.getMessage(), e);
+        }
+        out.put("purged", true);
+        out.put("nodesDeleted", deletedCount);
+        out.put("nextStep", "Call cv_scan_project to rebuild this project's graph.");
+        return out;
+    }
+
+    @Tool(name = "cv_purge_orphans",
+            description = "Find and delete graph data for projectIds that exist in the shared Kuzu DB but are no longer registered in settings.json. Recovery tool for the case where a prior cv_remove_project or a renamed project left orphan Project / Method / etc nodes behind. Two-step: omit confirm for a dry-run report listing each orphan projectId and its node count; pass confirm=true to actually delete.")
+    public Map<String, Object> purgeOrphans(
+            @ToolParam(description = "Must be true to actually delete. Without this the tool reports what would be removed.", required = false) Boolean confirm) {
+        // Discover orphans by comparing Project nodes in the graph against the registered set
+        // in settings.json. The registered set is keyed by projectId (UUID), not by name, so a
+        // rename doesn't accidentally orphan its own graph data.
+        java.util.Set<String> registeredIds = new java.util.HashSet<>();
+        for (ProjectEntry pe : projects.loadConfig().projects().values()) {
+            if (pe.projectId() != null) registeredIds.add(pe.projectId());
+        }
+        List<Map<String, Object>> graphProjects;
+        try {
+            graphProjects = store.projectsList();
+        } catch (RuntimeException e) {
+            Map<String, Object> err = new LinkedHashMap<>();
+            err.put("ok", false);
+            err.put("error", "couldn't enumerate Project nodes: " + e.getMessage());
+            return err;
+        }
+        List<Map<String, Object>> orphans = new ArrayList<>();
+        for (Map<String, Object> row : graphProjects) {
+            Object pidObj = row.get("projectId");
+            if (pidObj == null) continue;
+            String pid = pidObj.toString();
+            if (registeredIds.contains(pid)) continue;
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("projectId", pid);
+            entry.put("name", row.get("name"));
+            entry.put("rootPath", row.get("rootPath"));
+            try {
+                Map<String, Long> nodes = store.nodeCounts(pid);
+                entry.put("nodes", nodes.values().stream().mapToLong(Long::longValue).sum());
+            } catch (RuntimeException ignored) {
+                entry.put("nodes", null);
+            }
+            orphans.add(entry);
+        }
+
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("registeredProjectCount", registeredIds.size());
+        out.put("graphProjectCount", graphProjects.size());
+        out.put("orphans", orphans);
+        if (orphans.isEmpty()) {
+            out.put("ok", true);
+            out.put("message", "no orphan projectIds found in the graph");
+            return out;
+        }
+        if (!Boolean.TRUE.equals(confirm)) {
+            out.put("dryRun", true);
+            out.put("hint", "Pass confirm=true to delete every orphan projectId's nodes.");
+            return out;
+        }
+        int totalDeleted = 0;
+        List<Map<String, Object>> deleted = new ArrayList<>();
+        for (Map<String, Object> orphan : orphans) {
+            String pid = orphan.get("projectId").toString();
+            int n;
+            try {
+                n = store.deleteProjectSubtree(pid);
+            } catch (RuntimeException e) {
+                Map<String, Object> err = new LinkedHashMap<>(orphan);
+                err.put("error", e.getMessage());
+                deleted.add(err);
+                continue;
+            }
+            totalDeleted += n;
+            Map<String, Object> hit = new LinkedHashMap<>(orphan);
+            hit.put("nodesDeleted", n);
+            deleted.add(hit);
+        }
+        out.put("ok", true);
+        out.put("totalNodesDeleted", totalDeleted);
+        out.put("deleted", deleted);
         return out;
     }
 
@@ -207,7 +322,7 @@ public class CvectorTools {
             @ToolParam(description = "Project name, UUID, or rootPath. If omitted, falls back to the workspace's default project.", required = false) String project) {
         ProjectEntry target = projects.resolveOrDefault(project);
         Map<String, Object> out = newResponse(target);
-        out.putAll(CvectorScanService.scan(projects, target));
+        out.putAll(scanService.scan(target));
         return out;
     }
 

@@ -1,7 +1,9 @@
 package io.doindev.cvector.parser.config;
 
+import com.fasterxml.jackson.core.json.JsonReadFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.json.JsonMapper;
 import io.doindev.cvector.core.GraphEvent;
 import io.doindev.cvector.core.NodeKey;
 import io.doindev.cvector.core.Parser;
@@ -23,7 +25,14 @@ public class JsonParserAdapter implements Parser {
     private static final Logger log = LoggerFactory.getLogger(JsonParserAdapter.class);
     private static final Set<String> SKIP_FILES = Set.of("package-lock.json", "yarn.lock", "tsconfig.tsbuildinfo");
 
-    private final ObjectMapper mapper = new ObjectMapper();
+    // Enable JSONC affordances (// and /* */ comments, trailing commas) so we can read
+    // TypeScript tsconfig.*.json, VS Code .vscode/*.json, and the various other tools whose
+    // "JSON" files actually use the JSON-with-comments dialect. Stock JSON would reject these
+    // and the parser would log a warning per file without producing any ConfigKey nodes.
+    private final ObjectMapper mapper = JsonMapper.builder()
+            .enable(JsonReadFeature.ALLOW_JAVA_COMMENTS)
+            .enable(JsonReadFeature.ALLOW_TRAILING_COMMA)
+            .build();
 
     @Override
     public String name() { return "json"; }

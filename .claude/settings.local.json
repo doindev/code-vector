@@ -3,7 +3,13 @@
     "allow": [
       "PowerShell(Get-NetTCPConnection *)",
       "PowerShell(Start-Process \"http://localhost:2969/dashboard/\"; \"launched\")",
-      "PowerShell(Start-Process \"http://localhost:2969/dashboard/\"; \"opened\")"
+      "PowerShell(Start-Process \"http://localhost:2969/dashboard/\"; \"opened\")",
+      "PowerShell(& 'C:\\\\Users\\\\timhj\\\\AppData\\\\Local\\\\Temp\\\\cvec-scan-smoke.ps1')",
+      "PowerShell($bytes = [System.IO.File]::ReadAllBytes\\('C:\\\\Users\\\\timhj\\\\AppData\\\\Local\\\\Temp\\\\cvec-scan-smoke.ps1'\\); Write-Host \"First 6 bytes: $\\($bytes[0..5] | ForEach-Object { '{0:X2}' -f $_ }\\)\")",
+      "PowerShell(& 'C:\\\\Users\\\\timhj\\\\AppData\\\\Local\\\\Temp\\\\cvec-scan-mcp.ps1')",
+      "PowerShell(& 'C:\\\\Users\\\\timhj\\\\AppData\\\\Local\\\\Temp\\\\cvec-mcp-stress2.ps1')",
+      "PowerShell(& 'C:\\\\Users\\\\timhj\\\\AppData\\\\Local\\\\Temp\\\\cvec-mcp-stress3.ps1')",
+      "PowerShell(& 'C:\\\\Users\\\\timhj\\\\AppData\\\\Local\\\\Temp\\\\cvec-verify-fixes.ps1')"
     ]
   }
 }

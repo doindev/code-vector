@@ -49,9 +49,15 @@ public class GraphQueries {
     }
 
     public List<Map<String, Object>> findSymbol(String projectId, String symbol) {
+        // The fourth `STARTS WITH $sym + '('` predicate lets cv_explain resolve a partially-
+        // qualified Method like "io.foo.Bar.baz" when the graph stores it as
+        // "io.foo.Bar.baz(int, String)". Without it the only working shapes were the bare
+        // name and the full fqName-with-signature; the intermediate form an agent naturally
+        // types (it knows the class but not the parameter list) silently returned no hits.
         var rows = client.read(
                 "MATCH (n) WHERE n.projectId = $pid AND "
-                        + "(n.fqName = $sym OR n.fqName ENDS WITH '.' + $sym OR n.name = $sym) "
+                        + "(n.fqName = $sym OR n.fqName ENDS WITH '.' + $sym OR n.name = $sym "
+                        + " OR n.fqName STARTS WITH $sym + '(') "
                         + "RETURN labels(n)[0] AS label, n.fqName AS fqName, n.name AS name, "
                         + "n.id AS id, n.startLine AS startLine, n.fileId AS fileId LIMIT 25",
                 Map.of("pid", projectId, "sym", symbol)

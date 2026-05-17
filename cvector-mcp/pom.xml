@@ -32,6 +32,18 @@
             <artifactId>cvector-rules</artifactId>
         </dependency>
         <!--
+            cvector-cli brings in InProcessScanService + every Parser bean so the MCP
+            cv_scan_project tool can run scans in the same JVM that holds the embedded
+            Kuzu file lock. The CLI module is already a transitive dep of cvector-app
+            (which is the only assembly that boots cvector-mcp), so this declaration
+            costs nothing in shipped-jar size — it just makes the InProcessScanService
+            type visible at compile time inside cvector-mcp.
+        -->
+        <dependency>
+            <groupId>io.doindev</groupId>
+            <artifactId>cvector-cli</artifactId>
+        </dependency>
+        <!--
             Base stdio MCP transport for `cvector serve` (JSON-RPC over System.in / System.out).
         -->
         <dependency>

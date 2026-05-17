@@ -102,8 +102,14 @@ public final class KuzuGraphStore implements GraphStore {
 
     @Override
     public Map<String, Long> nodeCounts(String projectId) {
+        // Scoped to the requested project. Earlier this returned cross-project totals because
+        // the shared-DB workspace puts every project's nodes in the same Kuzu directory; the
+        // missing filter made cv_stats / cv_health show "47k nodes" when only some belonged to
+        // the caller's project, and made cv_remove_project look like it had silently no-op'd
+        // (counts didn't drop because they were never project-scoped in the first place).
         List<Map<String, Object>> rows = kuzu.read(
-                "MATCH (n:Node) RETURN n.label AS label, count(n) AS c ORDER BY label");
+                "MATCH (n:Node) WHERE n.projectId = $pid RETURN n.label AS label, count(n) AS c ORDER BY label",
+                Map.of("pid", projectId));
         Map<String, Long> out = new LinkedHashMap<>();
         for (Map<String, Object> r : rows) {
             String label = String.valueOf(r.get("label"));
@@ -115,9 +121,17 @@ public final class KuzuGraphStore implements GraphStore {
     @Override
     public Map<String, Long> edgeCounts(String projectId) {
         Map<String, Long> out = new LinkedHashMap<>();
+        // Project-scoped via both endpoints. Edges live in their own REL tables, so we have to
+        // filter on the node ends rather than on the edge itself. Either endpoint matching is
+        // enough in principle (every edge has both ends in the same project by construction),
+        // but predicating both also rules out any cross-project edge that a buggy importer may
+        // have created.
         for (String type : KuzuSchemaBootstrap.EDGE_TYPES) {
             List<Map<String, Object>> rows = kuzu.read(
-                    "MATCH ()-[r:" + type + "]->() RETURN count(r) AS c");
+                    "MATCH (a:Node)-[r:" + type + "]->(b:Node) "
+                            + "WHERE a.projectId = $pid AND b.projectId = $pid "
+                            + "RETURN count(r) AS c",
+                    Map.of("pid", projectId));
             long count = rows.isEmpty() ? 0L : asLong(rows.get(0).get("c"));
             if (count > 0) out.put(type, count);
         }
@@ -164,14 +178,24 @@ public final class KuzuGraphStore implements GraphStore {
 
     @Override
     public List<Map<String, Object>> findSymbol(String projectId, String symbol) {
-        // Three candidate predicates: exact fqName, fqName ending in `.symbol`, or simple name.
-        // Kuzu doesn't support Neo4j's `ENDS WITH '.' + $sym` string concat in the predicate, so
-        // pass the suffix as a separate parameter.
+        // Four candidate predicates, scoped to the caller's project:
+        //   * exact fqName                        — full match
+        //   * fqName ENDS WITH ".$symbol"         — bare name match anywhere in the FQ chain
+        //   * name = $symbol                      — simple name on the node itself
+        //   * fqName STARTS WITH "$symbol("       — class.method (no signature) matches the
+        //                                           Method whose fqName is class.method(args)
+        // The STARTS WITH branch is what lets cv_explain("io.foo.Bar.baz") resolve when the
+        // graph stores it as "io.foo.Bar.baz(int, String)". Kuzu doesn't support inline string
+        // concatenation in predicates, so the prefix is pre-built and passed as a param.
+        // projectId predicate is mandatory in shared-DB mode — without it, every project's
+        // duplicate-named symbols collide in the result set.
         return kuzu.read(
-                "MATCH (n:Node) WHERE n.fqName = $sym OR n.fqName ENDS WITH $suffix OR n.name = $sym "
+                "MATCH (n:Node) WHERE n.projectId = $pid "
+                        + "AND (n.fqName = $sym OR n.fqName ENDS WITH $suffix "
+                        + "     OR n.name = $sym OR n.fqName STARTS WITH $prefix) "
                         + "RETURN n.label AS label, n.fqName AS fqName, n.name AS name, "
                         + "n.id AS id, n.startLine AS startLine, n.fileId AS fileId LIMIT 25",
-                Map.of("sym", symbol, "suffix", "." + symbol));
+                Map.of("pid", projectId, "sym", symbol, "suffix", "." + symbol, "prefix", symbol + "("));
     }
 
     @Override
@@ -182,6 +206,7 @@ public final class KuzuGraphStore implements GraphStore {
         StringBuilder predicate = new StringBuilder();
         Map<String, Object> params = new LinkedHashMap<>();
         params.put("lim", limit);
+        params.put("pid", projectId);
         for (int i = 0; i < segments.length; i++) {
             String seg = segments[i];
             if (seg.isEmpty()) continue;
@@ -195,7 +220,8 @@ public final class KuzuGraphStore implements GraphStore {
         if (predicate.length() == 0) {
             return List.of();
         }
-        StringBuilder cypher = new StringBuilder("MATCH (n:Node) WHERE ").append(predicate);
+        // projectId predicate first so cv_search doesn't bleed cross-project results.
+        StringBuilder cypher = new StringBuilder("MATCH (n:Node) WHERE n.projectId = $pid AND ").append(predicate);
         if (label != null && !label.isEmpty()) {
             cypher.append(" AND n.label = $label");
             params.put("label", label);
@@ -266,9 +292,14 @@ public final class KuzuGraphStore implements GraphStore {
 
     @Override
     public Map<String, Object> projectMeta(String projectId) {
+        // Must filter on projectId — in a shared-DB workspace there are multiple Project nodes
+        // and without the predicate this returned the first one Kuzu happened to find, which
+        // is why cv_health.lastScanCommit appeared frozen at an old commit even after a fresh
+        // scan landed on a different Project node (the right one).
         List<Map<String, Object>> rows = kuzu.read(
-                "MATCH (p:Node) WHERE p.label = 'Project' "
-                        + "RETURN p.lastScanCommit AS lastScanCommit, p.rootPath AS rootPath LIMIT 1");
+                "MATCH (p:Node) WHERE p.label = 'Project' AND p.projectId = $pid "
+                        + "RETURN p.lastScanCommit AS lastScanCommit, p.rootPath AS rootPath LIMIT 1",
+                Map.of("pid", projectId));
         return rows.isEmpty() ? Map.of() : new LinkedHashMap<>(rows.get(0));
     }
 
@@ -303,57 +334,63 @@ public final class KuzuGraphStore implements GraphStore {
         String cutoff = DateTimeFormatter.ISO_LOCAL_DATE_TIME.format(
                 Instant.now().minus(since).atOffset(ZoneOffset.UTC));
         return kuzu.read(
-                "MATCH (n:Node) WHERE n.lastIngestedAt IS NOT NULL AND n.lastIngestedAt > timestamp($cutoff) "
+                "MATCH (n:Node) WHERE n.projectId = $pid "
+                        + "AND n.lastIngestedAt IS NOT NULL AND n.lastIngestedAt > timestamp($cutoff) "
                         + "RETURN n.label AS label, n.fqName AS fqName, "
                         + "cast(n.lastIngestedAt AS STRING) AS lastIngestedAt "
                         + "ORDER BY n.lastIngestedAt DESC LIMIT $lim",
-                Map.of("cutoff", cutoff, "lim", limit));
+                Map.of("pid", projectId, "cutoff", cutoff, "lim", limit));
     }
 
     @Override
     public List<Map<String, Object>> mavenDependencies(String projectId) {
         return kuzu.read(
-                "MATCH (d:Node) WHERE d.label = 'MavenDependency' "
+                "MATCH (d:Node) WHERE d.label = 'MavenDependency' AND d.projectId = $pid "
                         + "RETURN d.groupId AS groupId, d.artifactId AS artifactId, "
                         + "d.version AS version, d.scope AS scope "
-                        + "ORDER BY d.groupId, d.artifactId");
+                        + "ORDER BY d.groupId, d.artifactId",
+                Map.of("pid", projectId));
     }
 
     @Override
     public List<Map<String, Object>> fileInventory(String projectId) {
         return kuzu.read(
-                "MATCH (f:Node) WHERE f.label = 'File' "
+                "MATCH (f:Node) WHERE f.label = 'File' AND f.projectId = $pid "
                         + "OPTIONAL MATCH (f)-[:CONTAINS]->(m:Node) "
                         + "WITH f, count(m) AS methodCount "
                         + "RETURN f.path AS path, f.language AS language, f.lineCount AS lineCount, "
                         + "       methodCount, cast(f.lastIngestedAt AS STRING) AS lastIngestedAt "
-                        + "ORDER BY f.path");
+                        + "ORDER BY f.path",
+                Map.of("pid", projectId));
     }
 
     @Override
     public Map<String, List<Map<String, Object>>> healthRollup(String projectId) {
+        Map<String, Object> p = Map.of("pid", projectId);
         Map<String, List<Map<String, Object>>> out = new LinkedHashMap<>();
         out.put("godFiles", kuzu.read(
                 "MATCH (f:Node)-[:CONTAINS]->(c:Node)-[:CONTAINS]->(m:Node) "
                         + "WHERE f.label = 'File' AND c.label = 'Class' AND m.label = 'Method' "
+                        + "AND f.projectId = $pid "
                         + "WITH f, count(m) AS methods WHERE methods >= 30 "
-                        + "RETURN f.path AS path, methods ORDER BY methods DESC LIMIT 20"));
+                        + "RETURN f.path AS path, methods ORDER BY methods DESC LIMIT 20", p));
         out.put("godClasses", kuzu.read(
                 "MATCH (c:Node)-[:CONTAINS]->(m:Node) "
                         + "WHERE c.label = 'Class' AND m.label = 'Method' "
+                        + "AND c.projectId = $pid "
                         + "WITH c, count(m) AS methods WHERE methods >= 20 "
-                        + "RETURN c.fqName AS fqName, methods ORDER BY methods DESC LIMIT 20"));
+                        + "RETURN c.fqName AS fqName, methods ORDER BY methods DESC LIMIT 20", p));
         out.put("longMethods", kuzu.read(
-                "MATCH (m:Node) WHERE m.label = 'Method' "
+                "MATCH (m:Node) WHERE m.label = 'Method' AND m.projectId = $pid "
                         + "AND m.startLine IS NOT NULL AND m.endLine IS NOT NULL "
                         + "AND (m.endLine - m.startLine) >= 80 "
                         + "RETURN m.fqName AS fqName, (m.endLine - m.startLine) AS lines "
-                        + "ORDER BY lines DESC LIMIT 20"));
+                        + "ORDER BY lines DESC LIMIT 20", p));
         // Dead code: methods with no incoming CALLS, excluding tests, mains, constructors,
         // and only flagging private/package visibility. Kuzu doesn't support EXISTS subqueries,
         // so we OPTIONAL MATCH the incoming edges and filter on count = 0.
         out.put("deadCode", kuzu.read(
-                "MATCH (m:Node) WHERE m.label = 'Method' "
+                "MATCH (m:Node) WHERE m.label = 'Method' AND m.projectId = $pid "
                         + "AND coalesce(m.isTest, false) = false "
                         + "AND m.name <> 'main' "
                         + "AND coalesce(m.isConstructor, false) = false "
@@ -361,23 +398,25 @@ public final class KuzuGraphStore implements GraphStore {
                         + "OPTIONAL MATCH ()-[r:CALLS]->(m) "
                         + "WITH m, count(r) AS incoming "
                         + "WHERE incoming = 0 "
-                        + "RETURN m.fqName AS fqName ORDER BY m.fqName LIMIT 20"));
+                        + "RETURN m.fqName AS fqName ORDER BY m.fqName LIMIT 20", p));
         return out;
     }
 
     @Override
     public Map<String, Object> guardSummary(String projectId) {
+        Map<String, Object> p = Map.of("pid", projectId);
         long godFiles = countOne(
                 "MATCH (f:Node)-[:CONTAINS]->(c:Node)-[:CONTAINS]->(m:Node) "
                         + "WHERE f.label = 'File' AND c.label = 'Class' AND m.label = 'Method' "
-                        + "WITH f, count(m) AS methods WHERE methods >= 30 RETURN count(f) AS c");
+                        + "AND f.projectId = $pid "
+                        + "WITH f, count(m) AS methods WHERE methods >= 30 RETURN count(f) AS c", p);
         long godClasses = countOne(
                 "MATCH (c:Node)-[:CONTAINS]->(m:Node) "
-                        + "WHERE c.label = 'Class' AND m.label = 'Method' "
-                        + "WITH c, count(m) AS methods WHERE methods >= 20 RETURN count(c) AS c");
+                        + "WHERE c.label = 'Class' AND m.label = 'Method' AND c.projectId = $pid "
+                        + "WITH c, count(m) AS methods WHERE methods >= 20 RETURN count(c) AS c", p);
         long longMethods = countOne(
-                "MATCH (m:Node) WHERE m.label = 'Method' "
-                        + "AND (m.endLine - m.startLine) >= 80 RETURN count(m) AS c");
+                "MATCH (m:Node) WHERE m.label = 'Method' AND m.projectId = $pid "
+                        + "AND (m.endLine - m.startLine) >= 80 RETURN count(m) AS c", p);
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("pass", godFiles == 0 && godClasses == 0);
         out.put("errors", godFiles + godClasses);
@@ -389,42 +428,43 @@ public final class KuzuGraphStore implements GraphStore {
         return out;
     }
 
-    private long countOne(String cypher) {
-        List<Map<String, Object>> rows = kuzu.read(cypher);
+    private long countOne(String cypher, Map<String, Object> params) {
+        List<Map<String, Object>> rows = kuzu.read(cypher, params);
         if (rows.isEmpty()) return 0L;
         return asLong(rows.get(0).get("c"));
     }
 
     @Override
     public Map<String, List<Map<String, Object>>> infrastructureSummary(String projectId) {
+        Map<String, Object> p = Map.of("pid", projectId);
         Map<String, List<Map<String, Object>>> out = new LinkedHashMap<>();
         out.put("apiEndpoints", kuzu.read(
-                "MATCH (e:Node) WHERE e.label = 'ApiEndpoint' "
+                "MATCH (e:Node) WHERE e.label = 'ApiEndpoint' AND e.projectId = $pid "
                         + "RETURN e.httpMethod AS httpMethod, e.path AS path, e.framework AS framework "
-                        + "ORDER BY path"));
+                        + "ORDER BY path", p));
         out.put("queueListeners", kuzu.read(
-                "MATCH (m:Node) WHERE m.label = 'Method' "
+                "MATCH (m:Node) WHERE m.label = 'Method' AND m.projectId = $pid "
                         + "AND coalesce(m.isQueueListener, false) = true "
-                        + "RETURN m.fqName AS fqName"));
+                        + "RETURN m.fqName AS fqName", p));
         out.put("scheduledJobs", kuzu.read(
-                "MATCH (m:Node) WHERE m.label = 'Method' "
+                "MATCH (m:Node) WHERE m.label = 'Method' AND m.projectId = $pid "
                         + "AND coalesce(m.isScheduled, false) = true "
-                        + "RETURN m.fqName AS fqName"));
+                        + "RETURN m.fqName AS fqName", p));
         out.put("configKeys", kuzu.read(
-                "MATCH (c:Node) WHERE c.label = 'ConfigKey' "
-                        + "RETURN c.fqName AS fqName ORDER BY c.fqName"));
+                "MATCH (c:Node) WHERE c.label = 'ConfigKey' AND c.projectId = $pid "
+                        + "RETURN c.fqName AS fqName ORDER BY c.fqName", p));
         out.put("envVars", kuzu.read(
-                "MATCH (e:Node) WHERE e.label = 'EnvVar' "
-                        + "RETURN e.fqName AS fqName, e.value AS value ORDER BY e.fqName"));
+                "MATCH (e:Node) WHERE e.label = 'EnvVar' AND e.projectId = $pid "
+                        + "RETURN e.fqName AS fqName, e.value AS value ORDER BY e.fqName", p));
         out.put("containerImages", kuzu.read(
-                "MATCH (i:Node) WHERE i.label = 'ContainerImage' "
-                        + "RETURN i.fqName AS fqName, i.repository AS repository, i.tag AS tag"));
+                "MATCH (i:Node) WHERE i.label = 'ContainerImage' AND i.projectId = $pid "
+                        + "RETURN i.fqName AS fqName, i.repository AS repository, i.tag AS tag", p));
         out.put("containerPorts", kuzu.read(
-                "MATCH (p:Node) WHERE p.label = 'ContainerPort' "
-                        + "RETURN p.port AS port, p.protocol AS protocol"));
+                "MATCH (cp:Node) WHERE cp.label = 'ContainerPort' AND cp.projectId = $pid "
+                        + "RETURN cp.port AS port, cp.protocol AS protocol", p));
         out.put("terraformResources", kuzu.read(
-                "MATCH (r:Node) WHERE r.label = 'Resource' "
-                        + "RETURN r.fqName AS fqName, r.resourceType AS resourceType, r.provider AS provider"));
+                "MATCH (r:Node) WHERE r.label = 'Resource' AND r.projectId = $pid "
+                        + "RETURN r.fqName AS fqName, r.resourceType AS resourceType, r.provider AS provider", p));
         return out;
     }
 
@@ -438,29 +478,31 @@ public final class KuzuGraphStore implements GraphStore {
             out.put("rest", kuzu.read(
                     "MATCH (e:Node)-[:HANDLES]->(handler:Node) "
                             + "WHERE e.label = 'ApiEndpoint' AND handler.label = 'Method' "
+                            + "AND e.projectId = $pid "
                             + "OPTIONAL MATCH (handler)-[:CALLS*1.." + d + "]->(c:Node) "
                             + "WHERE c.label = 'Method' "
                             + "RETURN e.httpMethod AS method, e.path AS path, handler.fqName AS handler, "
                             + "list_slice(collect(DISTINCT c.fqName), 1, 50) AS reaches LIMIT $lim",
-                    Map.of("lim", limit)));
+                    Map.of("lim", limit, "pid", projectId)));
         }
         if ("main".equals(k) || "all".equals(k)) {
             out.put("main", kuzu.read(
-                    "MATCH (m:Node) WHERE m.label = 'Method' AND m.name = 'main' "
+                    "MATCH (m:Node) WHERE m.label = 'Method' AND m.projectId = $pid "
+                            + "AND m.name = 'main' "
                             + "AND coalesce(m.isStatic, false) = true "
                             + "OPTIONAL MATCH (m)-[:CALLS*1.." + d + "]->(c:Node) "
                             + "WHERE c.label = 'Method' "
                             + "RETURN m.fqName AS entry, list_slice(collect(DISTINCT c.fqName), 1, 50) AS reaches LIMIT $lim",
-                    Map.of("lim", limit)));
+                    Map.of("lim", limit, "pid", projectId)));
         }
         if ("test".equals(k) || "all".equals(k)) {
             out.put("test", kuzu.read(
-                    "MATCH (m:Node) WHERE m.label = 'Method' "
+                    "MATCH (m:Node) WHERE m.label = 'Method' AND m.projectId = $pid "
                             + "AND coalesce(m.isTest, false) = true "
                             + "OPTIONAL MATCH (m)-[:CALLS*1.." + d + "]->(c:Node) "
                             + "WHERE c.label = 'Method' "
                             + "RETURN m.fqName AS entry, list_slice(collect(DISTINCT c.fqName), 1, 50) AS reaches LIMIT $lim",
-                    Map.of("lim", limit)));
+                    Map.of("lim", limit, "pid", projectId)));
         }
         return out;
     }
@@ -468,11 +510,11 @@ public final class KuzuGraphStore implements GraphStore {
     @Override
     public Map<String, List<Map<String, Object>>> serviceLinks(String projectId) {
         Map<String, List<Map<String, Object>>> out = new LinkedHashMap<>();
-        out.put("outgoingHttp", readOutgoingHttp());
-        out.put("outgoingMessaging", readOutgoingMessaging());
-        out.put("incomingConsumers", readIncomingConsumers());
-        out.put("restEndpoints", readRestEndpoints());
-        out.put("tablesTouched", readTablesTouched());
+        out.put("outgoingHttp", readOutgoingHttp(projectId));
+        out.put("outgoingMessaging", readOutgoingMessaging(projectId));
+        out.put("incomingConsumers", readIncomingConsumers(projectId));
+        out.put("restEndpoints", readRestEndpoints(projectId));
+        out.put("tablesTouched", readTablesTouched(projectId));
         return out;
     }
 
@@ -487,38 +529,44 @@ public final class KuzuGraphStore implements GraphStore {
      *       {@code axios.post('url', body)}.</li>
      * </ul>
      */
-    private List<Map<String, Object>> readOutgoingHttp() {
+    private List<Map<String, Object>> readOutgoingHttp(String projectId) {
+        Map<String, Object> p = Map.of("pid", projectId);
         List<Map<String, Object>> jvm = kuzu.read(
                 "MATCH (m:Node)-[:CALLS]->(callee:Node) "
                         + "WHERE m.label = 'Method' AND callee.label = 'Method' "
+                        + "AND m.projectId = $pid "
                         + "AND regexp_matches(callee.fqName, '(?i).*(RestTemplate|WebClient|HttpClient|FeignClient|OkHttpClient).*') "
                         + "RETURN m.fqName AS caller, callee.fqName AS target, count(*) AS calls "
-                        + "ORDER BY calls DESC LIMIT 50");
+                        + "ORDER BY calls DESC LIMIT 50", p);
         List<Map<String, Object>> js = kuzu.read(
                 "MATCH (f:Node)-[:CALLS_HTTP]->(h:Node) "
                         + "WHERE f.label = 'File' AND h.label = 'HttpCall' "
+                        + "AND f.projectId = $pid "
                         + "RETURN f.path AS caller, h.httpMethod AS method, h.path AS target, "
-                        + "h.framework AS client ORDER BY target");
+                        + "h.framework AS client ORDER BY target", p);
         List<Map<String, Object>> all = new ArrayList<>(jvm.size() + js.size());
         all.addAll(jvm);
         all.addAll(js);
         return all;
     }
 
-    private List<Map<String, Object>> readOutgoingMessaging() {
+    private List<Map<String, Object>> readOutgoingMessaging(String projectId) {
         return kuzu.read(
                 "MATCH (m:Node)-[:CALLS]->(callee:Node) "
                         + "WHERE m.label = 'Method' AND callee.label = 'Method' "
+                        + "AND m.projectId = $pid "
                         + "AND regexp_matches(callee.fqName, '(?i).*(KafkaTemplate|RabbitTemplate|JmsTemplate|StreamBridge|SqsTemplate|SnsTemplate).*') "
                         + "RETURN m.fqName AS caller, callee.fqName AS target, count(*) AS calls "
-                        + "ORDER BY calls DESC LIMIT 50");
+                        + "ORDER BY calls DESC LIMIT 50",
+                Map.of("pid", projectId));
     }
 
-    private List<Map<String, Object>> readIncomingConsumers() {
+    private List<Map<String, Object>> readIncomingConsumers(String projectId) {
         return kuzu.read(
-                "MATCH (m:Node) WHERE m.label = 'Method' "
+                "MATCH (m:Node) WHERE m.label = 'Method' AND m.projectId = $pid "
                         + "AND coalesce(m.isQueueListener, false) = true "
-                        + "RETURN m.fqName AS handler LIMIT 100");
+                        + "RETURN m.fqName AS handler LIMIT 100",
+                Map.of("pid", projectId));
     }
 
     /**
@@ -529,16 +577,19 @@ public final class KuzuGraphStore implements GraphStore {
      * rejects {@code OPTIONAL MATCH} chained from an outer MATCH here, so we read both
      * relationships independently and join in Java.
      */
-    private List<Map<String, Object>> readRestEndpoints() {
+    private List<Map<String, Object>> readRestEndpoints(String projectId) {
+        Map<String, Object> p = Map.of("pid", projectId);
         List<Map<String, Object>> endpointRows = kuzu.read(
                 "MATCH (f:Node)-[:EXPOSES]->(e:Node) "
                         + "WHERE f.label = 'File' AND e.label = 'ApiEndpoint' "
+                        + "AND f.projectId = $pid "
                         + "RETURN e.fqName AS endpointKey, e.httpMethod AS method, e.path AS path, "
-                        + "e.framework AS framework, f.path AS file ORDER BY path");
+                        + "e.framework AS framework, f.path AS file ORDER BY path", p);
         List<Map<String, Object>> handlerRows = kuzu.read(
                 "MATCH (e:Node)-[:HANDLES]->(m:Node) "
                         + "WHERE e.label = 'ApiEndpoint' AND m.label = 'Method' "
-                        + "RETURN e.fqName AS endpointKey, m.fqName AS handler");
+                        + "AND e.projectId = $pid "
+                        + "RETURN e.fqName AS endpointKey, m.fqName AS handler", p);
         Map<Object, Object> handlerByEndpoint = new java.util.HashMap<>();
         for (Map<String, Object> r : handlerRows) handlerByEndpoint.put(r.get("endpointKey"), r.get("handler"));
         List<Map<String, Object>> endpoints = new ArrayList<>(endpointRows.size());
@@ -559,13 +610,15 @@ public final class KuzuGraphStore implements GraphStore {
      * in a single MATCH on the polymorphic Node table, so we issue one query per relationship
      * type and tag each result row with its {@code access} kind.
      */
-    private List<Map<String, Object>> readTablesTouched() {
+    private List<Map<String, Object>> readTablesTouched(String projectId) {
         List<Map<String, Object>> tables = new ArrayList<>();
         for (String rel : List.of("READS_TABLE", "WRITES_TABLE")) {
             List<Map<String, Object>> rows = kuzu.read(
-                    "MATCH (n:Node)-[r:" + rel + "]->(t:Node) WHERE t.label = 'Table' "
+                    "MATCH (n:Node)-[r:" + rel + "]->(t:Node) "
+                            + "WHERE t.label = 'Table' AND n.projectId = $pid "
                             + "RETURN t.name AS `table`, count(DISTINCT n) AS sources "
-                            + "ORDER BY `table`");
+                            + "ORDER BY `table`",
+                    Map.of("pid", projectId));
             for (Map<String, Object> r : rows) {
                 Map<String, Object> tagged = new LinkedHashMap<>(r);
                 tagged.put("access", rel);
@@ -577,26 +630,28 @@ public final class KuzuGraphStore implements GraphStore {
 
     @Override
     public Map<String, List<Map<String, Object>>> onboardSummary(String projectId) {
+        Map<String, Object> p = Map.of("pid", projectId);
         Map<String, List<Map<String, Object>>> out = new LinkedHashMap<>();
         out.put("languages", kuzu.read(
-                "MATCH (f:Node) WHERE f.label = 'File' "
-                        + "RETURN f.language AS language, count(f) AS files ORDER BY files DESC"));
+                "MATCH (f:Node) WHERE f.label = 'File' AND f.projectId = $pid "
+                        + "RETURN f.language AS language, count(f) AS files ORDER BY files DESC", p));
         out.put("topClasses", kuzu.read(
                 "MATCH (c:Node)-[:CONTAINS]->(m:Node) "
-                        + "WHERE c.label = 'Class' AND m.label = 'Method' "
-                        + "RETURN c.fqName AS fqName, count(m) AS methods ORDER BY methods DESC LIMIT 10"));
+                        + "WHERE c.label = 'Class' AND m.label = 'Method' AND c.projectId = $pid "
+                        + "RETURN c.fqName AS fqName, count(m) AS methods ORDER BY methods DESC LIMIT 10", p));
         out.put("restEndpoints", kuzu.read(
-                "MATCH (e:Node) WHERE e.label = 'ApiEndpoint' "
-                        + "RETURN e.httpMethod AS method, e.path AS path, e.framework AS framework ORDER BY path"));
+                "MATCH (e:Node) WHERE e.label = 'ApiEndpoint' AND e.projectId = $pid "
+                        + "RETURN e.httpMethod AS method, e.path AS path, e.framework AS framework ORDER BY path", p));
         // Two-step: list all tables, then fetch table→column counts, merge in Java. Kuzu's
         // binder doesn't keep the outer-MATCH variable in scope through an OPTIONAL MATCH +
         // WITH chain here, so we compose the result instead of one composite Cypher.
         List<Map<String, Object>> tableRows = kuzu.read(
-                "MATCH (t:Node) WHERE t.label = 'Table' RETURN t.name AS `table` ORDER BY t.name");
+                "MATCH (t:Node) WHERE t.label = 'Table' AND t.projectId = $pid "
+                        + "RETURN t.name AS `table` ORDER BY t.name", p);
         List<Map<String, Object>> colCounts = kuzu.read(
                 "MATCH (t:Node)-[:CONTAINS]->(c:Node) "
-                        + "WHERE t.label = 'Table' AND c.label = 'Column' "
-                        + "RETURN t.name AS `table`, count(c) AS columns");
+                        + "WHERE t.label = 'Table' AND c.label = 'Column' AND t.projectId = $pid "
+                        + "RETURN t.name AS `table`, count(c) AS columns", p);
         java.util.Map<Object, Object> byTable = new java.util.HashMap<>();
         for (Map<String, Object> r : colCounts) byTable.put(r.get("table"), r.get("columns"));
         List<Map<String, Object>> tables = new ArrayList<>(tableRows.size());
@@ -608,13 +663,13 @@ public final class KuzuGraphStore implements GraphStore {
         }
         out.put("tables", tables);
         out.put("configKeys", kuzu.read(
-                "MATCH (k:Node) WHERE k.label = 'ConfigKey' "
-                        + "RETURN k.fqName AS key, k.value AS value ORDER BY k.fqName LIMIT 50"));
+                "MATCH (k:Node) WHERE k.label = 'ConfigKey' AND k.projectId = $pid "
+                        + "RETURN k.fqName AS key, k.value AS value ORDER BY k.fqName LIMIT 50", p));
         out.put("envVars", kuzu.read(
-                "MATCH (e:Node) WHERE e.label = 'EnvVar' "
-                        + "RETURN e.name AS name, e.value AS value ORDER BY e.name"));
+                "MATCH (e:Node) WHERE e.label = 'EnvVar' AND e.projectId = $pid "
+                        + "RETURN e.name AS name, e.value AS value ORDER BY e.name", p));
         out.put("callGraphHubs", kuzu.read(
-                "MATCH (m:Node) WHERE m.label = 'Method' "
+                "MATCH (m:Node) WHERE m.label = 'Method' AND m.projectId = $pid "
                         + "AND NOT m.fqName STARTS WITH 'unresolved.' "
                         + "OPTIONAL MATCH (m)-[outR:CALLS]->() "
                         + "WITH m, count(outR) AS outDeg "
@@ -622,7 +677,7 @@ public final class KuzuGraphStore implements GraphStore {
                         + "WITH m, outDeg, count(inR) AS inDeg "
                         + "WHERE (outDeg + inDeg) > 0 "
                         + "RETURN m.fqName AS fqName, outDeg, inDeg, (outDeg + inDeg) AS total "
-                        + "ORDER BY total DESC LIMIT 10"));
+                        + "ORDER BY total DESC LIMIT 10", p));
         return out;
     }
 
@@ -640,8 +695,10 @@ public final class KuzuGraphStore implements GraphStore {
 
     @Override
     public MethodCallGraph methodCallGraph(String projectId) {
+        Map<String, Object> p = Map.of("pid", projectId);
         List<Map<String, Object>> methods = kuzu.read(
-                "MATCH (m:Node) WHERE m.label = 'Method' RETURN m.id AS id, m.fqName AS fqName");
+                "MATCH (m:Node) WHERE m.label = 'Method' AND m.projectId = $pid "
+                        + "RETURN m.id AS id, m.fqName AS fqName", p);
         java.util.Map<String, Integer> idx = new java.util.HashMap<>(methods.size() * 2);
         String[] fqNames = new String[methods.size()];
         for (int i = 0; i < methods.size(); i++) {
@@ -652,7 +709,8 @@ public final class KuzuGraphStore implements GraphStore {
         List<Map<String, Object>> edges = kuzu.read(
                 "MATCH (a:Node)-[:CALLS]->(b:Node) "
                         + "WHERE a.label = 'Method' AND b.label = 'Method' "
-                        + "RETURN a.id AS fromId, b.id AS toId");
+                        + "AND a.projectId = $pid AND b.projectId = $pid "
+                        + "RETURN a.id AS fromId, b.id AS toId", p);
         List<int[]> edgePairs = new ArrayList<>(edges.size());
         for (Map<String, Object> e : edges) {
             Integer fi = idx.get(e.get("fromId"));
