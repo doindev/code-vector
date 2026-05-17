@@ -1,6 +1,7 @@
 package io.doindev.cvector.cli.commands;
 
 import io.doindev.cvector.cli.CvectorRuntime;
+import io.doindev.cvector.cli.scan.InProcessScanService;
 import io.doindev.cvector.cli.util.GitHelper;
 import io.doindev.cvector.core.Parser;
 import io.doindev.cvector.core.ProjectContext;
@@ -102,7 +103,7 @@ public class ScanIncrementalCommand implements Callable<Integer> {
             }
             for (Parser p : parsers) p.finish();
 
-            ScanCommand.emitProjectNode(ctx, currentHead.get(), ingestor);
+            InProcessScanService.emitProjectNode(ctx, currentHead.get(), ingestor);
             ingestor.flush();
 
             System.out.printf("re-scanned %d file(s); nodes upserted: %d, edges upserted: %d%n",

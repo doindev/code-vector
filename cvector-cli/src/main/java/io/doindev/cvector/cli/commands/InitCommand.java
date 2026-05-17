@@ -37,7 +37,14 @@ public class InitCommand implements Callable<Integer> {
               cvector_neo4j_data:
             """;
 
-    @Option(names = "--project", description = "Project name (defaults to current directory name).")
+    // Renamed from `--project` to `--name` in 0.2.0. The root-level `--project` flag
+    // declared on {@code CvectorCommand} (scope=INHERIT) is reserved for the workspace
+    // one-shot override (which existing registered project a command targets); a
+    // duplicate option declaration at the subcommand level is a fatal picocli startup
+    // error. Old `cvector init --project foo` scripts must switch to
+    // `cvector init --name foo`.
+    @Option(names = "--name",
+            description = "Project name for the new entry (defaults to current directory name).")
     private String projectName;
 
     @Option(names = "--force", description = "Overwrite existing config.")

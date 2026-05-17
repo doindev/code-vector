@@ -35,11 +35,21 @@ public class ServeCommand implements Callable<Integer> {
     @Override
     public Integer call() throws InterruptedException {
         CvectorConfig cfg = runtime.loadConfig();
-        CvectorConfig.ProjectEntry active = runtime.requireActiveProject(cfg);
+        // Tolerate empty workspaces — the MCP server boots fine without an active project
+        // so the agent can immediately call cv_add_project / cv_onboard_project. We try
+        // requireActiveProject() best-effort; if it throws (no default + no override), we
+        // print a placeholder banner that still confirms the server is up.
+        CvectorConfig.ProjectEntry active;
+        try { active = runtime.requireActiveProject(cfg); }
+        catch (RuntimeException e) { active = null; }
 
         // Logs go to stderr so stdout is free for MCP JSON-RPC.
         System.err.println("cvector mcp server (stdio) ready");
-        System.err.println("  project:   " + active.name() + " (" + active.projectId() + ")");
+        if (active != null) {
+            System.err.println("  project:   " + active.name() + " (" + active.projectId() + ")");
+        } else {
+            System.err.println("  project:   <none registered — call cv_add_project or cv_onboard_project>");
+        }
         System.err.println("  neo4j:     " + cfg.neo4jOrDefault().uri());
         System.err.println("  transport: stdio (System.in / System.out JSON-RPC)");
         System.err.println("  log:       " + System.getProperty("user.home") + "/.cvector/mcp-server.log");

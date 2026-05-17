@@ -49,6 +49,25 @@ public final class EmbeddedKuzu implements AutoCloseable {
     private final Database database;
     private final Connection connection;
     /**
+     * Serializes every native call on {@link #connection}. Kuzu's Java {@code Connection} is a
+     * single-threaded session — its {@code prepare()}, {@code execute()}, {@code query()}, and
+     * {@code close()} entry points are not safe to call from multiple threads concurrently, and
+     * doing so in practice deadlocked the dashboard (four parallel MCP {@code cv_explain} calls
+     * each issuing three Kuzu reads → 12 JNI calls fighting over the same connection, all of them
+     * timing out at the client's 30 s ceiling). All other {@code EmbeddedKuzu} state
+     * ({@link #stmtCache}, {@link #paramRefCache}, {@link #colNamesCache}) lives in concurrent
+     * maps and doesn't need the lock — only the native calls do.
+     *
+     * <p>Holding the lock during {@code QueryResult} iteration too is the safe choice: Kuzu's
+     * result objects are tied to the connection's cursor and reusing the connection mid-iteration
+     * would invalidate them. The lock is fine-grained per-EmbeddedKuzu, so different project
+     * databases (isolated mode) still execute fully in parallel; only callers against the SAME
+     * project DB serialise here. That matches Kuzu's intrinsic single-writer semantics and keeps
+     * read throughput at single-connection-with-intra-query-parallelism levels — adequate for a
+     * single-user agent workflow without paying connection-pool complexity.
+     */
+    private final Object connLock = new Object();
+    /**
      * Prepared statements are cached by their Cypher text and reused across calls. KuzuDB's
      * {@code prepare} step parses and plans the query — when the ingest loop hits the same template
      * tens of thousands of times, amortising it gives a substantial speedup. The cache is bounded
@@ -116,10 +135,48 @@ public final class EmbeddedKuzu implements AutoCloseable {
             try {
                 this.connection.setMaxNumThreadForExec(Runtime.getRuntime().availableProcessors());
             } catch (RuntimeException ignored) { /* older Kuzu builds may not expose this */ }
+            writeLockfile();
         } catch (RuntimeException e) {
+            // Kuzu's open-time failure on a held file lock is opaque ("Could not set lock on
+            // file"); enrich it with the PID + timestamp from a sibling .cvector-lock file
+            // that we write at successful open. Helps users figure out which other process
+            // owns the DB without grepping for `cvector` in their task list.
+            String msg = e.getMessage() != null ? e.getMessage() : "";
+            if (msg.contains("Could not set lock")) {
+                String diag = readLockfile(dbPath);
+                throw new IOException("Kuzu database at " + dbPath + " is held by another cvector process"
+                        + (diag != null ? " (" + diag + ")" : "")
+                        + ". Stop the other process first, or set kuzu.sharedDb=false / isolated=true on this project to use its own DB.", e);
+            }
             throw new IOException("failed to open Kuzu database at " + dbPath + ": " + e.getMessage(), e);
         }
         log.debug("opened Kuzu database at {}", dbPath);
+    }
+
+    /**
+     * Drop a {@code .cvector-lock} sibling file with PID + timestamp so a future open
+     * attempt that hits Kuzu's file lock can surface a useful "owned by PID X" error.
+     * Best-effort: failure is logged but doesn't abort the open.
+     */
+    private void writeLockfile() {
+        Path lock = dbPath.resolveSibling(".cvector-lock");
+        try {
+            String pid = String.valueOf(ProcessHandle.current().pid());
+            String content = "pid=" + pid + "\ntimestamp=" + java.time.Instant.now() + "\n";
+            Files.writeString(lock, content);
+            // Best-effort cleanup on shutdown; if the JVM crashes the file leaks but the
+            // next successful open overwrites it.
+            lock.toFile().deleteOnExit();
+        } catch (IOException ignored) { }
+    }
+
+    private static String readLockfile(Path dbPath) {
+        Path lock = dbPath.resolveSibling(".cvector-lock");
+        try {
+            if (!Files.exists(lock)) return null;
+            String content = Files.readString(lock).trim().replace("\n", ", ");
+            return content;
+        } catch (IOException ignored) { return null; }
     }
 
     /**
@@ -209,17 +266,52 @@ public final class EmbeddedKuzu implements AutoCloseable {
         return Path.of(System.getProperty("user.home"), ".cvector", "kuzu-data");
     }
 
-    public static Path defaultDbPath(String projectId) {
+    /**
+     * Path to a single shared Kuzu DB that holds every non-isolated project, partitioned
+     * by the {@code projectId} node property. Introduced in 0.2.0; the previous
+     * per-project directory layout is still reachable via {@link #isolatedDbPath}.
+     */
+    public static Path sharedDbPath() {
+        return defaultDataRoot().resolve("graph.kuzu");
+    }
+
+    /** Pre-0.2.0 per-project DB path. Used when a project sets {@code isolated: true}. */
+    public static Path isolatedDbPath(String projectId) {
         return defaultDataRoot().resolve(projectId).resolve("graph.kuzu");
+    }
+
+    /**
+     * Resolves the on-disk Kuzu DB path for a project, honoring the workspace-level
+     * {@code kuzu.sharedDb} flag and the per-project {@code isolated} override.
+     *
+     * <p>{@code cfg} may be {@code null} (very early bootstrap) — in that case we
+     * fall back to the shared path so freshly-created projects land in the default
+     * topology.
+     */
+    public static Path defaultDbPath(CvectorConfig cfg, String projectId) {
+        if (cfg == null || cfg.isSharedDbMode(projectId)) return sharedDbPath();
+        return isolatedDbPath(projectId);
+    }
+
+    /**
+     * @deprecated Pass the loaded {@link CvectorConfig} so the shared/isolated routing
+     *     can be honored; this overload always returns the pre-0.2.0 per-project path
+     *     and is retained only for callers in early bootstrap paths.
+     */
+    @Deprecated
+    public static Path defaultDbPath(String projectId) {
+        return isolatedDbPath(projectId);
     }
 
     public Path dbPath() { return dbPath; }
 
     public boolean ping() {
-        try (QueryResult r = connection.query("RETURN 1")) {
-            return r.isSuccess();
-        } catch (RuntimeException e) {
-            return false;
+        synchronized (connLock) {
+            try (QueryResult r = connection.query("RETURN 1")) {
+                return r.isSuccess();
+            } catch (RuntimeException e) {
+                return false;
+            }
         }
     }
 
@@ -235,38 +327,40 @@ public final class EmbeddedKuzu implements AutoCloseable {
      * callers that need richer access can be extended later.
      */
     public List<Map<String, Object>> read(String cypher, Map<String, Object> params) {
-        try (QueryResult result = run(cypher, params)) {
-            if (!result.isSuccess()) {
-                throw new RuntimeException("Kuzu query failed: " + result.getErrorMessage()
-                        + "\nquery: " + cypher);
-            }
-            // Column names are stable per Cypher template (RETURN clause is fixed). Caching
-            // saves a per-call JNI loop -- meaningful for the read hot path, which 50+ call
-            // sites flow through. Validated against the live column count to fail loudly if
-            // a query ever returns a different shape (it shouldn't, but the cost is one int compare).
-            int cols = (int) result.getNumColumns();
-            String[] names = colNamesCache.get(cypher);
-            if (names == null || names.length != cols) {
-                names = new String[cols];
-                for (int i = 0; i < cols; i++) names[i] = result.getColumnName(i);
-                colNamesCache.put(cypher, names);
-            }
-            List<Map<String, Object>> rows = new ArrayList<>();
-            while (result.hasNext()) {
-                try (FlatTuple t = result.getNext()) {
-                    // Pre-size LinkedHashMap with the exact column count so we don't pay for
-                    // a rehash + table-double when {@code cols > 12}. Load factor 1.0 because
-                    // we never grow.
-                    Map<String, Object> row = new LinkedHashMap<>(cols, 1.0f);
-                    for (int i = 0; i < cols; i++) {
-                        try (Value v = t.getValue(i)) {
-                            row.put(names[i], unwrap(v));
-                        }
-                    }
-                    rows.add(row);
+        synchronized (connLock) {
+            try (QueryResult result = run(cypher, params)) {
+                if (!result.isSuccess()) {
+                    throw new RuntimeException("Kuzu query failed: " + result.getErrorMessage()
+                            + "\nquery: " + cypher);
                 }
+                // Column names are stable per Cypher template (RETURN clause is fixed). Caching
+                // saves a per-call JNI loop -- meaningful for the read hot path, which 50+ call
+                // sites flow through. Validated against the live column count to fail loudly if
+                // a query ever returns a different shape (it shouldn't, but the cost is one int compare).
+                int cols = (int) result.getNumColumns();
+                String[] names = colNamesCache.get(cypher);
+                if (names == null || names.length != cols) {
+                    names = new String[cols];
+                    for (int i = 0; i < cols; i++) names[i] = result.getColumnName(i);
+                    colNamesCache.put(cypher, names);
+                }
+                List<Map<String, Object>> rows = new ArrayList<>();
+                while (result.hasNext()) {
+                    try (FlatTuple t = result.getNext()) {
+                        // Pre-size LinkedHashMap with the exact column count so we don't pay for
+                        // a rehash + table-double when {@code cols > 12}. Load factor 1.0 because
+                        // we never grow.
+                        Map<String, Object> row = new LinkedHashMap<>(cols, 1.0f);
+                        for (int i = 0; i < cols; i++) {
+                            try (Value v = t.getValue(i)) {
+                                row.put(names[i], unwrap(v));
+                            }
+                        }
+                        rows.add(row);
+                    }
+                }
+                return rows;
             }
-            return rows;
         }
     }
 
@@ -274,10 +368,12 @@ public final class EmbeddedKuzu implements AutoCloseable {
     public void write(String cypher) { write(cypher, Map.of()); }
 
     public void write(String cypher, Map<String, Object> params) {
-        try (QueryResult result = run(cypher, params)) {
-            if (!result.isSuccess()) {
-                throw new RuntimeException("Kuzu write failed: " + result.getErrorMessage()
-                        + "\nquery: " + cypher);
+        synchronized (connLock) {
+            try (QueryResult result = run(cypher, params)) {
+                if (!result.isSuccess()) {
+                    throw new RuntimeException("Kuzu write failed: " + result.getErrorMessage()
+                            + "\nquery: " + cypher);
+                }
             }
         }
     }
@@ -396,11 +492,13 @@ public final class EmbeddedKuzu implements AutoCloseable {
 
     @Override
     public void close() {
-        for (PreparedStatement s : stmtCache.values()) {
-            try { s.close(); } catch (RuntimeException ignored) { }
+        synchronized (connLock) {
+            for (PreparedStatement s : stmtCache.values()) {
+                try { s.close(); } catch (RuntimeException ignored) { }
+            }
+            stmtCache.clear();
+            try { connection.close(); } catch (RuntimeException ignored) { }
+            try { database.close(); } catch (RuntimeException ignored) { }
         }
-        stmtCache.clear();
-        try { connection.close(); } catch (RuntimeException ignored) { }
-        try { database.close(); } catch (RuntimeException ignored) { }
     }
 }

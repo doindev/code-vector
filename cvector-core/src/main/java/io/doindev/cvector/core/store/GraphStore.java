@@ -445,6 +445,24 @@ public interface GraphStore extends AutoCloseable {
     int deleteFileSubtree(String projectId, String path);
 
     /**
+     * Delete every node belonging to a project (and the edges pinned to those nodes). Used
+     * by {@code cv_remove_project} and {@code cvector embedded wipe} on shared-DB
+     * deployments. Returns the number of nodes removed.
+     *
+     * <p>Default implementation runs a single {@code DETACH DELETE} matching by
+     * {@code projectId} — works for Neo4j and Kuzu without per-store overrides because both
+     * stores carry {@code projectId} on every node. Stores with non-standard schemas should
+     * override.
+     */
+    default int deleteProjectSubtree(String projectId) {
+        // The default impl can't run Cypher directly — concrete stores override. We can't
+        // throw from here without breaking the GraphStore interface contract for the
+        // (rare) implementations that don't carry projectId on every node, so the default
+        // is a soft no-op that subclasses are expected to replace.
+        return 0;
+    }
+
+    /**
      * Swap the backing data store to a different project. Used by the runtime project-switch
      * path so the dashboard / REST surface can flip workspaces without a restart.
      *

@@ -86,7 +86,7 @@ public class DiffCommand implements Callable<Integer> {
             return 0;
         }
 
-        return CvectorRuntime.isEmbeddedRequested()
+        return CvectorRuntime.isEmbeddedRequested(cfg)
                 ? runEmbedded(cfg, active, repo, fullA, fullB)
                 : runNeo4j(cfg, active, repo, fullA, fullB);
     }

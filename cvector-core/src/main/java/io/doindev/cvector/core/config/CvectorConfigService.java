@@ -130,17 +130,20 @@ public class CvectorConfigService {
      * place (settings.json or the legacy project.json). Returns {@code null} only when
      * the user-home property is missing or the filesystem refuses the write.
      *
-     * <p>The bootstrapped config seeds an embedded-Kuzu workspace with a single
-     * {@code default} project rooted at {@code $HOME}. That choice is deliberate: it lets
-     * read commands ({@code status}, {@code search}, dashboard) run successfully on a
-     * fresh install before the user has run {@code cvector init} anywhere; they can then
-     * point at their actual codebase via {@code cvector project create} /
-     * {@code project switch} or by editing the file.
+     * <p>The bootstrapped config is intentionally <b>empty of projects</b>: no
+     * {@code default} entry, no {@code activeProject}. Earlier 0.1.x releases seeded a
+     * {@code default} project rooted at {@code $HOME} so read commands "just worked" on
+     * a fresh install, but that surfaced the user's home directory as a scannable
+     * codebase — confusing when commands like {@code cvector status} reported counts
+     * from arbitrary files under {@code $HOME}. As of 0.2.0 the user must explicitly
+     * register a project via {@code cvector init} (in the codebase directory),
+     * {@code cvector project create}, or the MCP tools {@code cv_add_project} /
+     * {@code cv_onboard_project}.
      *
      * <p>Writes a one-line {@code stderr} notice so the user knows a file appeared in
-     * their home directory on their behalf — silent file creation in {@code $HOME} would
-     * be surprising. The notice fires once per bootstrap (subsequent calls find the file
-     * and skip).
+     * their home directory on their behalf — silent file creation in {@code $HOME}
+     * would be surprising. The notice fires once per bootstrap (subsequent calls find
+     * the file and skip).
      */
     public Path ensureHomeWorkspace() {
         Path home = userHomeConfigRoot();
@@ -149,20 +152,15 @@ public class CvectorConfigService {
         try {
             Path settings = configPath(home);
             Files.createDirectories(settings.getParent());
-            CvectorConfig.ProjectEntry defaultProject = new CvectorConfig.ProjectEntry(
-                    java.util.UUID.randomUUID().toString(),
-                    "default",
-                    home.toString());
-            java.util.Map<String, CvectorConfig.ProjectEntry> projects = new LinkedHashMap<>();
-            projects.put("default", defaultProject);
             CvectorConfig cfg = new CvectorConfig(
-                    "default", projects,
+                    null,                                // activeProject: nothing to activate yet
+                    new LinkedHashMap<>(),               // projects: empty
                     null,                                // neo4j: defaults at read time
                     CvectorConfig.BACKEND_EMBEDDED,
                     null, null, null, null);             // rest/mcp/docker/rules: defaults
             mapper.writeValue(settings.toFile(), cfg);
-            System.err.println("cvector: created " + settings + " (backend=embedded, project=default rooted at "
-                    + home + "). Edit it or run `cvector project create` to point at your codebase.");
+            System.err.println("cvector: created " + settings + " (backend=embedded, no projects registered yet). "
+                    + "Run `cvector init` from inside a codebase directory, or `cvector project create <name> --root <path>`.");
             return home;
         } catch (IOException e) {
             // File-system refused the write (read-only $HOME, permission denied, etc.).

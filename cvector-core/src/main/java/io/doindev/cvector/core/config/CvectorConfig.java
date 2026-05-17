@@ -1,5 +1,6 @@
 package io.doindev.cvector.core.config;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonInclude;
 
 import java.util.LinkedHashMap;
@@ -99,6 +100,29 @@ public record CvectorConfig(
         return docker != null ? docker.withDefaults() : DockerConfig.defaults();
     }
 
+    /** Kuzu section with defaults applied where absent — the section is entirely optional. */
+    public KuzuConfig kuzuOrDefault() {
+        return kuzu != null ? kuzu : new KuzuConfig(null, null);
+    }
+
+    /**
+     * Whether the given project should use the shared Kuzu DB layout or its own directory.
+     * Shared mode is the default unless either (a) {@code kuzu.sharedDb} is explicitly
+     * {@code false} workspace-wide or (b) the project entry sets {@code isolated: true}.
+     *
+     * <p>The lookup tolerates an unknown {@code projectId} (returns the workspace-level
+     * default) so freshly-created projects that haven't been added to {@code projects}
+     * yet still get sensible routing.
+     */
+    public boolean isSharedDbMode(String projectId) {
+        if (!kuzuOrDefault().sharedDbOrDefault()) return false;
+        if (projectId == null) return true;
+        for (ProjectEntry e : projects.values()) {
+            if (projectId.equals(e.projectId())) return !e.isolatedOrDefault();
+        }
+        return true;
+    }
+
     public ProjectEntry active() {
         if (activeProject == null) return null;
         return projects.get(activeProject);
@@ -114,10 +138,31 @@ public record CvectorConfig(
      * null field that confuses new users reading their first config file.
      */
     @JsonInclude(JsonInclude.Include.NON_NULL)
-    public record ProjectEntry(String projectId, String name, String rootPath, RulesPolicy rules) {
+    public record ProjectEntry(String projectId, String name, String rootPath, RulesPolicy rules, Boolean isolated) {
         /** Legacy 3-arg constructor for callers that don't carry rules. */
         public ProjectEntry(String projectId, String name, String rootPath) {
-            this(projectId, name, rootPath, null);
+            this(projectId, name, rootPath, null, null);
+        }
+
+        /** 4-arg constructor for callers that carry rules but not the isolated flag. */
+        public ProjectEntry(String projectId, String name, String rootPath, RulesPolicy rules) {
+            this(projectId, name, rootPath, rules, null);
+        }
+
+        /**
+         * When {@code true}, this project's Kuzu graph lives in its own directory at
+         * {@code ~/.cvector/kuzu-data/<projectId>/} (the pre-0.2.0 layout) instead of
+         * sharing the workspace-level {@code ~/.cvector/kuzu-data/graph.kuzu/} with other
+         * projects. Useful for very large projects you want isolated from the shared
+         * file-lock contention, or CI workflows running parallel scans.
+         *
+         * <p>{@code null} is equivalent to {@code false}.
+         */
+        @JsonIgnore  // Jackson's is-prefix bean introspection would otherwise expose this as
+                    // a serialised property called "olatedOrDefault" (stripping the leading
+                    // "is"), polluting every settings.json write.
+        public boolean isolatedOrDefault() {
+            return Boolean.TRUE.equals(isolated);
         }
     }
 
@@ -170,7 +215,32 @@ public record CvectorConfig(
      * runtime — pick a size up front, restart cvector if you change it.
      */
     @JsonInclude(JsonInclude.Include.NON_NULL)
-    public record KuzuConfig(Integer bufferSizeMb) {}
+    public record KuzuConfig(Integer bufferSizeMb, Boolean sharedDb) {
+        /** Legacy 1-arg constructor for callers that don't carry the sharedDb flag. */
+        public KuzuConfig(Integer bufferSizeMb) {
+            this(bufferSizeMb, null);
+        }
+
+        /**
+         * When {@code true} (the default for new installs as of 0.2.0), all non-isolated
+         * projects share a single Kuzu database at {@code ~/.cvector/kuzu-data/graph.kuzu/}
+         * partitioned by node {@code projectId}. Enables zero-cost project switching and
+         * native cross-project queries.
+         *
+         * <p>When {@code false}, each project gets its own directory at
+         * {@code ~/.cvector/kuzu-data/<projectId>/graph.kuzu/} (the pre-0.2.0 layout).
+         * Use this if you run parallel scans across projects and the shared file-lock
+         * contention hurts.
+         *
+         * <p>{@code null} is treated as {@code true} so upgrading users get the new
+         * topology automatically. Per-project opt-out is via
+         * {@link ProjectEntry#isolated}.
+         */
+        @JsonIgnore  // same Jackson is-prefix concern as ProjectEntry.isolatedOrDefault.
+        public boolean sharedDbOrDefault() {
+            return sharedDb == null || Boolean.TRUE.equals(sharedDb);
+        }
+    }
 
     @JsonInclude(JsonInclude.Include.NON_NULL)
     public record Neo4jConfig(String uri, String user, String password) {
@@ -214,9 +284,16 @@ public record CvectorConfig(
     }
 
     /**
-     * MCP server config. {@code transport} ∈ {@code http} | {@code sse} | {@code stdio}.
-     * {@code url} is informational for clients — the server still binds to {@link RestConfig#host}
-     * and {@link RestConfig#port} (plus the MCP path) by default.
+     * MCP server config. {@code transport} ∈ {@code sse} | {@code stdio} | {@code http}.
+     * <p>{@code sse} is the default when co-hosted with the dashboard: Spring AI 1.0.0's
+     * MCP server only implements the SSE transport (client opens {@code GET /sse},
+     * server emits an {@code endpoint} event with a {@code /mcp?sessionId=…} URL,
+     * client POSTs JSON-RPC there). The newer "Streamable HTTP" single-endpoint
+     * transport from MCP spec 2024-11-05+ is not yet supported by Spring AI; the
+     * server treats {@code http} as an alias for {@code sse} so existing config files
+     * keep working, but {@code sse} is the accurate label.
+     * <p>{@code url} is informational for clients — the server still binds to
+     * {@link RestConfig#host} and {@link RestConfig#port} regardless.
      */
     @JsonInclude(JsonInclude.Include.NON_NULL)
     public record McpConfig(String url, String transport) {
@@ -225,14 +302,16 @@ public record CvectorConfig(
         public static final String TRANSPORT_SSE = "sse";
         public static final String TRANSPORT_STDIO = "stdio";
 
+        private static final String DEFAULT_URL = "http://127.0.0.1:2969/sse";
+
         public static McpConfig defaults() {
-            return new McpConfig("http://127.0.0.1:2969/mcp", TRANSPORT_HTTP);
+            return new McpConfig(DEFAULT_URL, TRANSPORT_SSE);
         }
 
         public McpConfig withDefaults() {
             return new McpConfig(
-                    url == null || url.isBlank() ? "http://127.0.0.1:2969/mcp" : url,
-                    transport == null || transport.isBlank() ? TRANSPORT_HTTP : transport.toLowerCase());
+                    url == null || url.isBlank() ? DEFAULT_URL : url,
+                    transport == null || transport.isBlank() ? TRANSPORT_SSE : transport.toLowerCase());
         }
 
         /** Validates the transport string is one of the supported values. */

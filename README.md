@@ -15,6 +15,7 @@ Code knowledge graph with a polyglot scanner, a Picocli CLI, a Spring Boot REST 
 5. [REST API](#rest-api)
 6. [MCP server](#mcp-server)
    - [Tools](#mcp-tools)
+   - [Long-running tools: async + cv_job_status](#long-running-tools-async--cv_job_status)
    - [Resources](#mcp-resources)
    - [Prompts](#mcp-prompts)
    - [Client setup](#mcp-client-setup)
@@ -684,34 +685,180 @@ All responses are JSON. Role-based access via `cvector_role` env var (see [Roles
 
 ---
 
+## Multi-project workflows
+
+Every cvector workspace can hold many projects (`projects.<name>` map in `settings.json`). As of 0.2.0, both the CLI and the MCP tool surface treat the workspace as a multi-project catalog:
+
+- **Shared Kuzu DB by default.** All non-isolated projects live in one `~/.cvector/kuzu-data/graph.kuzu/` partitioned by `projectId`. Zero-cost project switching, native cross-project Cypher, single backup directory. Per-project escape hatch: set `projects.<name>.isolated: true` (or `cvector project create --isolated`) for the legacy per-project-directory layout — useful when concurrent CI scans need file-lock isolation.
+- **Default project resolution.** Both CLI commands and MCP tools accept an optional project argument (name, UUID, or rootPath). When omitted, they fall back to `activeProject` in `settings.json`. Set the default with `cvector project switch <name>` or the `cv_set_default_project` MCP tool.
+- **Sub-directory overlap is rejected.** `cvector project create` and `cv_add_project` both refuse a rootPath that equals, lives inside, or contains an existing project's rootPath — onboarding overlapping ranges produces ambiguous ownership for every file in the overlap.
+- **Cross-project queries.** Tools that support it (`cv_search`, `cv_stats`, `cv_health`, `cv_changes`, `cv_communities`, `cv_service_links`) accept the literal `"*"` for `project` to scope across every registered project. Each result row is tagged with its `project` block so the agent can disambiguate.
+- **Project context in every response.** Every MCP tool response that targets a specific project carries a top-level `project: { projectId, name, rootPath, isolated }` block. Confirms which project the result came from — defends against silent default-routing surprises.
+
+### Onboarding a new project (CLI)
+
+```bash
+cd /path/to/your/codebase
+cvector init --project my-app                    # bootstraps .cvector/settings.json
+cvector scan                                     # populates the graph
+
+# Add a second project to the same workspace
+cvector project create backend-api --root /work/backend --switch
+cvector scan                                     # against the new active project
+
+# Or use a one-shot override without flipping the default
+cvector --project my-app status                  # query a different project for one call
+```
+
+### Onboarding via the MCP server (AI agent)
+
+```jsonc
+// 1. Discover what's there
+{"name": "cv_list_projects"}
+
+// 2. New codebase — register + scan + brief in one call
+{"name": "cv_onboard_project",
+ "arguments": {"name": "auth-svc", "rootPath": "/work/auth-svc"}}
+
+// 3. Targeted query against the new project (project arg accepts name/UUID/path)
+{"name": "cv_search",
+ "arguments": {"project": "auth-svc", "query": "TokenStore"}}
+
+// 4. Cross-project query
+{"name": "cv_search",
+ "arguments": {"project": "*", "query": "org.slf4j"}}
+
+// 5. Change the workspace default so subsequent calls can omit `project`
+{"name": "cv_set_default_project",
+ "arguments": {"project": "auth-svc"}}
+```
+
+### Project lifecycle MCP tools
+
+| Tool | Purpose |
+|---|---|
+| `cv_list_projects` | Enumerate every project with name, projectId, rootPath, isolation flag, scan freshness, node/edge counts. The agent's primary discovery tool. |
+| `cv_find_project` | Look up a project by name, UUID, or directory path (path matching tolerates descendants of a registered rootPath). |
+| `cv_add_project` | Register a new project entry (no scan). Rejects overlapping rootPaths. |
+| `cv_scan_project` | (Re-)populate the graph for an existing project. Synchronous by default; pass `async: true` for codebases that may exceed the client's HTTP timeout. Runs in-process against the dashboard's live Kuzu/Neo4j handle so it avoids the file-lock collisions a subprocess scan would hit. |
+| `cv_onboard_project` | Register + scan + brief in one call — convenience wrapper. Supports `async: true`. |
+| `cv_remove_project` | Delete a project's graph data AND remove the workspace entry. Requires `confirm: true`. Supports `async: true`. Returns `nodesDeleted` (actual count) so you can verify against the dry-run promise. |
+| `cv_purge_project` | Delete graph data only; keep the registration. Recovery primitive for rebuilding a corrupted graph from scratch — pair with `cv_scan_project`. Supports `async: true`. |
+| `cv_purge_orphans` | Find projectIds present in the shared Kuzu DB but no longer registered in `settings.json` (e.g. left over from a prior delete or a rename) and delete them. Supports `async: true`. |
+| `cv_set_default_project` | Update the workspace's active project so subsequent tool calls can omit `project`. |
+| `cv_job_status` / `cv_jobs_list` | Poll an async job by id, or enumerate every job currently in the registry. See [Long-running tools: async + cv_job_status](#long-running-tools-async--cv_job_status). |
+
+### Multi-workspace orphans on a shared Kuzu DB
+
+The shared Kuzu DB at `~/.cvector/kuzu-data/graph.kuzu/` sits **below** the workspace boundary: each `.cvector/settings.json` is its own workspace registry, but all non-isolated workspaces use the same on-disk Kuzu directory partitioned by `projectId`. The consequence is that data from one workspace appears as "orphans" from another workspace's point of view.
+
+Concrete example: workspace **A** (rooted at `/work/auth-svc`) registers project `auth-svc` with `projectId=A123` and scans it. Workspace **B** (rooted at `/work/billing`) registers `billing` with `projectId=B456`. Both processes use the same `~/.cvector/kuzu-data/graph.kuzu/` because neither is isolated. From B's `cv_list_projects` perspective the `auth-svc` data is unowned — A123 isn't in B's `settings.json` — so `cv_purge_orphans` from B would offer to delete it. That's correct behaviour: every workspace queries through its own registry view, and the shared DB doesn't know about workspace boundaries.
+
+Three ways to handle this:
+
+| Want | Do |
+|---|---|
+| Each project isolated; no cross-workspace visibility at all | Add `"isolated": true` to the project entry, or pass `--isolated` to `cvector project create`. Project gets its own `~/.cvector/kuzu-data/<projectId>/` directory with its own file lock. |
+| One workspace, many projects | Register them all in a single `.cvector/settings.json` (e.g. a top-level repo's `.cvector/` directory) and use `cvector project create` to add each one. All projects share the same DB and registry. |
+| Multiple independent workspaces, same shared DB | Live with the orphan-from-other-workspace artifact. Run `cv_purge_orphans` from any workspace only when you genuinely want to forget another workspace's data; treat it as "delete projects this workspace doesn't recognise" rather than "garbage collect". |
+
+`cvector scan` and `cv_scan_project` both gate on the active project being in the current workspace's registry (via `requireActiveProject`) — so a workspace can never accidentally write data under a projectId it doesn't own. The orphan artifact only arises from running multiple workspaces against the same shared DB, which is supported but worth being aware of.
+
+### Switching backends keeps projects intact
+
+The `projects` map in `settings.json` is backend-agnostic. Flipping `backend` between `embedded`, `remote`, and `docker` doesn't drop any project entries — the data just lives in a different store. After switching, re-run `cvector scan` against each project you want to repopulate.
+
+### Upgrading from 0.1.x
+
+The MCP tool API is breaking-changed in 0.2.0: every read tool now requires (or has an optional default fallback for) a `project` argument. AI agents wired against the old `cvector serve` will auto-rediscover the new tool descriptions on reconnect and adapt. Settings.json is forward-compatible — existing files keep working; the new `kuzu.sharedDb` and per-project `isolated` fields are both `null` by default with sensible interpretations.
+
+After upgrading, run `cvector scan` once per project to populate the new shared Kuzu DB. The old `~/.cvector/kuzu-data/<projectId>/` directories are left in place for rollback; delete them once you've confirmed the shared layout works for your workflow.
+
+---
+
 ## MCP server
 
-Run with `cvector serve` (stdio JSON-RPC). Default capabilities: **tools**, **resources**, **prompts**.
+Run with `cvector serve` (stdio JSON-RPC) or co-host with the dashboard (`cvector dashboard` adds SSE on `/sse` + `/mcp`). Default capabilities: **33 tools**, **9 resources**, **9 prompts**.
+
+The MCP server runs in-process with the graph store — `cv_scan_project`, `cv_purge_project`, and friends reuse the dashboard's live Kuzu/Neo4j handle rather than spawning a subprocess, which avoids the file-lock collisions an out-of-process scan would hit on the embedded backend.
 
 ### MCP tools
 
+33 tools in three families: project lifecycle (register / scan / purge / remove), read queries (search / explain / impact / etc.), and async-job plumbing. Every read tool accepts an optional `project` argument (name, UUID, or rootPath) and falls back to the workspace's `activeProject` when omitted; the wildcard `"*"` runs cross-project for the tools that support it.
+
+**Project lifecycle**
+
 | Tool | Description | Parameters |
 |---|---|---|
-| `cv_stats` | Node + edge counts. | — |
-| `cv_health` | Connectivity + graph size + last scan commit. | — |
-| `cv_projects` | Active project context. | — |
-| `cv_search` | Substring node search; supports `*` wildcards. | `query` (req), `limit` (def 25), `label` (opt) |
-| `cv_explain` | Symbol context: type, file:line, callers, callees. | `symbol` (req) |
-| `cv_impact` | Downstream impact via CALLS/REFERENCES. | `symbol` (req), `depth` (def 3) |
-| `cv_test_impact` | Tests that transitively reach a symbol. | `symbol` (req), `depth` (def 5) |
-| `cv_context` | Members + references for a class/method. | `symbol` (req) |
-| `cv_rename` | Rename impact: callers, refs, importing files. | `symbol` (req) |
-| `cv_changes` | Recently-ingested nodes. | `since` (def `24h`), `limit` (def 50) |
-| `cv_onboard` | Full codebase briefing. | — |
-| `cv_rules` | Rules engine results. | — |
-| `cv_communities` | Cluster the call graph. | `algorithm` (leiden\|louvain\|connected-components), `minSize` (def 3), `limit` (def 10) |
-| `cv_flows` | Trace from REST/main/test entry points. | `kind` (rest\|main\|test\|all), `maxDepth` (def 3), `limit` (def 25) |
-| `cv_service_links` | Cross-service deps via HTTP, queues, exposed endpoints. | — |
-| `cv_audit` | OSV vulnerabilities × graph blast radius. | — |
+| `cv_list_projects` | Enumerate every project with name, projectId, rootPath, isolation flag, scan freshness, node/edge counts. | — |
+| `cv_find_project` | Look up by name / UUID / rootPath (descendant paths match). | `query` (req) |
+| `cv_add_project` | Register a new project (no scan). Rejects overlapping rootPaths. | `name` (req), `rootPath` (req), `isolated` (opt) |
+| `cv_scan_project` | (Re-)populate the graph for an existing project. Supports `async`. | `project` (opt), `async` (opt) |
+| `cv_onboard_project` | Register + scan + briefing in one call. Supports `async`. | `name` (req), `rootPath` (req), `isolated` (opt), `async` (opt) |
+| `cv_set_default_project` | Update the workspace's active project. | `project` (req) |
+| `cv_remove_project` | Delete a project's graph data AND remove the registration. Two-step (dry-run + `confirm:true`). Supports `async`. | `project` (opt), `confirm` (opt), `async` (opt) |
+| `cv_purge_project` | Delete a project's graph data but KEEP its registration — recovery primitive for rebuilding a corrupted graph. Two-step. Supports `async`. | `project` (opt), `confirm` (opt), `async` (opt) |
+| `cv_purge_orphans` | Find and delete graph data for projectIds present in the shared Kuzu DB but no longer registered in `settings.json`. Two-step. Supports `async`. | `confirm` (opt), `async` (opt) |
+| `cv_job_status` | Poll the status of a job started with `async: true`. | `jobId` (req) |
+| `cv_jobs_list` | List every job currently in the registry (running + retained for ~1 h post-completion). | `state` (opt: `running`/`done`/`failed`) |
+
+**Read & analysis**
+
+| Tool | Description | Parameters |
+|---|---|---|
+| `cv_stats` | Node + edge counts. | `project` (opt, `*` for all) |
+| `cv_health` | Connectivity + graph size + last scan commit. | `project` (opt, `*` for all) |
+| `cv_search` | Substring node search; supports `*` wildcards. | `query` (req), `project` (opt, `*` for all), `limit` (def 25), `label` (opt) |
+| `cv_explain` | Symbol context: type, file:line, callers, callees. Accepts bare names, full FQ names with/without signature, and `Class.method` partial-FQ. | `symbol` (req), `project` (opt) |
+| `cv_impact` | Downstream impact via CALLS/REFERENCES. | `symbol` (req), `project` (opt), `depth` (def 3) |
+| `cv_test_impact` | Tests that transitively reach a symbol. | `symbol` (req), `project` (opt), `depth` (def 5) |
+| `cv_context` | Members + references for a class/method. | `symbol` (req), `project` (opt) |
+| `cv_rename` | Rename impact: callers, refs, importing files. | `symbol` (req), `project` (opt) |
+| `cv_path` | Shortest CALLS path between two symbols. | `from` (req), `to` (req), `project` (opt), `maxDepth` (opt) |
+| `cv_changes` | Recently-ingested nodes. | `since` (def `24h`), `project` (opt, `*` for all), `limit` (def 50) |
+| `cv_onboard` | Full codebase briefing. | `project` (opt) |
+| `cv_wiki` | Structured documentation snapshot. | `project` (opt) |
+| `cv_rules` | Rules engine results. | `project` (opt) |
+| `cv_communities` | Cluster the call graph. | `algorithm` (leiden\|louvain\|connected-components), `project` (opt, `*` for all), `minSize` (def 3), `limit` (def 10) |
+| `cv_flows` | Trace from REST/main/test entry points. | `kind` (rest\|main\|test\|all), `project` (opt), `maxDepth` (def 3), `limit` (def 25) |
+| `cv_trace` | Multi-hop trace from a starting node. | `from` (req), `project` (opt), `maxDepth` (opt) |
+| `cv_service_links` | Cross-service deps via HTTP, queues, exposed endpoints. | `project` (opt, `*` for all) |
+| `cv_db_impact` | Methods touching a given table/column. | `table` (req), `column` (opt), `project` (opt) |
+| `cv_guard` | Quality-gate pass/fail. | `project` (opt) |
+| `cv_audit` | OSV vulnerabilities × graph blast radius. | `project` (opt) |
+| `cv_diff_start` / `cv_diff_status` | Async git-diff between two commits (separate subprocess). | `shaA` (req), `shaB` (req), `project` (opt), `includeCalls` (opt), `keep` (opt) |
+
+### Long-running tools: async + `cv_job_status`
+
+Five tools accept an optional `async: true` argument: `cv_scan_project`, `cv_onboard_project`, `cv_purge_project`, `cv_purge_orphans`, `cv_remove_project`. Use it for any call that might exceed the client's HTTP read timeout (typical default 30 s) — e.g. a from-scratch scan of a multi-thousand-file codebase, or a purge of a large graph.
+
+Two-step pattern when `async: true`:
+
+```jsonc
+// 1. Submit the work. Returns immediately (typically <100 ms).
+{"name": "cv_scan_project", "arguments": {"project": "my-app", "async": true}}
+// → { "jobId": "27f12ab9-...", "kind": "cv_scan_project", "state": "running", "accepted": true, "startedAt": "..." }
+
+// 2. Poll cv_job_status until state is "done" or "failed".
+{"name": "cv_job_status", "arguments": {"jobId": "27f12ab9-..."}}
+// → while running: { "state": "running", "elapsedMs": 1234 }
+// → on done:       { "state": "done",    "elapsedMs": 17728, "result": { ...full sync envelope... } }
+// → on failed:     { "state": "failed",  "exceptionClass": "...", "exceptionMessage": "..." }
+```
+
+When state reaches `done`, the `result` field is the exact response the synchronous variant of the tool would have returned — same shape, same keys. No second call required.
+
+**Recovery & lifecycle**
+
+- **Lost jobId?** Call `cv_jobs_list` to enumerate every job currently tracked (running + terminal jobs retained for ~1 h post-completion). Filter by `state: "running"` / `"done"` / `"failed"`. Useful when token-window truncation or a conversation restart dropped the original envelope.
+- **Stuck jobs.** Every async job has a built-in 15-minute wall-clock cap. If a job is still `RUNNING` past that deadline, the watchdog flips it to `FAILED` with a `TimeoutException` (best-effort `Future.cancel(true)` follows; native Kuzu calls can't be interrupted so the background work may keep running until completion, but the job state stops reporting `running` forever).
+- **Slow-sync hint.** When a *synchronous* call to one of the async-capable tools runs ≥10 s, the response gains a `syncElapsedMs` field and a one-line `hint` recommending `async: true` for similarly-sized future calls. Behaviour is unchanged; the hint self-documents the escape hatch when you're close to typical client timeouts.
+
+When `confirm: true` is required (`cv_purge_project`, `cv_purge_orphans`, `cv_remove_project`), the dry-run path stays synchronous since it only counts. Only the destructive path moves to the background when `async: true` is set.
 
 ### MCP resources
 
-Browsable read-only JSON snapshots — no parameters, no composition needed.
+9 browsable read-only JSON snapshots — no parameters, no composition needed. All are scoped to the workspace's active project.
 
 | URI | Contents |
 |---|---|
@@ -723,19 +870,23 @@ Browsable read-only JSON snapshots — no parameters, no composition needed.
 | `cvector://onboard` | Briefing: language mix, hubs, endpoints, dependencies. |
 | `cvector://infrastructure` | Endpoints, listeners, scheduled jobs, config keys, env vars, container ports, IaC resources. |
 | `cvector://guard` | Quality-gate pass/fail with severity totals. |
+| `cvector://communities` | Call-graph clusters from the community-detection algorithms. |
 
 ### MCP prompts
 
-Pre-built conversation starters that name the tools/resources the assistant should call.
+9 pre-built conversation starters that name the tools/resources the assistant should call.
 
 | Prompt | Arguments | Purpose |
 |---|---|---|
+| `cvector-discover-projects` | — | Walk through `cv_list_projects` and explain the workspace layout. |
 | `cvector-onboard` | — | Architecture brief for a new team member. |
+| `cvector-onboard-new-project` | `name`, `rootPath` | End-to-end registration + scan + briefing for a brand-new codebase. |
 | `cvector-review-change` | `symbol` (req) | Impact analysis pre-refactor. |
 | `cvector-health-check` | — | Prioritised action items. |
 | `cvector-explain-module` | `path` (req) | Module deep-dive. |
 | `cvector-migration-plan` | `from` (req), `to` (req), `scope` (opt) | Phased migration plan with risk register. |
 | `cvector-infrastructure` | — | Infrastructure surface audit. |
+| `cvector-cross-project-audit` | — | Cross-project audit using the wildcard `project: "*"` reads. |
 
 ### MCP client setup
 
@@ -760,6 +911,96 @@ Each helper writes an MCP server entry that runs `java -jar <path>/cvector.jar s
   }
 }
 ```
+
+### Testing the stdio server with `@modelcontextprotocol/inspector`
+
+The official [MCP Inspector](https://github.com/modelcontextprotocol/inspector) is the quickest way to confirm `cvector serve` is wired correctly and to browse its tools / resources / prompts without involving an IDE. Run it from inside any project workspace that has a `.cvector/settings.json`:
+
+```bash
+cd /path/to/your/project
+
+# Windows .exe install
+npx @modelcontextprotocol/inspector "%LOCALAPPDATA%\Programs\cvector\cvector.exe" serve
+
+# Or against the fat jar (faster iteration, easier `-D` overrides)
+npx @modelcontextprotocol/inspector java -jar /path/to/cvector-app/target/cvector.jar serve
+```
+
+The Inspector spawns cvector as a child process, attaches to its stdin/stdout, and opens a web UI (default `http://localhost:6274`). With the connection panel pre-filled (Transport `STDIO`, the command + `serve` arg), click **Connect** — you should see:
+
+- **Server log** pane shows cvector's stderr banner: `cvector mcp server (stdio) ready` followed by `Registered tools: 33` / `Registered resources: 9` / `Registered prompts: 9`.
+- **Tools** tab lists all 33 `cv_*` tools, callable with form-rendered argument inputs.
+- **Resources** tab lists the 9 `cvector://*` URIs; click one to fetch its JSON.
+- **Prompts** tab lists the 9 prompts.
+
+#### Gotchas
+
+- **Working directory matters.** cvector's `.cvector/settings.json` is found by walking up from the cwd Inspector launched it from. Either `cd` into the project before invoking Inspector or set a working directory in the Inspector's "Configuration" panel once it's open.
+- **Don't type into the Inspector's terminal.** cvector's stdio MCP reads stdin as JSON-RPC; arbitrary input crashes the parser.
+- **Logs go to `~/.cvector/mcp-server.log`** plus the Inspector's "Server log" pane (stderr). cvector keeps stdout clean for JSON-RPC by design.
+- **Reconnects respawn the process.** `cvector serve` is single-shot — it exits when stdin closes, so each Inspector reconnect starts a fresh JVM. First start pays the JDK warm-up cost (~3.8 s on this repo).
+
+For a one-shot CLI sanity check without the web UI:
+
+```bash
+npx @modelcontextprotocol/inspector --cli "%LOCALAPPDATA%\Programs\cvector\cvector.exe" serve
+```
+
+That mode prints the JSON-RPC handshake to the terminal so you can verify `initialize` succeeds without opening a browser tab.
+
+### Testing the HTTP/SSE server (dashboard mode) with Inspector
+
+`cvector dashboard` exposes the same tools over Spring AI's WebMVC SSE transport. Start the dashboard, then point Inspector at the SSE URL:
+
+```bash
+cvector.exe dashboard                       # leave running in another terminal
+npx @modelcontextprotocol/inspector         # opens the web UI with no preset
+```
+
+In the Inspector connection panel:
+
+| Field | Value |
+|---|---|
+| Transport Type | `SSE` (**not** "Streamable HTTP" — Spring AI 1.0.0 only implements the SSE transport) |
+| URL | `http://localhost:2969/sse` (or whatever `mcp.url` is set to in your `.cvector/settings.json`) |
+
+Click **Connect**. The CORS headers cvector ships on `/sse`, `/mcp`, and `/mcp/**` (allowed origin patterns: `*`) let the Inspector's browser tab complete the handshake.
+
+If you get **"Failed to fetch"**, you're almost always on the wrong transport — switch from "Streamable HTTP" to "SSE" in the dropdown. If you get a 404 on `/sse`, your `mcp.url` in `settings.json` is pointing at a different path; either match the URL or restart the dashboard after editing.
+
+### GitHub Copilot for Eclipse
+
+No `setup-*` helper exists for Eclipse Copilot yet (the plugin's MCP support is new and the settings location depends on the plugin version), but every MCP-aware client consumes the same server-definition JSON. Paste the snippet below wherever your Copilot for Eclipse install accepts MCP server configuration:
+
+```json
+{
+  "mcpServers": {
+    "cvector": {
+      "command": "C:\\Users\\<your-user>\\AppData\\Local\\Programs\\cvector\\cvector.exe",
+      "args": ["serve"]
+    }
+  }
+}
+```
+
+(Linux / macOS: replace the `command` with the absolute path to the installed `cvector` binary — no `.exe`.)
+
+**Where to put it** — try these in order, the right location varies by plugin version:
+
+1. **Eclipse → Preferences → GitHub Copilot → Model Context Protocol** (or `MCP Servers`). If you see an `Edit JSON` / `Configure` button, paste the snippet directly into the editor.
+2. **Workspace file**: `<workspace>/.metadata/.plugins/com.github.copilot/mcp.json`. The plugin id varies — search your workspace `.metadata/.plugins/` for a directory containing `copilot` or `mcp`.
+3. **User-home fallback**: `~/.github-copilot/mcp.json` or `~/.copilot/mcp.json`. Some Copilot ports share settings here across IDEs.
+
+**Verify it's working:**
+
+- Restart Eclipse (or use the plugin's "Reload MCP Servers" command if present).
+- Open Copilot Chat and ask "what tools do you have?" — `cv_search`, `cv_explain`, `cv_impact`, etc. should show up alongside Copilot's built-in tools.
+- First-launch traces appear in `~/.cvector/mcp-server.log` — look for `cvector mcp server (stdio) ready` followed by `Registered tools: 33`.
+
+**If your Copilot plugin version doesn't expose MCP yet**, two workarounds:
+
+- Bridge stdio → SSE via a proxy like [`mcp-proxy`](https://github.com/sparfenyuk/mcp-proxy) and point Copilot at the SSE URL once the plugin gains SSE support.
+- Use [Continue.dev for Eclipse](https://www.continue.dev) instead — it has full first-party MCP support and consumes the same JSON snippet.
 
 ---
 
@@ -803,24 +1044,18 @@ The `cvector-embedded-kuzudb-server` module ships an in-process [KuzuDB](https:/
 
 The module is named with its backend (`-kuzudb-`) so additional embedded backends (e.g. DuckDB, SQLite-backed graph) can ship as parallel modules without colliding.
 
-### Status
+### How it works
 
-- **Write path: ready.** `cvector --embedded scan` runs the full parser pipeline against KuzuDB instead of Neo4j. `EmbeddedKuzu` opens a database in-process, `KuzuSchemaBootstrap` declares cvector's schema (one polymorphic `Node` table + 14 typed `REL` tables), and `KuzuIngestor` issues per-row MERGE/SET writes batched in 500-row transactions. 12 unit tests pass.
-- **Post-passes: ported.** `KuzuPostScan.resolveUnresolvedCalls`, `resolveDeferredHandlers`, and `cleanupStale` all run on embedded scans. The Neo4j versions leaned on `EXISTS { ... }` subqueries, `properties(r)` map projections, and `SET r += oldProps`; the Kuzu ports replace those with OPTIONAL MATCH + IS NULL, explicit per-column reads, and explicit per-column SET.
-- **Read path: most surfaces migrated.** The `GraphStore` interface in `cvector-core/store` covers {ping, displayUri, bootstrapSchema, schemaReady, nodeCounts, edgeCounts, findSymbol, searchByName, callers, callees, impactDownstream, fileOf, projectMeta, contains, referencingNodes, importingFiles, recentlyChanged, mavenDependencies, fileInventory, healthRollup, guardSummary, infrastructureSummary, traceFlows, serviceLinks, onboardSummary, projectsList, methodCallGraph, testReach, backend, supportsRawCypher}. `Neo4jGraphStore` and `KuzuGraphStore` both implement it. The MCP and REST modules wire `GraphStore` via Spring config that branches on `cvector.embedded`. Kuzu queries skip the `projectId` predicate (each Kuzu DB is per-project, so the filter is a no-op) and use Kuzu's `regexp_matches()` / `list_slice()` / variable-length `*1..N` traversal in place of Neo4j's `=~` / `collect()[0..N]`. The `testReach` impl is Java BFS over a fetched reverse-adjacency list since Kuzu has no `shortestPath()`.
-- **CLI commands on `GraphStore`:** all 22 — `diff` included. On `--embedded`, `diff` spins up two ephemeral Kuzu DBs (one per SHA, each bulk-loaded via `COPY FROM`) and computes added/removed/changed sets in Java rather than via `NOT EXISTS` Cypher. On Neo4j it retains the original cross-snapshot model. `--keep` prints the temp Kuzu paths instead of project ids; `--include-calls` emits added/removed CALLS edges via the same set-difference pattern.
-- **MCP tools on `GraphStore`:** all 16. `cv_rules` runs the full `RulesEngine` (god-file, god-class, long-method, deep-inheritance, dead-code + custom Cypher rules from `rules.yml`) on Kuzu via per-rule dialect-aware Cypher pairs.
-- **MCP resources on `GraphStore`:** all 8 — `stats`, `schema`, `files`, `health`, `infrastructure`, `guard`, `projects`, `onboard`.
-- **REST controllers:** both `StatsController` and `QueryController` (including `/test-impact`) fully on `GraphStore`.
-- **`cvector-rules` and `cvector-watcher` are backend-agnostic.** Both modules dropped their `cvector-neo4j` dependency. `Rule.evaluate` and `CvectorWatcher` take `GraphStore` directly. Custom rules in `.cvector/rules.yml` can supply an optional `cypherKuzu` field for per-backend bodies; otherwise `cypher` is used for both.
-- **Write paths.** `scan`, `scan:incremental`, `watch` (live + cron), and the watcher itself all go through `GraphStore.openIngestor()` → `GraphIngestor` (implemented by `Ingestor` for Neo4j and `KuzuIngestor` for Kuzu). File-removal uses `GraphStore.deleteFileSubtree(projectId, path)` — variable-length `CONTAINS*` DETACH DELETE on Neo4j, Java BFS over CONTAINS edges on Kuzu.
-- **`testReach` is native on Kuzu.** Previously the Kuzu impl fetched every CALLS+REFERENCES edge into Java memory and BFS'd backwards from the target. Now uses Kuzu's variable-length union-edge traversal — `MATCH p = (t)-[:CALLS|REFERENCES*1..N]->(target)` + `min(length(p))` per test — so query cost scales with reachable subgraph instead of total edge count.
-- **`EmbeddedKuzu` filters bound parameters** to only those the prepared statement references. Kuzu rejects `execute` calls where the param map contains extra keys (Neo4j silently ignores). The filter is a one-time regex scan per unique Cypher; the prepared-statement cache keeps the resolved references hot, so callers can pass uniform `{pid, t, ...}` maps regardless of which placeholders each dialect-specific query actually uses.
-- **Schema completeness.** The Kuzu Node table declares 65+ properties parsers emit. `KuzuSchemaBootstrap` issues `ALTER TABLE Node ADD ...` per missing column on startup, so existing on-disk databases lift to the current schema without a wipe.
-- **Performance.** Two ingest paths, picked automatically by `ScanCommand`:
-  - **Bulk mode** (empty DB): `KuzuBulkLoader` buffers events in memory, stages typed CSVs, and runs `COPY Node FROM '...'` + one `COPY <REL_TYPE> FROM '...'` per populated edge table. Flush of ~3.5 k nodes + ~10 k edges takes **~700 ms** on this repo. Total scan wall-clock **~12 s** (most of it JVM/Spring startup + the post-pass rewire).
-  - **Merge mode** (re-scan with existing data): `KuzuIngestor` carries a `contentHash` SHA-256 (excluding `lastIngestedAt`) on every row. At flush time it pre-fetches existing `(id, contentHash)` for all buffered nodes and existing `(from, to)` pairs per REL type, then skips MERGEs for unchanged rows. The ingestor tracks every node id it saw (written + skipped); `KuzuPostScan.cleanupStale` consumes that set and deletes managed-label rows whose id isn't in it, so `lastIngestedAt` doesn't need a per-row bulk-bump and `cv_changes` now reflects only rows whose content actually changed. On a no-source-change re-scan of this repo (3625 nodes / 11058 edges) **3481 nodes + 10294 edges get skipped, ~145 nodes + ~765 edges actually MERGE** (mostly placeholder churn the post-pass introduces). Re-scan wall-clock dropped from ~70 s to **~17 s**.
-  - Both paths share the same in-memory dedup (14 k raw events → 3.5 k distinct nodes + 10 k distinct edges), a shape-keyed prepared-statement cache, and a regex-cached parameter filter. Read paths are sub-100 ms across the board.
+- **Schema.** `KuzuSchemaBootstrap` declares one polymorphic `Node` table (~65 typed columns covering everything parsers emit) plus 14 typed `REL` tables (`CALLS`, `CONTAINS`, `EXTENDS`, `IMPLEMENTS`, `IMPORTS`, `EXPOSES`, `HANDLES`, `DEPENDS_ON`, `DECLARES`, `READS_TABLE`, `WRITES_TABLE`, `READS_COLUMN`, `WRITES_COLUMN`, `READS_CONFIG`). `ALTER TABLE Node ADD ...` runs at boot for any property the current schema declares that's missing on disk, so existing databases lift in place — no wipe needed across upgrades.
+- **`GraphStore` abstraction.** `cvector-core/store/GraphStore` is the single interface every read path goes through; both `KuzuGraphStore` and `Neo4jGraphStore` implement it. The MCP, REST, rules, and watcher modules all consume it directly. Every query method takes a `projectId` argument that's pushed into the Cypher predicate — required since shared-DB mode puts multiple projects' nodes in the same Kuzu directory.
+- **Cypher dialect translation.** Kuzu's Cypher subset replaces Neo4j features the parsers and queries use: `regexp_matches()` in place of `=~`, `list_slice()` in place of slice subscripts, variable-length `*1..N` traversal in place of `shortestPath()`. Custom rules in `.cvector/rules.yml` can supply an optional `cypherKuzu` body when their Neo4j Cypher uses features Kuzu doesn't have (`EXISTS { ... }` subqueries, `SET r += $props`, etc.).
+- **Thread safety.** Kuzu's Java `Connection` is single-threaded; `EmbeddedKuzu` serialises every native call through one mutex so concurrent reads from MCP tool calls + REST controllers + the scan ingestor stay correct. Throughput per query is unchanged (Kuzu's intra-query parallelism still kicks in via `setMaxNumThreadForExec`); only the JNI entry is serialised.
+- **Two ingest paths**, picked automatically by `InProcessScanService`:
+  - **Bulk mode** (empty project — `isKuzuEmpty(projectId)`): `KuzuBulkLoader` buffers events in memory, stages typed CSVs, and runs `COPY Node FROM '...'` + one `COPY <REL_TYPE> FROM '...'` per populated edge table. Fastest path for first-time scans.
+  - **Merge mode** (re-scan): `KuzuIngestor` carries a `contentHash` SHA-256 (excluding `lastIngestedAt`) on every row. At flush time it pre-fetches existing `(id, contentHash)` and `(from, to)` pairs and skips MERGEs for unchanged rows. Content-hash file-level skip on top of that means re-scans of unchanged source code touch almost nothing — typical re-scan flushes a handful of nodes/edges instead of the whole graph.
+- **Chunked deletes.** `deleteProjectSubtree` (the surface behind `cv_remove_project` / `cv_purge_project` / `cv_purge_orphans`) issues `DETACH DELETE` in 500-node batches with the connection lock released between batches. Concurrent `cv_health` / `cv_search` calls interleave with the delete instead of queueing behind one long native call.
+- **In-process scan.** `cv_scan_project` runs in the same JVM as the dashboard's `GraphStore`, reusing the live Kuzu/Neo4j handle. Avoids the file-lock collisions a subprocess scan would hit on the embedded backend; pairs with `JobRegistry` for the optional async path.
+- **REST + MCP parity.** Every controller (`StatsController`, `QueryController`, `CodeHealthController`, `FlowsController`, etc.) routes through `GraphStore`. Every MCP tool ditto. `cvector-rules` and `cvector-watcher` are backend-agnostic — neither has a `cvector-neo4j` dependency.
 
 ### CLI
 
@@ -885,9 +1120,9 @@ Set `cvector_role` (env) to restrict MCP tools and REST paths.
 | Role | Tools | REST paths |
 |---|---|---|
 | `dev` (default) | All | All |
-| `architect` | `cv_stats`, `cv_projects`, `cv_search`, `cv_context`, `cv_explain`, `cv_impact`, `cv_test_impact`, `cv_communities`, `cv_flows`, `cv_rules`, `cv_guard`, `cv_diff`, `cv_service_links` | `/api/health`, `/api/stats`, `/api/projects`, `/api/search`, `/api/explain`, `/api/impact`, `/api/test-impact` |
-| `security` | `cv_audit`, `cv_guard`, `cv_rules`, `cv_health`, `cv_stats` | `/api/health`, `/api/stats`, `/api/audit`, `/api/guard`, `/api/rules` |
-| `pm` | `cv_stats`, `cv_projects`, `cv_onboard`, `cv_changes`, `cv_health`, `cv_wiki` | `/api/health`, `/api/stats`, `/api/projects`, `/api/onboard` |
+| `architect` | `cv_stats`, `cv_health`, `cv_list_projects`, `cv_find_project`, `cv_search`, `cv_context`, `cv_explain`, `cv_impact`, `cv_test_impact`, `cv_path`, `cv_trace`, `cv_communities`, `cv_flows`, `cv_rules`, `cv_guard`, `cv_diff_start`, `cv_diff_status`, `cv_service_links`, `cv_db_impact`, `cv_job_status`, `cv_jobs_list` | `/api/health`, `/api/stats`, `/api/projects`, `/api/search`, `/api/explain`, `/api/impact`, `/api/test-impact` |
+| `security` | `cv_audit`, `cv_guard`, `cv_rules`, `cv_health`, `cv_stats`, `cv_list_projects`, `cv_find_project`, `cv_job_status`, `cv_jobs_list` | `/api/health`, `/api/stats`, `/api/audit`, `/api/guard`, `/api/rules` |
+| `pm` | `cv_stats`, `cv_health`, `cv_list_projects`, `cv_find_project`, `cv_onboard`, `cv_changes`, `cv_wiki`, `cv_job_status`, `cv_jobs_list` | `/api/health`, `/api/stats`, `/api/projects`, `/api/onboard` |
 
 Resources and prompts are not currently role-gated (additive surface).
 
@@ -897,15 +1132,18 @@ Resources and prompts are not currently role-gated (additive surface).
 
 ```
 cvector/
-├── cvector-core/              # GraphEvent, NodeKey, ProjectContext, CvectorConfig, CvectorRole
+├── cvector-core/              # GraphEvent, NodeKey, ProjectContext, CvectorConfig, CvectorRole, GraphStore interface
 ├── cvector-neo4j/             # Neo4jClient, Ingestor, SchemaBootstrap, GraphQueries
-├── cvector-embedded-kuzudb-server/  # Optional embedded KuzuDB store (in-process graph DB)
+├── cvector-embedded-kuzudb-server/  # Embedded KuzuDB store (default backend): EmbeddedKuzu, KuzuGraphStore, KuzuIngestor / KuzuBulkLoader, KuzuPostScan
 ├── cvector-parser-*/          # 25 language/format parsers (see Supported languages)
 ├── cvector-rules/             # Rule engine + builtin rules
 ├── cvector-watcher/           # Live file-watch + cron-driven re-scan
 ├── cvector-cli/               # Picocli commands wired as Spring beans
+│   └── scan/                  # InProcessScanService / ScanRequest / ScanResult — the shared scan loop used by both the CLI and the MCP cv_scan_project tool
 ├── cvector-rest/              # Spring Web controllers for the dashboard
 ├── cvector-mcp/               # MCP server: tools, resources, prompts
+│   ├── CvectorTools.java      # 33 @Tool methods + the async opt-in plumbing
+│   └── JobRegistry.java       # In-memory async-job tracking for the cv_*_project tools + cv_job_status / cv_jobs_list
 └── cvector-app/               # Spring Boot main + fat-jar assembly (entry point)
 ```
 

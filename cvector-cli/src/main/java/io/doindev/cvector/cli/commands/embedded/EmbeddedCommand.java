@@ -54,6 +54,13 @@ public class EmbeddedCommand implements Callable<Integer> {
         return runtime.requireActiveProject(cfg).projectId();
     }
 
+    /** Resolves the active project's Kuzu DB path honoring the shared/isolated layout. */
+    private static Path activeDbPath(CvectorRuntime runtime) {
+        CvectorConfig cfg = runtime.loadConfig();
+        String pid = runtime.requireActiveProject(cfg).projectId();
+        return EmbeddedKuzu.defaultDbPath(cfg, pid);
+    }
+
     @Component
     @Command(name = "init", description = "Create the embedded database directory and bootstrap its schema.", mixinStandardHelpOptions = true)
     public static class Init implements Callable<Integer> {
@@ -61,12 +68,13 @@ public class EmbeddedCommand implements Callable<Integer> {
         public Init(CvectorRuntime runtime) { this.runtime = runtime; }
         @Override
         public Integer call() throws IOException {
-            String pid = activeProjectId(runtime);
-            Path db = EmbeddedKuzu.defaultDbPath(pid);
-            try (EmbeddedKuzu k = new EmbeddedKuzu(db, EmbeddedKuzu.bufferSizeFromConfig(runtime.loadConfig()))) {
+            CvectorConfig cfg = runtime.loadConfig();
+            String pid = runtime.requireActiveProject(cfg).projectId();
+            Path db = EmbeddedKuzu.defaultDbPath(cfg, pid);
+            try (EmbeddedKuzu k = new EmbeddedKuzu(db, EmbeddedKuzu.bufferSizeFromConfig(cfg))) {
                 new KuzuSchemaBootstrap(k).bootstrap();
             }
-            System.out.println("initialized: " + db);
+            System.out.println("initialized: " + db + (cfg.isSharedDbMode(pid) ? " (shared)" : " (isolated)"));
             return 0;
         }
     }
@@ -78,20 +86,35 @@ public class EmbeddedCommand implements Callable<Integer> {
         public Info(CvectorRuntime runtime) { this.runtime = runtime; }
         @Override
         public Integer call() throws IOException {
-            String pid = activeProjectId(runtime);
-            Path db = EmbeddedKuzu.defaultDbPath(pid);
+            CvectorConfig cfg = runtime.loadConfig();
+            String pid = runtime.requireActiveProject(cfg).projectId();
+            Path db = EmbeddedKuzu.defaultDbPath(cfg, pid);
+            boolean shared = cfg.isSharedDbMode(pid);
             if (!Files.exists(db)) {
                 System.out.println("not initialized (no DB at " + db + ")");
                 return 0;
             }
             long bytes = directorySize(db.getParent());
             System.out.printf("path:   %s%n", db);
+            System.out.printf("layout: %s%n", shared ? "shared (one DB serves every non-isolated project)" : "isolated (per-project directory)");
             System.out.printf("size:   %.2f MB%n", bytes / (1024.0 * 1024.0));
-            try (EmbeddedKuzu k = new EmbeddedKuzu(db, EmbeddedKuzu.bufferSizeFromConfig(runtime.loadConfig()))) {
+            try (EmbeddedKuzu k = new EmbeddedKuzu(db, EmbeddedKuzu.bufferSizeFromConfig(cfg))) {
                 List<Map<String, Object>> tables = k.read("CALL SHOW_TABLES() RETURN *");
                 System.out.printf("tables: %d%n", tables.size());
                 for (Map<String, Object> t : tables) {
                     System.out.printf("  %-10s %s%n", t.get("type"), t.get("name"));
+                }
+                if (shared) {
+                    // Show per-project node counts so the operator can see what's in the shared DB.
+                    List<Map<String, Object>> projectCounts = k.read(
+                            "MATCH (n:Node) RETURN n.projectId AS projectId, count(n) AS nodes "
+                                    + "ORDER BY nodes DESC LIMIT 20");
+                    if (!projectCounts.isEmpty()) {
+                        System.out.println("projects in this shared DB:");
+                        for (Map<String, Object> row : projectCounts) {
+                            System.out.printf("  %-40s %d nodes%n", row.get("projectId"), ((Number) row.get("nodes")).longValue());
+                        }
+                    }
                 }
             }
             return 0;
@@ -117,9 +140,10 @@ public class EmbeddedCommand implements Callable<Integer> {
 
         @Override
         public Integer call() throws IOException {
-            String pid = activeProjectId(runtime);
-            Path db = EmbeddedKuzu.defaultDbPath(pid);
-            try (EmbeddedKuzu k = new EmbeddedKuzu(db, EmbeddedKuzu.bufferSizeFromConfig(runtime.loadConfig()))) {
+            CvectorConfig cfg = runtime.loadConfig();
+            String pid = runtime.requireActiveProject(cfg).projectId();
+            Path db = EmbeddedKuzu.defaultDbPath(cfg, pid);
+            try (EmbeddedKuzu k = new EmbeddedKuzu(db, EmbeddedKuzu.bufferSizeFromConfig(cfg))) {
                 List<Map<String, Object>> rows = k.read(cypher);
                 if (rows.isEmpty()) {
                     System.out.println("(no rows)");
@@ -137,25 +161,37 @@ public class EmbeddedCommand implements Callable<Integer> {
     }
 
     @Component
-    @Command(name = "wipe", description = "Delete the embedded database directory for the active project.", mixinStandardHelpOptions = true)
+    @Command(name = "wipe", description = "Delete the active project's graph data. On a shared DB only this project's rows go; isolated projects get their directory removed.", mixinStandardHelpOptions = true)
     public static class Wipe implements Callable<Integer> {
         private final CvectorRuntime runtime;
         public Wipe(CvectorRuntime runtime) { this.runtime = runtime; }
         @Override
         public Integer call() throws IOException {
-            String pid = activeProjectId(runtime);
-            Path dir = EmbeddedKuzu.defaultDbPath(pid).getParent();
-            if (!Files.exists(dir)) {
-                System.out.println("nothing to wipe (no DB at " + dir + ")");
+            CvectorConfig cfg = runtime.loadConfig();
+            String pid = runtime.requireActiveProject(cfg).projectId();
+            Path db = EmbeddedKuzu.defaultDbPath(cfg, pid);
+            if (!Files.exists(db)) {
+                System.out.println("nothing to wipe (no DB at " + db + ")");
                 return 0;
             }
+            if (cfg.isSharedDbMode(pid)) {
+                // Shared DB: surgically DETACH DELETE only this project's rows so other
+                // projects in the same DB keep working. Slower than rm -rf but correct.
+                try (EmbeddedKuzu k = new EmbeddedKuzu(db, EmbeddedKuzu.bufferSizeFromConfig(cfg))) {
+                    k.write("MATCH (n:Node) WHERE n.projectId = $pid DETACH DELETE n", Map.of("pid", pid));
+                }
+                System.out.println("wiped project " + pid + " from shared DB at " + db);
+                return 0;
+            }
+            // Isolated layout: delete the per-project directory.
+            Path dir = db.getParent();
             try (Stream<Path> walk = Files.walk(dir)) {
                 walk.sorted(Comparator.reverseOrder()).forEach(p -> {
                     try { Files.deleteIfExists(p); }
                     catch (IOException ignored) { /* best effort */ }
                 });
             }
-            System.out.println("wiped: " + dir);
+            System.out.println("wiped (isolated): " + dir);
             return 0;
         }
     }

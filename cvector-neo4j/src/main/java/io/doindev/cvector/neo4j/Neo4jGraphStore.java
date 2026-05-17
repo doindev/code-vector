@@ -716,6 +716,22 @@ public final class Neo4jGraphStore implements GraphStore {
         return (int) total;
     }
 
+    @Override
+    public int deleteProjectSubtree(String projectId) {
+        // Single DETACH DELETE filtered by projectId. Neo4j naturally partitions multiple
+        // projects in the same DB by this property, so this is the surgical "remove just
+        // one project's data" path used by cv_remove_project + dashboard project removal.
+        List<Map<String, Object>> count = queries.raw(
+                "MATCH (n {projectId: $pid}) RETURN count(n) AS c",
+                Map.of("pid", projectId));
+        long total = count.isEmpty() ? 0L : asLong(count.get(0).get("c"));
+        if (total == 0) return 0;
+        queries.raw(
+                "MATCH (n {projectId: $pid}) DETACH DELETE n",
+                Map.of("pid", projectId));
+        return (int) total;
+    }
+
     private static long asLong(Object v) {
         if (v instanceof Number n) return n.longValue();
         if (v == null) return 0L;

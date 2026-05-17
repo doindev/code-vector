@@ -65,6 +65,14 @@ public class CacheWarmer {
     private static final Duration WARM_TTL = Duration.ofMinutes(30);
 
     private void warm() {
+        // Empty-workspace short-circuit: when the user has no projects registered yet, the
+        // dashboard still boots (the ActiveProject bean returns a placeholder with null
+        // fields) but there's nothing to pre-compute. Skipping the warm pass avoids
+        // emitting cache entries keyed on "stats:null" / similar that would never get hit.
+        if (project == null || project.projectId() == null) {
+            log.info("cache warmer: no active project yet — skipping warm-up. Register a project via cv_add_project / cv_onboard_project or `cvector project create`.");
+            return;
+        }
         Instant start = Instant.now();
         // Endpoints whose controllers compute against the live store but produce a stable
         // result we can mirror cheaply. {@code /api/wiki} has a complex multi-section shape;

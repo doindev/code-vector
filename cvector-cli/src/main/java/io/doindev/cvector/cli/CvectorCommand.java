@@ -147,6 +147,24 @@ public class CvectorCommand implements Callable<Integer> {
         }
     }
 
+    /**
+     * One-shot override for the project this invocation targets. Mirrors the MCP tool API's
+     * optional {@code project} parameter: if absent, commands fall back to the workspace's
+     * {@code activeProject} field in {@code settings.json}; if present, the named project is
+     * used for this invocation only (no persistence). Accepts name, UUID, or rootPath —
+     * resolved by {@link CvectorRuntime#resolveProject(CvectorConfig)}.
+     *
+     * <p>Inherited into every subcommand via {@link ScopeType#INHERIT} so existing commands
+     * pick up the flag without each declaring its own {@code --project} option.
+     */
+    @Option(names = "--project", scope = ScopeType.INHERIT,
+            description = "One-shot project override (name, UUID, or rootPath). When omitted, the workspace's activeProject from settings.json is used. Persistent default: `cvector project switch <name>` or the cv_set_default_project MCP tool.")
+    public void setProject(String project) {
+        if (project != null && !project.isBlank()) {
+            System.setProperty("cvector.project", project.trim());
+        }
+    }
+
     @Override
     public Integer call() {
         spec.commandLine().usage(System.err);

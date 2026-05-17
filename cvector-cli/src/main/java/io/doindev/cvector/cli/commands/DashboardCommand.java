@@ -36,10 +36,15 @@ public class DashboardCommand implements Callable<Integer> {
     @Override
     public Integer call() throws InterruptedException {
         CvectorConfig cfg = runtime.loadConfig();
-        CvectorConfig.ProjectEntry active = runtime.requireActiveProject(cfg);
+        // Tolerate empty workspaces — the dashboard boots fine and the SPA can guide the
+        // user through onboarding a first project via the REST API / MCP tools. Try
+        // requireActiveProject best-effort; fall back to a placeholder banner.
+        CvectorConfig.ProjectEntry active;
+        try { active = runtime.requireActiveProject(cfg); }
+        catch (RuntimeException e) { active = null; }
 
         int effectivePort = port != null ? port : 2969;
-        String backend = CvectorRuntime.isEmbeddedRequested()
+        String backend = CvectorRuntime.isEmbeddedRequested(cfg)
                 ? "kuzu (embedded)"
                 : "neo4j @ " + cfg.neo4jOrDefault().uri();
         String base = "http://localhost:" + effectivePort;
@@ -51,11 +56,18 @@ public class DashboardCommand implements Callable<Integer> {
         // don't have to cross-reference the settings.json file to figure out what their
         // running process actually exposes.
         boolean mcpCoHosted = !CvectorConfig.McpConfig.TRANSPORT_STDIO.equalsIgnoreCase(mcp.transport());
+        // Surface the actual SSE URL the operator put in mcp.url, so the banner doesn't
+        // drift from configuration. Falls back to the listener host/port + /sse default.
+        String mcpEffectiveUrl = (mcp.url() != null && !mcp.url().isBlank()) ? mcp.url() : (base + "/sse");
         String mcpLine = mcpCoHosted
-                ? "sse @ " + base + "/sse  (transport=" + mcp.transport() + ")"
+                ? "sse @ " + mcpEffectiveUrl + "  (transport=" + mcp.transport() + ")"
                 : "stdio only — run `cvector serve` for MCP";
         System.out.println("cvector dashboard running");
-        System.out.println("  project:    " + active.name() + " (" + active.projectId() + ")");
+        if (active != null) {
+            System.out.println("  project:    " + active.name() + " (" + active.projectId() + ")");
+        } else {
+            System.out.println("  project:    <none registered — use the SPA or cv_add_project to add one>");
+        }
         System.out.println("  backend:    " + backend);
         System.out.println("  api:        " + base + "/api");
         System.out.println("  dashboard:  " + base + "/dashboard");
