@@ -15,6 +15,7 @@ Code knowledge graph with a polyglot scanner, a Picocli CLI, a Spring Boot REST 
 5. [REST API](#rest-api)
 6. [MCP server](#mcp-server)
    - [Tools](#mcp-tools)
+   - [Long-running tools: async + cv_job_status](#long-running-tools-async--cv_job_status)
    - [Resources](#mcp-resources)
    - [Prompts](#mcp-prompts)
    - [Client setup](#mcp-client-setup)
@@ -739,10 +740,13 @@ cvector --project my-app status                  # query a different project for
 | `cv_list_projects` | Enumerate every project with name, projectId, rootPath, isolation flag, scan freshness, node/edge counts. The agent's primary discovery tool. |
 | `cv_find_project` | Look up a project by name, UUID, or directory path (path matching tolerates descendants of a registered rootPath). |
 | `cv_add_project` | Register a new project entry (no scan). Rejects overlapping rootPaths. |
-| `cv_scan_project` | (Re-)populate the graph for an existing project. Synchronous. |
-| `cv_onboard_project` | Register + scan + brief in one call — the convenience wrapper for IDE agents. |
-| `cv_remove_project` | Delete a project's graph data + workspace entry. Requires `confirm=true` for the actual delete (dry-run by default). |
+| `cv_scan_project` | (Re-)populate the graph for an existing project. Synchronous by default; pass `async: true` for codebases that may exceed the client's HTTP timeout. Runs in-process against the dashboard's live Kuzu/Neo4j handle so it avoids the file-lock collisions a subprocess scan would hit. |
+| `cv_onboard_project` | Register + scan + brief in one call — convenience wrapper. Supports `async: true`. |
+| `cv_remove_project` | Delete a project's graph data AND remove the workspace entry. Requires `confirm: true`. Supports `async: true`. Returns `nodesDeleted` (actual count) so you can verify against the dry-run promise. |
+| `cv_purge_project` | Delete graph data only; keep the registration. Recovery primitive for rebuilding a corrupted graph from scratch — pair with `cv_scan_project`. Supports `async: true`. |
+| `cv_purge_orphans` | Find projectIds present in the shared Kuzu DB but no longer registered in `settings.json` (e.g. left over from a prior delete or a rename) and delete them. Supports `async: true`. |
 | `cv_set_default_project` | Update the workspace's active project so subsequent tool calls can omit `project`. |
+| `cv_job_status` / `cv_jobs_list` | Poll an async job by id, or enumerate every job currently in the registry. See [Long-running tools: async + cv_job_status](#long-running-tools-async--cv_job_status). |
 
 ### Switching backends keeps projects intact
 
@@ -758,32 +762,87 @@ After upgrading, run `cvector scan` once per project to populate the new shared 
 
 ## MCP server
 
-Run with `cvector serve` (stdio JSON-RPC). Default capabilities: **tools**, **resources**, **prompts**.
+Run with `cvector serve` (stdio JSON-RPC) or co-host with the dashboard (`cvector dashboard` adds SSE on `/sse` + `/mcp`). Default capabilities: **33 tools**, **9 resources**, **9 prompts**.
+
+The MCP server runs in-process with the graph store — `cv_scan_project`, `cv_purge_project`, and friends reuse the dashboard's live Kuzu/Neo4j handle rather than spawning a subprocess, which avoids the file-lock collisions an out-of-process scan would hit on the embedded backend.
 
 ### MCP tools
 
+33 tools in three families: project lifecycle (register / scan / purge / remove), read queries (search / explain / impact / etc.), and async-job plumbing. Every read tool accepts an optional `project` argument (name, UUID, or rootPath) and falls back to the workspace's `activeProject` when omitted; the wildcard `"*"` runs cross-project for the tools that support it.
+
+**Project lifecycle**
+
 | Tool | Description | Parameters |
 |---|---|---|
-| `cv_stats` | Node + edge counts. | — |
-| `cv_health` | Connectivity + graph size + last scan commit. | — |
-| `cv_projects` | Active project context. | — |
-| `cv_search` | Substring node search; supports `*` wildcards. | `query` (req), `limit` (def 25), `label` (opt) |
-| `cv_explain` | Symbol context: type, file:line, callers, callees. | `symbol` (req) |
-| `cv_impact` | Downstream impact via CALLS/REFERENCES. | `symbol` (req), `depth` (def 3) |
-| `cv_test_impact` | Tests that transitively reach a symbol. | `symbol` (req), `depth` (def 5) |
-| `cv_context` | Members + references for a class/method. | `symbol` (req) |
-| `cv_rename` | Rename impact: callers, refs, importing files. | `symbol` (req) |
-| `cv_changes` | Recently-ingested nodes. | `since` (def `24h`), `limit` (def 50) |
-| `cv_onboard` | Full codebase briefing. | — |
-| `cv_rules` | Rules engine results. | — |
-| `cv_communities` | Cluster the call graph. | `algorithm` (leiden\|louvain\|connected-components), `minSize` (def 3), `limit` (def 10) |
-| `cv_flows` | Trace from REST/main/test entry points. | `kind` (rest\|main\|test\|all), `maxDepth` (def 3), `limit` (def 25) |
-| `cv_service_links` | Cross-service deps via HTTP, queues, exposed endpoints. | — |
-| `cv_audit` | OSV vulnerabilities × graph blast radius. | — |
+| `cv_list_projects` | Enumerate every project with name, projectId, rootPath, isolation flag, scan freshness, node/edge counts. | — |
+| `cv_find_project` | Look up by name / UUID / rootPath (descendant paths match). | `query` (req) |
+| `cv_add_project` | Register a new project (no scan). Rejects overlapping rootPaths. | `name` (req), `rootPath` (req), `isolated` (opt) |
+| `cv_scan_project` | (Re-)populate the graph for an existing project. Supports `async`. | `project` (opt), `async` (opt) |
+| `cv_onboard_project` | Register + scan + briefing in one call. Supports `async`. | `name` (req), `rootPath` (req), `isolated` (opt), `async` (opt) |
+| `cv_set_default_project` | Update the workspace's active project. | `project` (req) |
+| `cv_remove_project` | Delete a project's graph data AND remove the registration. Two-step (dry-run + `confirm:true`). Supports `async`. | `project` (opt), `confirm` (opt), `async` (opt) |
+| `cv_purge_project` | Delete a project's graph data but KEEP its registration — recovery primitive for rebuilding a corrupted graph. Two-step. Supports `async`. | `project` (opt), `confirm` (opt), `async` (opt) |
+| `cv_purge_orphans` | Find and delete graph data for projectIds present in the shared Kuzu DB but no longer registered in `settings.json`. Two-step. Supports `async`. | `confirm` (opt), `async` (opt) |
+| `cv_job_status` | Poll the status of a job started with `async: true`. | `jobId` (req) |
+| `cv_jobs_list` | List every job currently in the registry (running + retained for ~1 h post-completion). | `state` (opt: `running`/`done`/`failed`) |
+
+**Read & analysis**
+
+| Tool | Description | Parameters |
+|---|---|---|
+| `cv_stats` | Node + edge counts. | `project` (opt, `*` for all) |
+| `cv_health` | Connectivity + graph size + last scan commit. | `project` (opt, `*` for all) |
+| `cv_search` | Substring node search; supports `*` wildcards. | `query` (req), `project` (opt, `*` for all), `limit` (def 25), `label` (opt) |
+| `cv_explain` | Symbol context: type, file:line, callers, callees. Accepts bare names, full FQ names with/without signature, and `Class.method` partial-FQ. | `symbol` (req), `project` (opt) |
+| `cv_impact` | Downstream impact via CALLS/REFERENCES. | `symbol` (req), `project` (opt), `depth` (def 3) |
+| `cv_test_impact` | Tests that transitively reach a symbol. | `symbol` (req), `project` (opt), `depth` (def 5) |
+| `cv_context` | Members + references for a class/method. | `symbol` (req), `project` (opt) |
+| `cv_rename` | Rename impact: callers, refs, importing files. | `symbol` (req), `project` (opt) |
+| `cv_path` | Shortest CALLS path between two symbols. | `from` (req), `to` (req), `project` (opt), `maxDepth` (opt) |
+| `cv_changes` | Recently-ingested nodes. | `since` (def `24h`), `project` (opt, `*` for all), `limit` (def 50) |
+| `cv_onboard` | Full codebase briefing. | `project` (opt) |
+| `cv_wiki` | Structured documentation snapshot. | `project` (opt) |
+| `cv_rules` | Rules engine results. | `project` (opt) |
+| `cv_communities` | Cluster the call graph. | `algorithm` (leiden\|louvain\|connected-components), `project` (opt, `*` for all), `minSize` (def 3), `limit` (def 10) |
+| `cv_flows` | Trace from REST/main/test entry points. | `kind` (rest\|main\|test\|all), `project` (opt), `maxDepth` (def 3), `limit` (def 25) |
+| `cv_trace` | Multi-hop trace from a starting node. | `from` (req), `project` (opt), `maxDepth` (opt) |
+| `cv_service_links` | Cross-service deps via HTTP, queues, exposed endpoints. | `project` (opt, `*` for all) |
+| `cv_db_impact` | Methods touching a given table/column. | `table` (req), `column` (opt), `project` (opt) |
+| `cv_guard` | Quality-gate pass/fail. | `project` (opt) |
+| `cv_audit` | OSV vulnerabilities × graph blast radius. | `project` (opt) |
+| `cv_diff_start` / `cv_diff_status` | Async git-diff between two commits (separate subprocess). | `shaA` (req), `shaB` (req), `project` (opt), `includeCalls` (opt), `keep` (opt) |
+
+### Long-running tools: async + `cv_job_status`
+
+Five tools accept an optional `async: true` argument: `cv_scan_project`, `cv_onboard_project`, `cv_purge_project`, `cv_purge_orphans`, `cv_remove_project`. Use it for any call that might exceed the client's HTTP read timeout (typical default 30 s) — e.g. a from-scratch scan of a multi-thousand-file codebase, or a purge of a large graph.
+
+Two-step pattern when `async: true`:
+
+```jsonc
+// 1. Submit the work. Returns immediately (typically <100 ms).
+{"name": "cv_scan_project", "arguments": {"project": "my-app", "async": true}}
+// → { "jobId": "27f12ab9-...", "kind": "cv_scan_project", "state": "running", "accepted": true, "startedAt": "..." }
+
+// 2. Poll cv_job_status until state is "done" or "failed".
+{"name": "cv_job_status", "arguments": {"jobId": "27f12ab9-..."}}
+// → while running: { "state": "running", "elapsedMs": 1234 }
+// → on done:       { "state": "done",    "elapsedMs": 17728, "result": { ...full sync envelope... } }
+// → on failed:     { "state": "failed",  "exceptionClass": "...", "exceptionMessage": "..." }
+```
+
+When state reaches `done`, the `result` field is the exact response the synchronous variant of the tool would have returned — same shape, same keys. No second call required.
+
+**Recovery & lifecycle**
+
+- **Lost jobId?** Call `cv_jobs_list` to enumerate every job currently tracked (running + terminal jobs retained for ~1 h post-completion). Filter by `state: "running"` / `"done"` / `"failed"`. Useful when token-window truncation or a conversation restart dropped the original envelope.
+- **Stuck jobs.** Every async job has a built-in 15-minute wall-clock cap. If a job is still `RUNNING` past that deadline, the watchdog flips it to `FAILED` with a `TimeoutException` (best-effort `Future.cancel(true)` follows; native Kuzu calls can't be interrupted so the background work may keep running until completion, but the job state stops reporting `running` forever).
+- **Slow-sync hint.** When a *synchronous* call to one of the async-capable tools runs ≥10 s, the response gains a `syncElapsedMs` field and a one-line `hint` recommending `async: true` for similarly-sized future calls. Behaviour is unchanged; the hint self-documents the escape hatch when you're close to typical client timeouts.
+
+When `confirm: true` is required (`cv_purge_project`, `cv_purge_orphans`, `cv_remove_project`), the dry-run path stays synchronous since it only counts. Only the destructive path moves to the background when `async: true` is set.
 
 ### MCP resources
 
-Browsable read-only JSON snapshots — no parameters, no composition needed.
+9 browsable read-only JSON snapshots — no parameters, no composition needed. All are scoped to the workspace's active project.
 
 | URI | Contents |
 |---|---|
@@ -795,19 +854,23 @@ Browsable read-only JSON snapshots — no parameters, no composition needed.
 | `cvector://onboard` | Briefing: language mix, hubs, endpoints, dependencies. |
 | `cvector://infrastructure` | Endpoints, listeners, scheduled jobs, config keys, env vars, container ports, IaC resources. |
 | `cvector://guard` | Quality-gate pass/fail with severity totals. |
+| `cvector://communities` | Call-graph clusters from the community-detection algorithms. |
 
 ### MCP prompts
 
-Pre-built conversation starters that name the tools/resources the assistant should call.
+9 pre-built conversation starters that name the tools/resources the assistant should call.
 
 | Prompt | Arguments | Purpose |
 |---|---|---|
+| `cvector-discover-projects` | — | Walk through `cv_list_projects` and explain the workspace layout. |
 | `cvector-onboard` | — | Architecture brief for a new team member. |
+| `cvector-onboard-new-project` | `name`, `rootPath` | End-to-end registration + scan + briefing for a brand-new codebase. |
 | `cvector-review-change` | `symbol` (req) | Impact analysis pre-refactor. |
 | `cvector-health-check` | — | Prioritised action items. |
 | `cvector-explain-module` | `path` (req) | Module deep-dive. |
 | `cvector-migration-plan` | `from` (req), `to` (req), `scope` (opt) | Phased migration plan with risk register. |
 | `cvector-infrastructure` | — | Infrastructure surface audit. |
+| `cvector-cross-project-audit` | — | Cross-project audit using the wildcard `project: "*"` reads. |
 
 ### MCP client setup
 
@@ -849,10 +912,10 @@ npx @modelcontextprotocol/inspector java -jar /path/to/cvector-app/target/cvecto
 
 The Inspector spawns cvector as a child process, attaches to its stdin/stdout, and opens a web UI (default `http://localhost:6274`). With the connection panel pre-filled (Transport `STDIO`, the command + `serve` arg), click **Connect** — you should see:
 
-- **Server log** pane shows cvector's stderr banner: `cvector mcp server (stdio) ready` followed by `Registered tools: 23` / `Registered resources: 9` / `Registered prompts: 6`.
-- **Tools** tab lists all 23 `cv_*` tools, callable with form-rendered argument inputs.
+- **Server log** pane shows cvector's stderr banner: `cvector mcp server (stdio) ready` followed by `Registered tools: 33` / `Registered resources: 9` / `Registered prompts: 9`.
+- **Tools** tab lists all 33 `cv_*` tools, callable with form-rendered argument inputs.
 - **Resources** tab lists the 9 `cvector://*` URIs; click one to fetch its JSON.
-- **Prompts** tab lists the 6 prompts.
+- **Prompts** tab lists the 9 prompts.
 
 #### Gotchas
 
@@ -916,7 +979,7 @@ No `setup-*` helper exists for Eclipse Copilot yet (the plugin's MCP support is 
 
 - Restart Eclipse (or use the plugin's "Reload MCP Servers" command if present).
 - Open Copilot Chat and ask "what tools do you have?" — `cv_search`, `cv_explain`, `cv_impact`, etc. should show up alongside Copilot's built-in tools.
-- First-launch traces appear in `~/.cvector/mcp-server.log` — look for `cvector mcp server (stdio) ready` followed by `Registered tools: 23`.
+- First-launch traces appear in `~/.cvector/mcp-server.log` — look for `cvector mcp server (stdio) ready` followed by `Registered tools: 33`.
 
 **If your Copilot plugin version doesn't expose MCP yet**, two workarounds:
 

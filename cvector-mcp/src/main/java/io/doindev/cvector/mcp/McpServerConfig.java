@@ -101,8 +101,8 @@ public class McpServerConfig {
 
     @Bean
     public CvectorTools cvectorTools(GraphStore graphStore, ProjectResolver projectResolver,
-                                     CvectorScanService cvectorScanService) {
-        return new CvectorTools(graphStore, projectResolver, cvectorScanService);
+                                     CvectorScanService cvectorScanService, JobRegistry jobRegistry) {
+        return new CvectorTools(graphStore, projectResolver, cvectorScanService, jobRegistry);
     }
 
     @Bean

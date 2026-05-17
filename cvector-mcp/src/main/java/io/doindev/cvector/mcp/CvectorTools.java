@@ -59,11 +59,14 @@ public class CvectorTools {
     private final GraphStore store;
     private final ProjectResolver projects;
     private final CvectorScanService scanService;
+    private final JobRegistry jobs;
 
-    public CvectorTools(GraphStore store, ProjectResolver projects, CvectorScanService scanService) {
+    public CvectorTools(GraphStore store, ProjectResolver projects, CvectorScanService scanService,
+                        JobRegistry jobs) {
         this.store = store;
         this.projects = projects;
         this.scanService = scanService;
+        this.jobs = jobs;
     }
 
     // ===========================================================================================
@@ -161,14 +164,15 @@ public class CvectorTools {
     }
 
     @Tool(name = "cv_remove_project",
-            description = "Remove a project from the workspace AND delete its graph data. Requires confirm=true to actually run; without it the tool returns a dry-run summary so the agent can show the user what would be deleted.")
+            description = "Remove a project from the workspace AND delete its graph data. Requires confirm=true to actually run; without it the tool returns a dry-run summary so the agent can show the user what would be deleted. Pass async=true with confirm=true to run in the background; the dry-run path is always synchronous.")
     public Map<String, Object> removeProject(
             @ToolParam(description = "Project name, UUID, or rootPath. If omitted, falls back to the workspace's default project.", required = false) String project,
-            @ToolParam(description = "Must be true to actually delete. Without this the tool reports what would be removed.", required = false) Boolean confirm) {
+            @ToolParam(description = "Must be true to actually delete. Without this the tool reports what would be removed.", required = false) Boolean confirm,
+            @ToolParam(description = "Run the delete + settings update in background; return a jobId immediately. Only meaningful when confirm=true. Default false.", required = false) Boolean async) {
         ProjectEntry target = projects.resolveOrDefault(project);
-        Map<String, Object> out = new LinkedHashMap<>();
-        out.put("project", projectContext(target));
         if (!Boolean.TRUE.equals(confirm)) {
+            Map<String, Object> out = new LinkedHashMap<>();
+            out.put("project", projectContext(target));
             try {
                 Map<String, Long> nodes = store.nodeCounts(target.projectId());
                 out.put("nodesPendingDelete", nodes.values().stream().mapToLong(Long::longValue).sum());
@@ -179,6 +183,18 @@ public class CvectorTools {
             out.put("hint", "Pass confirm=true to actually remove this project.");
             return out;
         }
+        if (Boolean.TRUE.equals(async)) {
+            JobRegistry.Job job = jobs.submit("cv_remove_project", () -> removeProjectSync(target));
+            return acceptedEnvelope(job);
+        }
+        long start = System.currentTimeMillis();
+        Map<String, Object> result = removeProjectSync(target);
+        return maybeAddAsyncHint(result, "cv_remove_project", System.currentTimeMillis() - start);
+    }
+
+    private Map<String, Object> removeProjectSync(ProjectEntry target) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("project", projectContext(target));
         int deletedCount;
         try {
             deletedCount = store.deleteProjectSubtree(target.projectId());
@@ -209,24 +225,41 @@ public class CvectorTools {
     }
 
     @Tool(name = "cv_purge_project",
-            description = "Delete a project's graph data WITHOUT removing its registration in settings.json. Useful when a graph got corrupted (e.g. from prior buggy scans that left duplicate nodes) — pair it with cv_scan_project for a clean rebuild. Two-step like cv_remove_project: call without confirm for a dry-run, pass confirm=true to delete.")
+            description = "Delete a project's graph data WITHOUT removing its registration in settings.json. Useful when a graph got corrupted (e.g. from prior buggy scans that left duplicate nodes) — pair it with cv_scan_project for a clean rebuild. Two-step: call without confirm for a dry-run, pass confirm=true to delete. Pass async=true with confirm=true to run the delete in the background; the dry-run path is always synchronous since it just counts.")
     public Map<String, Object> purgeProject(
             @ToolParam(description = "Project name, UUID, or rootPath. If omitted, falls back to the workspace's default project.", required = false) String project,
-            @ToolParam(description = "Must be true to actually delete. Without this the tool reports what would be removed.", required = false) Boolean confirm) {
+            @ToolParam(description = "Must be true to actually delete. Without this the tool reports what would be removed.", required = false) Boolean confirm,
+            @ToolParam(description = "Run the delete in background; return a jobId immediately. Only meaningful when confirm=true. Default false.", required = false) Boolean async) {
         ProjectEntry target = projects.resolveOrDefault(project);
+        if (!Boolean.TRUE.equals(confirm)) {
+            return purgeProjectDryRun(target);
+        }
+        if (Boolean.TRUE.equals(async)) {
+            JobRegistry.Job job = jobs.submit("cv_purge_project", () -> purgeProjectSync(target));
+            return acceptedEnvelope(job);
+        }
+        long start = System.currentTimeMillis();
+        Map<String, Object> result = purgeProjectSync(target);
+        return maybeAddAsyncHint(result, "cv_purge_project", System.currentTimeMillis() - start);
+    }
+
+    private Map<String, Object> purgeProjectDryRun(ProjectEntry target) {
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("project", projectContext(target));
-        if (!Boolean.TRUE.equals(confirm)) {
-            try {
-                Map<String, Long> nodes = store.nodeCounts(target.projectId());
-                out.put("nodesPendingDelete", nodes.values().stream().mapToLong(Long::longValue).sum());
-            } catch (RuntimeException ignored) {
-                out.put("nodesPendingDelete", null);
-            }
-            out.put("dryRun", true);
-            out.put("hint", "Pass confirm=true to actually purge this project's graph data. The project registration in settings.json will remain so you can re-scan it.");
-            return out;
+        try {
+            Map<String, Long> nodes = store.nodeCounts(target.projectId());
+            out.put("nodesPendingDelete", nodes.values().stream().mapToLong(Long::longValue).sum());
+        } catch (RuntimeException ignored) {
+            out.put("nodesPendingDelete", null);
         }
+        out.put("dryRun", true);
+        out.put("hint", "Pass confirm=true to actually purge this project's graph data. The project registration in settings.json will remain so you can re-scan it.");
+        return out;
+    }
+
+    private Map<String, Object> purgeProjectSync(ProjectEntry target) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("project", projectContext(target));
         int deletedCount;
         try {
             deletedCount = store.deleteProjectSubtree(target.projectId());
@@ -240,16 +273,61 @@ public class CvectorTools {
     }
 
     @Tool(name = "cv_purge_orphans",
-            description = "Find and delete graph data for projectIds that exist in the shared Kuzu DB but are no longer registered in settings.json. Recovery tool for the case where a prior cv_remove_project or a renamed project left orphan Project / Method / etc nodes behind. Two-step: omit confirm for a dry-run report listing each orphan projectId and its node count; pass confirm=true to actually delete.")
+            description = "Find and delete graph data for projectIds that exist in the shared Kuzu DB but are no longer registered in settings.json. Recovery tool for the case where a prior cv_remove_project or a renamed project left orphan Project / Method / etc nodes behind. Two-step: omit confirm for a dry-run report listing each orphan projectId and its node count; pass confirm=true to actually delete. Pass async=true with confirm=true to run the delete in the background; the dry-run path is always synchronous.")
     public Map<String, Object> purgeOrphans(
-            @ToolParam(description = "Must be true to actually delete. Without this the tool reports what would be removed.", required = false) Boolean confirm) {
-        // Discover orphans by comparing Project nodes in the graph against the registered set
-        // in settings.json. The registered set is keyed by projectId (UUID), not by name, so a
-        // rename doesn't accidentally orphan its own graph data.
+            @ToolParam(description = "Must be true to actually delete. Without this the tool reports what would be removed.", required = false) Boolean confirm,
+            @ToolParam(description = "Run the deletes in background; return a jobId immediately. Only meaningful when confirm=true. Default false.", required = false) Boolean async) {
+        // The dry-run path is fast (one count per orphan), so even in async mode we still
+        // compute the orphan list synchronously — the agent gets the per-projectId breakdown
+        // up front. Only the destructive deleteProjectSubtree loop gets backgrounded.
+        OrphanDiscovery discovery = discoverOrphans();
+        if (discovery.error != null) return discovery.error;
+        if (discovery.orphans.isEmpty()) {
+            Map<String, Object> out = new LinkedHashMap<>();
+            out.put("registeredProjectCount", discovery.registeredCount);
+            out.put("graphProjectCount", discovery.graphCount);
+            out.put("orphans", List.of());
+            out.put("ok", true);
+            out.put("message", "no orphan projectIds found in the graph");
+            return out;
+        }
+        if (!Boolean.TRUE.equals(confirm)) {
+            Map<String, Object> out = new LinkedHashMap<>();
+            out.put("registeredProjectCount", discovery.registeredCount);
+            out.put("graphProjectCount", discovery.graphCount);
+            out.put("orphans", discovery.orphans);
+            out.put("dryRun", true);
+            out.put("hint", "Pass confirm=true to delete every orphan projectId's nodes.");
+            return out;
+        }
+        if (Boolean.TRUE.equals(async)) {
+            JobRegistry.Job job = jobs.submit("cv_purge_orphans", () -> purgeOrphansSync(discovery));
+            return acceptedEnvelope(job);
+        }
+        long start = System.currentTimeMillis();
+        Map<String, Object> result = purgeOrphansSync(discovery);
+        return maybeAddAsyncHint(result, "cv_purge_orphans", System.currentTimeMillis() - start);
+    }
+
+    /**
+     * Snapshot of orphan-projectId discovery: the registered projectId set, all Project nodes
+     * present in the graph, and the orphan subset (graph - registered). Or, if enumeration
+     * failed, an error envelope ready to return to the caller verbatim.
+     */
+    private static final class OrphanDiscovery {
+        int registeredCount;
+        int graphCount;
+        List<Map<String, Object>> orphans = List.of();
+        Map<String, Object> error;
+    }
+
+    private OrphanDiscovery discoverOrphans() {
+        OrphanDiscovery d = new OrphanDiscovery();
         java.util.Set<String> registeredIds = new java.util.HashSet<>();
         for (ProjectEntry pe : projects.loadConfig().projects().values()) {
             if (pe.projectId() != null) registeredIds.add(pe.projectId());
         }
+        d.registeredCount = registeredIds.size();
         List<Map<String, Object>> graphProjects;
         try {
             graphProjects = store.projectsList();
@@ -257,8 +335,10 @@ public class CvectorTools {
             Map<String, Object> err = new LinkedHashMap<>();
             err.put("ok", false);
             err.put("error", "couldn't enumerate Project nodes: " + e.getMessage());
-            return err;
+            d.error = err;
+            return d;
         }
+        d.graphCount = graphProjects.size();
         List<Map<String, Object>> orphans = new ArrayList<>();
         for (Map<String, Object> row : graphProjects) {
             Object pidObj = row.get("projectId");
@@ -277,24 +357,14 @@ public class CvectorTools {
             }
             orphans.add(entry);
         }
+        d.orphans = orphans;
+        return d;
+    }
 
-        Map<String, Object> out = new LinkedHashMap<>();
-        out.put("registeredProjectCount", registeredIds.size());
-        out.put("graphProjectCount", graphProjects.size());
-        out.put("orphans", orphans);
-        if (orphans.isEmpty()) {
-            out.put("ok", true);
-            out.put("message", "no orphan projectIds found in the graph");
-            return out;
-        }
-        if (!Boolean.TRUE.equals(confirm)) {
-            out.put("dryRun", true);
-            out.put("hint", "Pass confirm=true to delete every orphan projectId's nodes.");
-            return out;
-        }
+    private Map<String, Object> purgeOrphansSync(OrphanDiscovery discovery) {
         int totalDeleted = 0;
         List<Map<String, Object>> deleted = new ArrayList<>();
-        for (Map<String, Object> orphan : orphans) {
+        for (Map<String, Object> orphan : discovery.orphans) {
             String pid = orphan.get("projectId").toString();
             int n;
             try {
@@ -310,6 +380,10 @@ public class CvectorTools {
             hit.put("nodesDeleted", n);
             deleted.add(hit);
         }
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("registeredProjectCount", discovery.registeredCount);
+        out.put("graphProjectCount", discovery.graphCount);
+        out.put("orphans", discovery.orphans);
         out.put("ok", true);
         out.put("totalNodesDeleted", totalDeleted);
         out.put("deleted", deleted);
@@ -317,26 +391,54 @@ public class CvectorTools {
     }
 
     @Tool(name = "cv_scan_project",
-            description = "Scan an existing registered project to (re)populate its graph data. Synchronous — returns when the scan completes with node/edge counts and elapsed time. Idempotent: re-scans use content-hash skipping for unchanged files.")
+            description = "Scan an existing registered project to (re)populate its graph data. Idempotent: re-scans use content-hash skipping for unchanged files. Synchronous by default — returns the full scan envelope when the work completes. Pass async=true to run in the background and get a jobId envelope back immediately; poll cv_job_status(jobId) for the result. Use async on large codebases that may exceed the client's HTTP timeout.")
     public Map<String, Object> scanProject(
-            @ToolParam(description = "Project name, UUID, or rootPath. If omitted, falls back to the workspace's default project.", required = false) String project) {
+            @ToolParam(description = "Project name, UUID, or rootPath. If omitted, falls back to the workspace's default project.", required = false) String project,
+            @ToolParam(description = "Run in background; return a jobId immediately and let the scan complete asynchronously. Default false (synchronous).", required = false) Boolean async) {
         ProjectEntry target = projects.resolveOrDefault(project);
+        if (Boolean.TRUE.equals(async)) {
+            JobRegistry.Job job = jobs.submit("cv_scan_project", () -> scanProjectSync(target));
+            return acceptedEnvelope(job);
+        }
+        long start = System.currentTimeMillis();
+        Map<String, Object> result = scanProjectSync(target);
+        return maybeAddAsyncHint(result, "cv_scan_project", System.currentTimeMillis() - start);
+    }
+
+    private Map<String, Object> scanProjectSync(ProjectEntry target) {
         Map<String, Object> out = newResponse(target);
         out.putAll(scanService.scan(target));
         return out;
     }
 
     @Tool(name = "cv_onboard_project",
-            description = "Convenience: register a new project AND scan it AND return the codebase briefing in one call. Equivalent to cv_add_project + cv_scan_project + cv_onboard. Use this when an agent is asked to onboard a brand-new codebase.")
+            description = "Convenience: register a new project AND scan it AND return the codebase briefing in one call. Equivalent to cv_add_project + cv_scan_project + cv_onboard. Use this when an agent is asked to onboard a brand-new codebase. The composite scan + briefing can take a while on large codebases — pass async=true to run in the background and return a jobId immediately; poll cv_job_status(jobId) for the result.")
     public Map<String, Object> onboardProject(
             @ToolParam(description = "Project name.") String name,
             @ToolParam(description = "Absolute directory path of the codebase root.") String rootPath,
-            @ToolParam(description = "Give this project its own Kuzu DB directory. Default false.", required = false) Boolean isolated) {
+            @ToolParam(description = "Give this project its own Kuzu DB directory. Default false.", required = false) Boolean isolated,
+            @ToolParam(description = "Run the scan + briefing in background; return a jobId immediately. The cv_add_project step still runs synchronously (it's fast and the caller needs the new projectId to refer back to the project). Default false.", required = false) Boolean async) {
+        // The register-project step is fast and the caller needs the new projectId synchronously
+        // — running it inline keeps the simple "I just registered X, here's its UUID" contract.
+        // The heavyweight scan + briefing pair is what we optionally background.
         Map<String, Object> addResult = addProject(name, rootPath, isolated);
         @SuppressWarnings("unchecked")
         Map<String, Object> created = (Map<String, Object>) addResult.get("project");
         String projectId = (String) created.get("projectId");
-        Map<String, Object> scanResult = scanProject(projectId);
+        ProjectEntry target = projects.resolve(projectId);
+        if (Boolean.TRUE.equals(async)) {
+            JobRegistry.Job job = jobs.submit("cv_onboard_project", () -> onboardScanAndBrief(created, target, projectId));
+            Map<String, Object> env = acceptedEnvelope(job);
+            env.put("project", created); // surface the new projectId immediately even in async mode
+            return env;
+        }
+        long start = System.currentTimeMillis();
+        Map<String, Object> result = onboardScanAndBrief(created, target, projectId);
+        return maybeAddAsyncHint(result, "cv_onboard_project", System.currentTimeMillis() - start);
+    }
+
+    private Map<String, Object> onboardScanAndBrief(Map<String, Object> created, ProjectEntry target, String projectId) {
+        Map<String, Object> scanResult = scanProjectSync(target);
         Map<String, Object> briefing = onboard(projectId);
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("ok", true);
@@ -1018,5 +1120,124 @@ public class CvectorTools {
             case "d", "day", "days" -> Duration.ofDays(n);
             default -> Duration.ofHours(24);
         };
+    }
+
+    // ===========================================================================================
+    //  Async job plumbing — long-running write tools (cv_scan_project, cv_purge_*, cv_onboard_*)
+    //  accept an optional `async: true` arg. When set, the tool returns the envelope below
+    //  immediately and the work runs on JobRegistry's background executor; the agent polls
+    //  cv_job_status(jobId) until state becomes "done" or "failed".
+    // ===========================================================================================
+
+    /**
+     * Threshold beyond which a sync call gets decorated with a "consider async" hint. The
+     * value is just under typical client HTTP read timeouts (30 s) — the hint fires when
+     * we got a sync response back successfully but it was close enough to the timeout
+     * that the next, slightly larger call might not. It's advisory only; the response
+     * payload itself is unchanged.
+     */
+    private static final long SLOW_SYNC_HINT_MS = 10_000;
+
+    /**
+     * Decorate a sync-tool response with a soft hint suggesting {@code async: true} for
+     * similarly-sized future calls. Called from the wrapped sync paths so destructive /
+     * long-running tools self-document their async escape hatch when the operator's
+     * current call ran close to the typical client timeout.
+     */
+    private static Map<String, Object> maybeAddAsyncHint(Map<String, Object> response, String toolName, long elapsedMs) {
+        if (elapsedMs >= SLOW_SYNC_HINT_MS && response != null && !response.containsKey("hint")) {
+            response.put("syncElapsedMs", elapsedMs);
+            response.put("hint", "This sync call ran for " + elapsedMs + " ms — close to typical HTTP client timeouts. "
+                    + "For similarly-sized future calls, pass async:true and poll cv_job_status(jobId) to avoid the timeout race.");
+        }
+        return response;
+    }
+
+    /**
+     * Standard envelope returned when a long-running tool was invoked with {@code async: true}.
+     * The caller polls {@code cv_job_status({jobId})} to learn the outcome.
+     */
+    private static Map<String, Object> acceptedEnvelope(JobRegistry.Job job) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("jobId", job.id().toString());
+        out.put("kind", job.kind());
+        out.put("state", "running");
+        out.put("accepted", true);
+        out.put("startedAt", job.startedAt().toString());
+        out.put("hint", "Poll cv_job_status({jobId: \"" + job.id() + "\"}) until state is 'done' or 'failed'.");
+        return out;
+    }
+
+    @Tool(name = "cv_jobs_list",
+            description = "List every background job currently tracked by the server (running plus any terminal jobs retained for ~1 h). Use this when an agent has lost the jobId from a prior async call (token-window truncation, conversation restart) and needs to recover the result, or to verify that a long-running operation is still progressing.")
+    public Map<String, Object> jobsList(
+            @ToolParam(description = "Filter by state: 'running' / 'done' / 'failed'. Omit to list every state.", required = false) String state) {
+        Map<UUID, JobRegistry.Job> all = jobs.snapshot();
+        List<Map<String, Object>> entries = new ArrayList<>(all.size());
+        String filter = state == null ? null : state.trim().toLowerCase();
+        for (JobRegistry.Job job : all.values()) {
+            if (filter != null && !filter.isEmpty() && !filter.equalsIgnoreCase(job.state().name())) continue;
+            Map<String, Object> e = new LinkedHashMap<>();
+            e.put("jobId", job.id().toString());
+            e.put("kind", job.kind());
+            e.put("state", job.state().name().toLowerCase());
+            e.put("startedAt", job.startedAt().toString());
+            if (job.finishedAt() != null) e.put("finishedAt", job.finishedAt().toString());
+            e.put("elapsedMs", job.elapsedMs());
+            entries.add(e);
+        }
+        // Most-recent-first so the agent's natural read order matches the most likely
+        // "what was I just doing?" recovery scenario.
+        entries.sort((a, b) -> ((String) b.get("startedAt")).compareTo((String) a.get("startedAt")));
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("count", entries.size());
+        out.put("jobs", entries);
+        out.put("retentionHint", "Terminal jobs are retained for ~1 h after completion before eviction. Use cv_job_status(jobId) to fetch the full result for any entry.");
+        return out;
+    }
+
+    @Tool(name = "cv_job_status",
+            description = "Poll the status of an async background job started by a tool invoked with `async: true` (cv_scan_project, cv_purge_project, cv_purge_orphans, cv_onboard_project, cv_remove_project). Returns the job's current state and — once it reaches a terminal state — the full result that the synchronous variant of the tool would have produced. Jobs are retained for ~1 h after completion; older entries are evicted. Use cv_jobs_list to recover a lost jobId.")
+    public Map<String, Object> jobStatus(
+            @ToolParam(description = "Job UUID returned by the original tool call.") String jobId) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("jobId", jobId);
+        UUID id;
+        try {
+            id = UUID.fromString(jobId);
+        } catch (IllegalArgumentException e) {
+            out.put("found", false);
+            out.put("error", "invalid jobId — not a UUID");
+            return out;
+        }
+        JobRegistry.Job job = jobs.get(id);
+        if (job == null) {
+            out.put("found", false);
+            out.put("error", "no job with that id (it may have completed >1h ago and been evicted, or the server restarted)");
+            return out;
+        }
+        out.put("found", true);
+        out.put("kind", job.kind());
+        out.put("state", job.state().name().toLowerCase());
+        out.put("startedAt", job.startedAt().toString());
+        if (job.finishedAt() != null) out.put("finishedAt", job.finishedAt().toString());
+        out.put("elapsedMs", job.elapsedMs());
+        if (job.state() == JobRegistry.State.DONE) {
+            out.put("result", job.result());
+        } else if (job.state() == JobRegistry.State.FAILED) {
+            Throwable t = job.error();
+            if (t != null) {
+                out.put("exceptionClass", t.getClass().getName());
+                if (t.getMessage() != null) out.put("exceptionMessage", t.getMessage());
+                List<String> causes = new ArrayList<>();
+                Throwable c = t.getCause();
+                while (c != null && c != t) {
+                    causes.add(c.getClass().getName() + (c.getMessage() == null ? "" : ": " + c.getMessage()));
+                    c = c.getCause();
+                }
+                if (!causes.isEmpty()) out.put("causes", causes);
+            }
+        }
+        return out;
     }
 }
