@@ -1194,16 +1194,43 @@ public final class KuzuGraphStore implements GraphStore {
     @Override
     public int deleteProjectSubtree(String projectId) {
         // Surgical "remove this project's rows from the (possibly shared) Kuzu DB" used by
-        // cv_remove_project and embedded wipe. Counts first so we can report what got
-        // removed; then DETACH DELETE in a single statement.
+        // cv_remove_project, cv_purge_project, and cv_purge_orphans.
+        //
+        // Chunked so a large purge can't wedge the dashboard. The single DETACH DELETE
+        // statement we used before held the connection lock for the entire native call,
+        // which on a densely-edged project (~6k nodes with thousands of CALLS edges) can
+        // run well past the 30 s client timeout. While the lock was held every other tool
+        // call queued behind it — sometimes long enough for the operator to think the
+        // server itself had wedged and to restart the JVM. Doing the work in 500-node
+        // chunks keeps each {@link EmbeddedKuzu#write} call short (typically &lt;100 ms),
+        // releases the lock between batches so concurrent reads can interleave, and lets
+        // the deletion complete fully even when the originating client gives up on the
+        // request. Kuzu auto-commits each statement, so there's no transaction state to
+        // leak if the JVM is killed mid-purge — the next call resumes from whatever
+        // survived.
         List<Map<String, Object>> count = kuzu.read(
                 "MATCH (n:Node) WHERE n.projectId = $pid RETURN count(n) AS c",
                 Map.of("pid", projectId));
         long total = count.isEmpty() ? 0L : asLong(count.get(0).get("c"));
         if (total == 0) return 0;
-        kuzu.write("MATCH (n:Node) WHERE n.projectId = $pid DETACH DELETE n",
-                Map.of("pid", projectId));
-        return (int) total;
+        final int batchSize = 500;
+        long remaining = total;
+        // Safety cap: the loop should make linear progress, but if a Kuzu bug ever caused
+        // DETACH DELETE to silently NO-OP we'd spin forever otherwise. 10× the initial
+        // count is more than enough headroom — bail with whatever was actually removed.
+        long maxIterations = (total / batchSize + 1) * 10L;
+        while (remaining > 0 && maxIterations-- > 0) {
+            kuzu.write(
+                    "MATCH (n:Node) WHERE n.projectId = $pid WITH n LIMIT " + batchSize + " DETACH DELETE n",
+                    Map.of("pid", projectId));
+            List<Map<String, Object>> recount = kuzu.read(
+                    "MATCH (n:Node) WHERE n.projectId = $pid RETURN count(n) AS c",
+                    Map.of("pid", projectId));
+            long now = recount.isEmpty() ? 0L : asLong(recount.get(0).get("c"));
+            if (now >= remaining) break; // no forward progress — abort to avoid an infinite spin
+            remaining = now;
+        }
+        return (int) (total - remaining);
     }
 
     @Override

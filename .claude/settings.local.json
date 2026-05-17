@@ -11,7 +11,8 @@
       "PowerShell(& 'C:\\\\Users\\\\timhj\\\\AppData\\\\Local\\\\Temp\\\\cvec-mcp-stress3.ps1')",
       "PowerShell(& 'C:\\\\Users\\\\timhj\\\\AppData\\\\Local\\\\Temp\\\\cvec-verify-fixes.ps1')",
       "PowerShell(& 'C:\\\\Users\\\\timhj\\\\AppData\\\\Local\\\\Temp\\\\cvec-parallel-explain.ps1')",
-      "PowerShell(& 'C:\\\\Users\\\\timhj\\\\AppData\\\\Local\\\\Temp\\\\cvec-class-method.ps1')"
+      "PowerShell(& 'C:\\\\Users\\\\timhj\\\\AppData\\\\Local\\\\Temp\\\\cvec-class-method.ps1')",
+      "PowerShell(& 'C:\\\\Users\\\\timhj\\\\AppData\\\\Local\\\\Temp\\\\cvec-purge-wedge.ps1')"
     ]
   }
 }
