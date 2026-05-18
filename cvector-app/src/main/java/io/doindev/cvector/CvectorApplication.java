@@ -71,7 +71,7 @@ public class CvectorApplication implements CommandLineRunner, ExitCodeGenerator 
             int port = 2969;
             String host = "127.0.0.1";
             Map<String, Object> serverMap = null;
-            String mcpTransport = CvectorConfig.McpConfig.TRANSPORT_STREAMABLE;
+            String mcpTransport = CvectorConfig.McpConfig.TRANSPORT_HTTP;
             String mcpHttpPath = null;
             try {
                 CvectorConfigService svc = new CvectorConfigService();
@@ -92,8 +92,8 @@ public class CvectorApplication implements CommandLineRunner, ExitCodeGenerator 
             // Co-host the MCP server with the dashboard unless the user opted out by setting
             // mcp.transport: "stdio" — stdio MCP can't be paired with an HTTP dashboard from
             // the same terminal (the JSON-RPC reader would race the user for stdin), so we
-            // skip the profile entirely and `cvector dashboard` runs alone. "streamable" /
-            // "sse" both wire Spring AI's WebMVC MCP transport into Tomcat — which one is
+            // skip the profile entirely and `cvector dashboard` runs alone. "http" / "sse"
+            // both wire Spring AI's WebMVC MCP transport into Tomcat — which one is
             // determined below by spring.ai.mcp.server.protocol.
             boolean coHostMcp = !CvectorConfig.McpConfig.TRANSPORT_STDIO.equalsIgnoreCase(mcpTransport);
             // Defaults via .properties() — lowest precedence, env vars and any user-set
