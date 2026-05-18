@@ -296,7 +296,8 @@ public record CvectorConfig(
      * {@link RestConfig#host} and {@link RestConfig#port} regardless.
      */
     @JsonInclude(JsonInclude.Include.NON_NULL)
-    public record McpConfig(String url, String transport, McpTimeouts timeouts) {
+    public record McpConfig(String url, String transport, McpTimeouts timeouts,
+                            LocalhostSessionRecovery localhostSessionRecovery) {
 
         /**
          * MCP 2025-03-26 "Streamable HTTP" transport. Single endpoint (default {@code /mcp}),
@@ -330,19 +331,27 @@ public record CvectorConfig(
         private static final String DEFAULT_URL = "http://127.0.0.1:2969/mcp";
 
         public static McpConfig defaults() {
-            return new McpConfig(DEFAULT_URL, TRANSPORT_HTTP, null);
+            return new McpConfig(DEFAULT_URL, TRANSPORT_HTTP, null, null);
         }
 
         public McpConfig withDefaults() {
             return new McpConfig(
                     url == null || url.isBlank() ? DEFAULT_URL : url,
                     transport == null || transport.isBlank() ? TRANSPORT_HTTP : canonicalTransport(transport),
-                    timeouts);
+                    timeouts,
+                    localhostSessionRecovery);
         }
 
         /** Returns timeouts, never null — falls back to defaults when settings.json omits the section. */
         public McpTimeouts timeoutsOrDefault() {
             return timeouts != null ? timeouts.withDefaults() : McpTimeouts.defaults();
+        }
+
+        /** Returns recovery config, never null — falls back to defaults when settings.json omits the section. */
+        public LocalhostSessionRecovery localhostSessionRecoveryOrDefault() {
+            return localhostSessionRecovery != null
+                    ? localhostSessionRecovery.withDefaults()
+                    : LocalhostSessionRecovery.defaults();
         }
 
         /** Validates the transport string is one of the supported values. */
@@ -417,6 +426,44 @@ public record CvectorConfig(
                 // "let application-mcp.properties / Spring AI defaults stand". The
                 // method exists for symmetry with the other config records.
                 return this;
+            }
+        }
+
+        /**
+         * Localhost-only session-recovery: when an MCP client (Eclipse Copilot, MCP
+         * Inspector, …) holds an {@code Mcp-Session-Id} from a previous cvector run and
+         * cvector has since restarted, normally the server returns 404 "Session not
+         * found" on the client's next tool request and the user has to close + reopen
+         * the IDE. With recovery enabled, cvector's
+         * {@code LocalhostSessionRecoveryFilter} intercepts the stale request on
+         * loopback, transparently synthesizes a fresh server-side session
+         * (initialize + notifications/initialized), remembers the {@code clientId →
+         * serverId} mapping, and rewrites the request's session header so Spring AI
+         * sees a valid session. The client never notices.
+         *
+         * <p>Localhost-only is the security boundary: off-host, accepting arbitrary
+         * client session ids would be a replay/CSRF vector. The dashboard UI itself
+         * never carries an {@code Mcp-Session-Id} (it talks {@code /api/*}, not
+         * {@code /mcp}), so the filter is invisible to it regardless of this setting.
+         *
+         * @param enabled    Master toggle. Default {@code true} on a loopback bind
+         *                   ({@code rest.host=127.0.0.1}), set to {@code false} to keep
+         *                   Spring AI's plain 404 behaviour.
+         * @param ttlMinutes How long a {@code clientId → serverId} mapping survives
+         *                   unused before being evicted. Default 60. Bounds memory
+         *                   growth when many distinct clients connect over time.
+         */
+        @JsonInclude(JsonInclude.Include.NON_NULL)
+        public record LocalhostSessionRecovery(Boolean enabled, Integer ttlMinutes) {
+
+            public static LocalhostSessionRecovery defaults() {
+                return new LocalhostSessionRecovery(true, 60);
+            }
+
+            public LocalhostSessionRecovery withDefaults() {
+                return new LocalhostSessionRecovery(
+                        enabled == null ? Boolean.TRUE : enabled,
+                        ttlMinutes == null || ttlMinutes <= 0 ? 60 : ttlMinutes);
             }
         }
     }

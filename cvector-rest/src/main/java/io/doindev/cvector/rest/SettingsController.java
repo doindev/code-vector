@@ -130,7 +130,17 @@ public class SettingsController {
                 timeouts = new CvectorConfig.McpConfig.McpTimeouts(
                         requestTimeoutMs, keepAliveIntervalMs, asyncRequestTimeoutMs);
             }
-            mcp = new CvectorConfig.McpConfig(url, transport, timeouts);
+            CvectorConfig.McpConfig.LocalhostSessionRecovery recovery =
+                    mcp != null ? mcp.localhostSessionRecovery() : null;
+            if (m.get("localhostSessionRecovery") instanceof Map<?, ?> r) {
+                Boolean enabled = r.get("enabled") instanceof Boolean b
+                        ? b
+                        : (recovery != null ? recovery.enabled() : null);
+                Integer ttl = toInt(r.get("ttlMinutes"),
+                        recovery != null ? recovery.ttlMinutes() : null);
+                recovery = new CvectorConfig.McpConfig.LocalhostSessionRecovery(enabled, ttl);
+            }
+            mcp = new CvectorConfig.McpConfig(url, transport, timeouts, recovery);
         }
         CvectorConfig.DockerConfig docker = before.docker();
         if (p.get("docker") instanceof Map<?, ?> d) {
