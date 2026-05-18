@@ -59,6 +59,12 @@ public class CvectorApplication implements CommandLineRunner, ExitCodeGenerator 
                 .logStartupInfo(false);
 
         if (webMode) {
+            // In-place restart handshake: when this JVM was spawned by a previous cvector
+            // instance's RestartRunner, it carries a `-Dcvector.restart.waitForPid=<pid>`
+            // pointing at the soon-to-exit parent. Hold here until that PID is gone so Kuzu's
+            // directory lock has been released by the OS before Spring boots EmbeddedKuzu.
+            // No-op on a plain `cvector dashboard` launch (the property won't be set).
+            awaitParentExit();
             // Read REST host/port, server.* overrides, and mcp.transport from settings.json
             // before Spring boots. Falls back to defaults silently when the config is missing
             // (e.g. running outside a cvector workspace, or a stale install).
@@ -232,6 +238,60 @@ public class CvectorApplication implements CommandLineRunner, ExitCodeGenerator 
                 System.setProperty(e.getKey(), e.getValue());
             }
         }
+    }
+
+    /**
+     * Block until the PID named by {@code -Dcvector.restart.waitForPid=<pid>} has exited,
+     * so the in-place dashboard restart can be sure the Kuzu directory lock the old JVM held
+     * has been released by the OS before the new JVM tries to open it. The
+     * {@code RestartRunner} on the parent side passes its own PID through this system
+     * property when it spawns the replacement; a plain {@code cvector dashboard} launch from
+     * a shell never carries it and this is a no-op.
+     *
+     * <p>Polls {@code ProcessHandle.of(pid).isPresent()} every 500 ms. Bounded at 30 s — past
+     * that we log a warning and fall through, letting Spring boot proceed. {@code EmbeddedKuzu}'s
+     * own retry-with-backoff (also ~30 s ceiling) catches the rare case where the parent
+     * truly froze during shutdown and Kuzu's lock didn't release.
+     *
+     * <p>Logs to {@code System.err} directly rather than via SLF4J because logging hasn't
+     * been initialised at this point in startup — the operator sees the wait outcome live in
+     * the terminal that holds the new process.
+     */
+    private static void awaitParentExit() {
+        String raw = System.getProperty("cvector.restart.waitForPid");
+        if (raw == null || raw.isBlank()) return;
+        long pid;
+        try {
+            pid = Long.parseLong(raw.trim());
+        } catch (NumberFormatException e) {
+            System.err.println("restart: ignoring malformed cvector.restart.waitForPid=" + raw);
+            return;
+        }
+        if (!ProcessHandle.of(pid).isPresent()) {
+            // Parent already gone by the time we got here. Common when the parent's
+            // System.exit(0) finished before PowerShell finished spawning us.
+            return;
+        }
+        System.err.println("restart: waiting for parent pid=" + pid + " to exit before opening Kuzu");
+        long deadline = System.currentTimeMillis() + 30_000L;
+        while (System.currentTimeMillis() < deadline) {
+            if (!ProcessHandle.of(pid).isPresent()) {
+                long waited = 30_000L - (deadline - System.currentTimeMillis());
+                System.err.println("restart: parent pid=" + pid + " exited after " + waited + " ms");
+                return;
+            }
+            try {
+                Thread.sleep(500);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                System.err.println("restart: interrupted while waiting for parent pid=" + pid);
+                return;
+            }
+        }
+        // 30 s ceiling — let EmbeddedKuzu's retry loop handle the rare case where the
+        // parent process froze during shutdown and the lock didn't release on time.
+        System.err.println("restart: parent pid=" + pid + " still alive after 30 s; proceeding anyway"
+                + " (EmbeddedKuzu lock retry will cover any straggler release)");
     }
 
     @Override
