@@ -19,6 +19,10 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Stream;
 
 /**
  * Embedded graph store using KuzuDB. One {@link Database} + {@link Connection} per project. Owns a
@@ -48,6 +52,19 @@ public final class EmbeddedKuzu implements AutoCloseable {
     private final Path dbPath;
     private final Database database;
     private final Connection connection;
+    /** Cached at construction so the size monitor can compute % usage without re-deriving. */
+    private final long maxDbSizeBytes;
+    /**
+     * Daemon thread that walks {@link #dbPath} every 30 s and logs a warning when on-disk
+     * usage crosses 75% (and again at 90%) of {@link #maxDbSizeBytes}. Hits the threshold
+     * once → one log line; doesn't repeat until usage drops below 70% / 85% respectively
+     * (a {@code cv_purge_orphans} or similar cleanup) and the level is crossed again.
+     * Cancelled on {@link #close()}. Null when monitoring is disabled (test mode).
+     */
+    private final ScheduledExecutorService sizeMonitor;
+    /** Tracks which thresholds we've already warned for, so the log stays quiet on repeat ticks. */
+    private volatile boolean warnedAt75;
+    private volatile boolean warnedAt90;
     /**
      * Serializes every native call on {@link #connection}. Kuzu's Java {@code Connection} is a
      * single-threaded session — its {@code prepare()}, {@code execute()}, {@code query()}, and
@@ -139,6 +156,7 @@ public final class EmbeddedKuzu implements AutoCloseable {
         // that is almost certainly a live owner (another running cvector, an AV not
         // letting go) — fall through and throw the enriched message.
         long[] backoffMillis = {250, 500, 1000, 2000, 4000, 4000, 4000, 4000, 4000, 4000, 4000, 4000};
+        long resolvedMaxDbSize = resolveMaxDbSize();
         // Kuzu's Database(...) constructor declares `throws Exception` in the 0.11.x JNI
         // binding — the lock-failure case surfaces as a plain java.lang.Exception, not a
         // RuntimeException. Catch Exception so the retry path actually fires; the
@@ -155,7 +173,7 @@ public final class EmbeddedKuzu implements AutoCloseable {
                         bufferSize,
                         /* enableCompression */ true,
                         /* readOnly */ false,
-                        DEFAULT_MAX_DB_SIZE,
+                        resolvedMaxDbSize,
                         /* autoCheckpoint */ true,
                         DEFAULT_CHECKPOINT_THRESHOLD);
                 openedConn = new Connection(openedDb);
@@ -202,13 +220,105 @@ public final class EmbeddedKuzu implements AutoCloseable {
         }
         this.database = openedDb;
         this.connection = openedConn;
+        // Single source of truth: the value we passed to Database(...) is what Kuzu actually
+        // enforces, and is also what the size monitor uses for its 75% / 90% thresholds.
+        this.maxDbSizeBytes = resolvedMaxDbSize;
         // Use all available cores. Kuzu's intra-query parallelism speeds up reads dramatically
         // and gives smaller gains on per-row writes (which serialize on the storage layer).
         try {
             this.connection.setMaxNumThreadForExec(Runtime.getRuntime().availableProcessors());
         } catch (RuntimeException ignored) { /* older Kuzu builds may not expose this */ }
         writeLockfile();
+        this.sizeMonitor = startSizeMonitor();
         log.debug("opened Kuzu database at {}", dbPath);
+    }
+
+    /**
+     * Schedule a daemon thread that walks the database directory every 30 s and warns when
+     * usage crosses 75% / 90% of {@link #maxDbSizeBytes}. Kuzu refuses writes once the on-disk
+     * size hits the configured max (the same value passed to the {@link Database} constructor);
+     * an early warning lets the operator prune projects, compact the DB, or raise the cap
+     * before scans start failing.
+     *
+     * <p>Runs an immediate check before scheduling so a DB that's already over threshold at
+     * boot is reported in the first second of the JVM's life, not after a full 30 s tick.
+     */
+    private ScheduledExecutorService startSizeMonitor() {
+        ScheduledExecutorService exec = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "cvector-kuzu-size-monitor");
+            t.setDaemon(true);
+            return t;
+        });
+        // Initial probe so a tight workspace is flagged immediately on open.
+        try { checkDbSize(); } catch (RuntimeException ignored) { }
+        // 10 s tick is light enough (walks ~10-20 files in the DB dir) to run continuously
+        // on the dashboard JVM and frequent enough that short CLI scans still see at least
+        // one tick before close(). Callers running one-shot, sub-tick scans should pair this
+        // with an explicit {@link #checkSizeNow()} after their final flush.
+        exec.scheduleAtFixedRate(this::checkDbSize, 10, 10, TimeUnit.SECONDS);
+        return exec;
+    }
+
+    /**
+     * Run an out-of-band size check. Callers use this after a known bulk-write step
+     * (the scan service after {@code flush()}, for example) so a JVM that exits before
+     * the next scheduled tick still emits the warning. Safe to call from any thread;
+     * no-op if the monitor was never armed.
+     */
+    public void checkSizeNow() {
+        try { checkDbSize(); } catch (RuntimeException ignored) { }
+    }
+
+    /**
+     * Walk {@link #dbPath} recursively, sum every regular file's size, and emit a one-line
+     * warning when usage crosses 75% or 90% of the configured max. Cleanups that drop usage
+     * back below 70% / 85% reset the corresponding latch so a recurrence emits a fresh
+     * warning instead of staying silent.
+     *
+     * <p>Best-effort: IO errors during the walk are swallowed (the monitor must never throw
+     * out to its scheduler thread, which would suppress all future ticks).
+     */
+    private void checkDbSize() {
+        long used = directorySizeBytes(dbPath);
+        if (used < 0) return; // walk failed; try again next tick
+        double pct = (double) used / (double) maxDbSizeBytes;
+        long usedMb = used / (1024 * 1024);
+        long maxMb = maxDbSizeBytes / (1024 * 1024);
+        int pctInt = (int) Math.round(pct * 100);
+        if (pct >= 0.90 && !warnedAt90) {
+            warnedAt90 = true;
+            log.warn("kuzu database at {} is at {} MB / {} MB ({}%) — Kuzu will refuse writes once it hits"
+                    + " 100% of maxDbSize ({}GB). Run cv_purge_orphans to drop unowned projects, or split"
+                    + " heavy projects into isolated=true workspaces with their own DB directories.",
+                    dbPath, usedMb, maxMb, pctInt, maxDbSizeBytes / (1024L * 1024 * 1024));
+        } else if (pct >= 0.75 && !warnedAt75) {
+            warnedAt75 = true;
+            log.warn("kuzu database at {} is at {} MB / {} MB ({}%) of its max size — consider running"
+                    + " cv_purge_orphans, moving large projects to isolated=true workspaces, or planning"
+                    + " for storage growth before hitting the 100% write-refusal cap.",
+                    dbPath, usedMb, maxMb, pctInt);
+        }
+        // Hysteresis: only re-arm the latches once usage has dropped meaningfully below the
+        // trigger so the log doesn't flap when something is right on a threshold.
+        if (pct < 0.85) warnedAt90 = false;
+        if (pct < 0.70) warnedAt75 = false;
+    }
+
+    /**
+     * Recursive byte-size of every regular file under {@code root}. Returns {@code -1} on
+     * any failure (missing directory, IO error, security manager denial) — callers treat
+     * that as "skip this tick" rather than throwing.
+     */
+    private static long directorySizeBytes(Path root) {
+        if (!Files.exists(root)) return -1;
+        try (Stream<Path> walk = Files.walk(root)) {
+            return walk.filter(Files::isRegularFile).mapToLong(p -> {
+                try { return Files.size(p); }
+                catch (IOException e) { return 0L; }
+            }).sum();
+        } catch (IOException | RuntimeException e) {
+            return -1;
+        }
     }
 
     /**
@@ -354,6 +464,31 @@ public final class EmbeddedKuzu implements AutoCloseable {
         } catch (NumberFormatException e) {
             return null;
         }
+    }
+
+    /**
+     * Resolve the {@code maxDbSize} value passed to Kuzu's {@code Database} constructor.
+     * Kuzu refuses writes once the on-disk size hits this cap, so the size monitor's
+     * thresholds (75% / 90%) are computed against the very same number. Precedence
+     * mirrors {@link #resolveBufferSize()}:
+     * <ol>
+     *   <li>{@code -Dcvector.kuzu.maxDbSizeMb=<N>} system property — explicit override.</li>
+     *   <li>{@code CVECTOR_KUZU_MAX_DB_SIZE_MB=<N>} env var.</li>
+     *   <li>Default {@link #DEFAULT_MAX_DB_SIZE} (64 GB).</li>
+     * </ol>
+     */
+    private static long resolveMaxDbSize() {
+        Long fromSysProp = parseMb(System.getProperty("cvector.kuzu.maxDbSizeMb"));
+        if (fromSysProp != null) {
+            log.info("Kuzu max DB size: {} MB (from -Dcvector.kuzu.maxDbSizeMb)", fromSysProp);
+            return fromSysProp * 1024L * 1024L;
+        }
+        Long fromEnv = parseMb(System.getenv("CVECTOR_KUZU_MAX_DB_SIZE_MB"));
+        if (fromEnv != null) {
+            log.info("Kuzu max DB size: {} MB (from CVECTOR_KUZU_MAX_DB_SIZE_MB)", fromEnv);
+            return fromEnv * 1024L * 1024L;
+        }
+        return DEFAULT_MAX_DB_SIZE;
     }
 
     /**
@@ -602,6 +737,11 @@ public final class EmbeddedKuzu implements AutoCloseable {
 
     @Override
     public void close() {
+        // Stop the size-monitor before tearing down the native handles. shutdownNow()
+        // interrupts any in-flight directory walk so the close path doesn't block on it.
+        if (sizeMonitor != null) {
+            try { sizeMonitor.shutdownNow(); } catch (RuntimeException ignored) { }
+        }
         synchronized (connLock) {
             for (PreparedStatement s : stmtCache.values()) {
                 try { s.close(); } catch (RuntimeException ignored) { }

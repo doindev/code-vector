@@ -168,6 +168,7 @@ public class InProcessScanService {
                         elapsedMs, parserMs, flushMs,
                         nodesUpserted, edgesUpserted,
                         linkedNow, rewiredNow, removed,
+                        stats.parseErrors(),
                         log.snapshot());
             }
         } finally {
@@ -236,6 +237,7 @@ public class InProcessScanService {
             long flushMs;
             int nodesUpserted;
             int edgesUpserted;
+            int parseErrors;
             Set<String> touchedNodeIds = null;
             try (GraphIngestor ingestor = empty
                     ? new KuzuBulkLoader(kuzu, scanStartInstant)
@@ -251,6 +253,7 @@ public class InProcessScanService {
                 filesScanned = stats.fileCount;
                 filesSkipped = stats.skippedCount;
                 parserMs = stats.elapsedMs;
+                parseErrors = stats.parseErrors;
                 nodesUpserted = ingestor.totalNodes();
                 edgesUpserted = ingestor.totalEdges();
 
@@ -258,6 +261,10 @@ public class InProcessScanService {
                         filesScanned, parserMs + flushMs, parserMs, flushMs));
                 log.line(String.format("nodes upserted: %d, edges upserted: %d", nodesUpserted, edgesUpserted));
                 if (ingestor instanceof KuzuIngestor ki) touchedNodeIds = ki.touchedNodeIds();
+                // Out-of-band size probe — guarantees the 75% / 90% warning fires before
+                // this short-lived CLI JVM exits, which can happen well within the
+                // monitor's scheduled tick interval on small scans.
+                kuzu.checkSizeNow();
             }
 
             int linkedNow = KuzuPostScan.resolveDeferredHandlers(kuzu, ctx.projectId());
@@ -281,6 +288,7 @@ public class InProcessScanService {
                     elapsedMs, parserMs, flushMs,
                     nodesUpserted, edgesUpserted,
                     linkedNow, rewiredNow, removed,
+                    parseErrors,
                     log.snapshot());
         } finally {
             if (!reuse) {
@@ -312,11 +320,23 @@ public class InProcessScanService {
     //  Parser walk (shared between embedded + Neo4j)
     // ===========================================================================================
 
-    private ScanStats runParsers(ProjectContext ctx, Path scanRoot, Consumer<GraphEvent> sink,
+    private ScanStats runParsers(ProjectContext ctx, Path scanRoot, Consumer<GraphEvent> rawSink,
                                  Map<String, FileSnapshot> existingFiles,
                                  Set<String> skipTouchedIds,
                                  ProgressSink log) throws Exception {
         for (Parser p : parsers) p.prepare(ctx);
+
+        // Tee the sink so we can count ParseError nodes as parsers emit them. This is the
+        // signal "this file needs attention" (per-file YAML tab errors, malformed JSON, etc.)
+        // — surfacing the count in ScanResult lets the dashboard / cv_scan_project response
+        // flag dirty scans without forcing callers to query the graph after every run.
+        AtomicInteger parseErrorCount = new AtomicInteger();
+        Consumer<GraphEvent> sink = ev -> {
+            if (ev instanceof GraphEvent.NodeUpsert up && "ParseError".equals(up.key().label())) {
+                parseErrorCount.incrementAndGet();
+            }
+            rawSink.accept(ev);
+        };
 
         // Pre-compute extension -> parsers map so dispatch is O(1) per file instead of O(N parsers).
         // Multiple parsers may claim the same extension (e.g. TypeScript + JavaScript both claim .js,
@@ -379,10 +399,16 @@ public class InProcessScanService {
         if (skippedCount > 0) {
             log.line(String.format("skipped %d unchanged file(s) via contentHash match", skippedCount));
         }
-        return new ScanStats(fileCount.get(), skippedCount, System.currentTimeMillis() - startMs);
+        int parseErrors = parseErrorCount.get();
+        if (parseErrors > 0) {
+            log.line(String.format("parse errors: %d file(s) need attention — query "
+                    + "`MATCH (e {label:\"ParseError\"}) RETURN e.path, e.value` or check cv_health",
+                    parseErrors));
+        }
+        return new ScanStats(fileCount.get(), skippedCount, parseErrors, System.currentTimeMillis() - startMs);
     }
 
-    private record ScanStats(int fileCount, int skippedCount, long elapsedMs) {}
+    private record ScanStats(int fileCount, int skippedCount, int parseErrors, long elapsedMs) {}
 
     public static void emitProjectNode(ProjectContext ctx, String head, Consumer<GraphEvent> sink) {
         NodeKey projectKey = new NodeKey(ctx.projectId(), "Project", ctx.projectId());
