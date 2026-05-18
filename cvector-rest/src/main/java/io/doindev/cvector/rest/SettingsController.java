@@ -116,7 +116,21 @@ public class SettingsController {
             if (!CvectorConfig.McpConfig.isValidTransport(transport)) {
                 transport = before.mcpOrDefault().transport();
             }
-            mcp = new CvectorConfig.McpConfig(url, transport);
+            CvectorConfig.McpConfig.McpTimeouts timeouts = mcp != null ? mcp.timeouts() : null;
+            if (m.get("timeouts") instanceof Map<?, ?> t) {
+                // Each field is optional and falls back to the prior persisted value when the
+                // PATCH omits it — lets the dashboard send "just requestTimeoutMs" without
+                // clobbering the other two.
+                Long requestTimeoutMs = toLong(t.get("requestTimeoutMs"),
+                        timeouts != null ? timeouts.requestTimeoutMs() : null);
+                Long keepAliveIntervalMs = toLong(t.get("keepAliveIntervalMs"),
+                        timeouts != null ? timeouts.keepAliveIntervalMs() : null);
+                Long asyncRequestTimeoutMs = toLong(t.get("asyncRequestTimeoutMs"),
+                        timeouts != null ? timeouts.asyncRequestTimeoutMs() : null);
+                timeouts = new CvectorConfig.McpConfig.McpTimeouts(
+                        requestTimeoutMs, keepAliveIntervalMs, asyncRequestTimeoutMs);
+            }
+            mcp = new CvectorConfig.McpConfig(url, transport, timeouts);
         }
         CvectorConfig.DockerConfig docker = before.docker();
         if (p.get("docker") instanceof Map<?, ?> d) {
@@ -162,6 +176,23 @@ public class SettingsController {
         if (o instanceof Number n) return n.intValue();
         if (o instanceof String s) {
             try { return Integer.parseInt(s.trim()); } catch (NumberFormatException ignored) { return fallback; }
+        }
+        return fallback;
+    }
+
+    /**
+     * Coerce a JSON number / numeric string into a {@code Long}. Returns {@code fallback}
+     * (which may itself be {@code null}, signalling "no override") for missing or
+     * unparseable input. Used by the mcp.timeouts PATCH path where every field is
+     * optional and {@code null} explicitly means "let the application default stand".
+     */
+    private static Long toLong(Object o, Long fallback) {
+        if (o == null) return fallback;
+        if (o instanceof Number n) return n.longValue();
+        if (o instanceof String s) {
+            String trimmed = s.trim();
+            if (trimmed.isEmpty()) return fallback;
+            try { return Long.parseLong(trimmed); } catch (NumberFormatException ignored) { return fallback; }
         }
         return fallback;
     }

@@ -80,8 +80,9 @@ interface StatusPayload {
             </label>
             <div class="input-group">
               <input class="form-control"
+                     name="newPath"
                      [ngModel]="newPath()"
-                     (ngModelChange)="newPath.set($event)"
+                     (ngModelChange)="onPathTyped($event)"
                      (keydown.enter)="add()"
                      [placeholder]="projectRoot() || 'C:\\path\\to\\project'" />
               <button class="btn btn-outline-secondary" type="button"
@@ -96,10 +97,23 @@ interface StatusPayload {
                 This path is outside the active project — the monitor will be rejected.
               </div>
             }
+            @if (pathCheck() === 'checking') {
+              <div class="form-text text-secondary">
+                <i class="bi bi-arrow-repeat"></i> verifying path…
+              </div>
+            } @else if (pathCheck() === 'invalid' && pathError()) {
+              <div class="form-text text-danger">
+                <i class="bi bi-x-circle"></i> {{ pathError() }}
+              </div>
+            } @else if (pathCheck() === 'valid' && newPath().trim()) {
+              <div class="form-text text-success">
+                <i class="bi bi-check-circle"></i> path exists on the server
+              </div>
+            }
           </div>
           <div class="col-md-3 d-flex gap-2">
             <button class="btn btn-primary flex-grow-1" (click)="add()"
-                    [disabled]="!newPath().trim() || saving()">
+                    [disabled]="!canAdd()">
               {{ saving() ? 'Saving…' : 'Add monitor' }}
             </button>
           </div>
@@ -215,6 +229,30 @@ export class MonitorsComponent implements OnInit {
   /** Latest /status response. Used to render per-row file-event counters + live badges. */
   readonly status = signal<StatusPayload | null>(null);
 
+  /**
+   * Live path-existence state for the inline input. {@code idle} = no input or not yet
+   * checked; {@code checking} = a debounced /fs/list probe is in flight; {@code valid} =
+   * backend confirmed the path exists and is a directory; {@code invalid} = path doesn't
+   * exist or isn't a directory (see {@link #pathError} for the server's reason). Used to
+   * render the inline feedback under the input and to gate the Add button.
+   */
+  readonly pathCheck = signal<'idle' | 'checking' | 'valid' | 'invalid'>('idle');
+  readonly pathError = signal<string>('');
+  /** Cancels in-flight check timer so the latest typing wins. */
+  private pathCheckTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Tracks which input value the in-flight check corresponds to so a stale response can't overwrite a newer one. */
+  private pathCheckTarget = '';
+
+  /** Add button gating: non-empty + done checking + valid (+ if a project root is known, inside it). */
+  readonly canAdd = computed(() => {
+    if (this.saving()) return false;
+    const p = this.newPath().trim();
+    if (!p) return false;
+    if (this.pathCheck() !== 'valid') return false;
+    if (this.projectRoot() && !this.pathInsideProject()) return false;
+    return true;
+  });
+
   ngOnInit(): void {
     this.refresh();
     this.refreshStatus();
@@ -303,5 +341,58 @@ export class MonitorsComponent implements OnInit {
   onPickerSelect(path: string): void {
     this.newPath.set(path);
     this.pickerOpen.set(false);
+    // Picker already navigated successfully to this path, so we know it exists. Skip the
+    // round-trip and mark valid directly — the operator gets immediate feedback.
+    this.pathCheck.set('valid');
+    this.pathError.set('');
+  }
+
+  /**
+   * Two-way binding handler for the path input. Updates the signal immediately so the
+   * displayed value tracks typing 1:1, then debounces a backend validation probe so we
+   * don't hammer {@code /fs/list} on every keystroke. The probe resolves to either
+   * {@code valid} (path exists + is a directory) or {@code invalid} (404 / wrong type /
+   * permission denied) with the server's message surfaced inline. The button can't be
+   * clicked until the probe lands a {@code valid} verdict, so the operator can't submit
+   * a typo and get an opaque rejection from the monitor-add endpoint downstream.
+   */
+  onPathTyped(value: string): void {
+    this.newPath.set(value);
+    this.error.set('');  // clear any "Failed to add monitor" leftover
+    const trimmed = value.trim();
+    if (this.pathCheckTimer) clearTimeout(this.pathCheckTimer);
+    if (!trimmed) {
+      this.pathCheck.set('idle');
+      this.pathError.set('');
+      return;
+    }
+    this.pathCheck.set('checking');
+    this.pathCheckTarget = trimmed;
+    // 350 ms debounce — quick enough to feel reactive, slow enough that a fast typist
+    // doesn't trigger a probe per character.
+    this.pathCheckTimer = setTimeout(() => this.verifyPath(trimmed), 350);
+  }
+
+  private verifyPath(path: string): void {
+    const params = new URLSearchParams({ path });
+    this.http.get<{ path: string; parent: string | null; items: unknown[] }>(
+      `/api/dashboard/fs/list?${params.toString()}`,
+    ).subscribe({
+      next: () => {
+        // Guard against stale responses overwriting a newer probe's result.
+        if (this.pathCheckTarget !== path) return;
+        this.pathCheck.set('valid');
+        this.pathError.set('');
+      },
+      error: (err) => {
+        if (this.pathCheckTarget !== path) return;
+        const msg = err?.error?.error
+            ?? err?.error?.message
+            ?? err?.message
+            ?? 'path could not be verified';
+        this.pathCheck.set('invalid');
+        this.pathError.set(msg);
+      },
+    });
   }
 }

@@ -73,6 +73,7 @@ public class CvectorApplication implements CommandLineRunner, ExitCodeGenerator 
             Map<String, Object> serverMap = null;
             String mcpTransport = CvectorConfig.McpConfig.TRANSPORT_HTTP;
             String mcpHttpPath = null;
+            CvectorConfig.McpConfig.McpTimeouts mcpTimeouts = null;
             try {
                 CvectorConfigService svc = new CvectorConfigService();
                 Path root = svc.findConfigRoot(Paths.get("").toAbsolutePath());
@@ -85,6 +86,7 @@ public class CvectorApplication implements CommandLineRunner, ExitCodeGenerator 
                     CvectorConfig.McpConfig mcpCfg = cfg.mcpOrDefault();
                     mcpTransport = CvectorConfig.McpConfig.canonicalTransport(mcpCfg.transport());
                     mcpHttpPath = extractMcpSsePath(mcpCfg.url(), host, port);
+                    mcpTimeouts = mcpCfg.timeouts();
                 }
             } catch (Exception ignored) {
                 // Boot with defaults; the operator can fix settings.json and restart.
@@ -150,6 +152,7 @@ public class CvectorApplication implements CommandLineRunner, ExitCodeGenerator 
                     serverOverrides.put("spring.ai.mcp.server.streamable-http.mcp-endpoint",
                             mcpHttpPath != null && !mcpHttpPath.isBlank() ? mcpHttpPath : "/mcp");
                 }
+                applyMcpTimeouts(mcpTransport, mcpTimeouts, serverOverrides);
             }
             applySystemProperties(serverOverrides);
             builder.web(WebApplicationType.SERVLET).properties(defaultProps.toArray(String[]::new));
@@ -224,6 +227,44 @@ public class CvectorApplication implements CommandLineRunner, ExitCodeGenerator 
             System.err.println("warning: could not parse mcp.url '" + mcpUrl + "': " + e.getMessage()
                     + " — falling back to /sse");
             return null;
+        }
+    }
+
+    /**
+     * Translate the optional {@code mcp.timeouts} settings.json section into the matching
+     * Spring AI / Spring MVC system properties. Each field is independent and only emits a
+     * property when non-null — a {@code null} (or omitted) field leaves the application-mcp
+     * default in place. The keep-alive property key depends on which HTTP transport is
+     * active because Spring AI uses different config sub-namespaces for SSE vs Streamable.
+     *
+     * <p>This method only writes to the {@code serverOverrides} map; the caller's existing
+     * {@link #applySystemProperties} step is what actually pushes them onto the JVM, so the
+     * "command-line -D wins" semantics still apply to these knobs.
+     */
+    private static void applyMcpTimeouts(String transport,
+                                         CvectorConfig.McpConfig.McpTimeouts timeouts,
+                                         Map<String, String> serverOverrides) {
+        if (timeouts == null) return;
+        if (timeouts.requestTimeoutMs() != null && timeouts.requestTimeoutMs() > 0) {
+            // Spring AI parses java.time.Duration; the `ms` suffix is the canonical
+            // milliseconds form recognised by Spring Boot's Duration binder.
+            serverOverrides.put("spring.ai.mcp.server.request-timeout",
+                    timeouts.requestTimeoutMs() + "ms");
+        }
+        if (timeouts.keepAliveIntervalMs() != null && timeouts.keepAliveIntervalMs() > 0) {
+            // Streamable HTTP and SSE expose keep-alive under different property keys.
+            // Pick the matching one so the same settings.json field works regardless of
+            // which transport the user picked.
+            String key = CvectorConfig.McpConfig.TRANSPORT_SSE.equalsIgnoreCase(transport)
+                    ? "spring.ai.mcp.server.keep-alive-interval"
+                    : "spring.ai.mcp.server.streamable-http.keep-alive-interval";
+            serverOverrides.put(key, timeouts.keepAliveIntervalMs() + "ms");
+        }
+        if (timeouts.asyncRequestTimeoutMs() != null) {
+            // -1 disables the timeout (Spring MVC's "no async ceiling") — application-mcp's
+            // default. Positive values evict idle SSE / Streamable-HTTP streams sooner.
+            serverOverrides.put("spring.mvc.async.request-timeout",
+                    String.valueOf(timeouts.asyncRequestTimeoutMs()));
         }
     }
 
