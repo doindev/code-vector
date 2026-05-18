@@ -7,6 +7,8 @@ import io.doindev.cvector.core.ProjectContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.yaml.snakeyaml.Yaml;
+import org.yaml.snakeyaml.error.Mark;
+import org.yaml.snakeyaml.error.MarkedYAMLException;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -43,8 +45,67 @@ public class YamlParserAdapter implements Parser {
                 flatten("", doc, ctx, fileKey, sink);
             }
         } catch (IOException | RuntimeException e) {
-            log.warn("failed to parse yaml {}: {}", file, e.getMessage());
+            // YAML parse failures shouldn't disappear into a stderr line — surface them as
+            // queryable graph nodes so `cv_health`, the dashboard, and any rule looking for
+            // "files that need attention" can see them. The tab-character-in-yaml case
+            // (ScannerException with a precise Mark) is the canonical example; the same
+            // path catches every other YAMLException / IOException too.
+            emitParseError(file, relPath, ctx, fileKey, e, sink);
         }
+    }
+
+    /**
+     * Emit a {@code ParseError} node + a {@code CONTAINS} edge from the offending file. The
+     * node carries enough info for a human reader to find the bad line: line + column when
+     * we can extract them from a {@link MarkedYAMLException} (covers SnakeYAML's
+     * {@code ScannerException}, {@code ParserException}, {@code ComposerException},
+     * {@code ConstructorException}), plus the exception class name and the raw message.
+     *
+     * <p>The fqName uses {@code <path>#<line>:<col>} (or {@code <path>#unknown} when the
+     * exception has no mark) so two errors in the same file don't collapse to one node via
+     * NodeKey deduplication.
+     */
+    private void emitParseError(Path file, String relPath, ProjectContext ctx, NodeKey fileKey,
+                                Throwable t, Consumer<GraphEvent> sink) {
+        int line = -1;
+        int col = -1;
+        if (t instanceof MarkedYAMLException mye) {
+            Mark mark = mye.getProblemMark();
+            if (mark != null) {
+                // SnakeYAML's Mark is 0-indexed; humans count from 1.
+                line = mark.getLine() + 1;
+                col = mark.getColumn() + 1;
+            }
+        }
+        String posSuffix = (line > 0)
+                ? ("#" + line + ":" + (col > 0 ? col : "?"))
+                : "#unknown";
+        String fqName = relPath + posSuffix;
+        String displayName = relPath + (line > 0 ? (":" + line + (col > 0 ? (":" + col) : "")) : "");
+        NodeKey errKey = new NodeKey(ctx.projectId(), "ParseError", fqName);
+        String message = t.getMessage() == null ? t.getClass().getSimpleName() : t.getMessage();
+        // Bound the stored message so a runaway exception trace can't blow up the row size.
+        if (message.length() > 2000) message = message.substring(0, 2000) + "… (truncated)";
+
+        Map<String, Object> props = new HashMap<>();
+        props.put("name", displayName);
+        props.put("fqName", fqName);
+        props.put("path", relPath);
+        props.put("language", "yaml");
+        props.put("fileId", fileKey.id());
+        if (line > 0) {
+            props.put("startLine", (long) line);
+            props.put("endLine", (long) line);
+        }
+        if (col > 0) props.put("column", (long) col); // reuses no existing column; safely ignored by schemas without it
+        props.put("value", message);
+        // `source` is a free-form text column already on Node — repurpose it to carry the
+        // exception class name so consumers can filter "yaml syntax error" vs "io error".
+        props.put("source", t.getClass().getSimpleName());
+        sink.accept(new GraphEvent.NodeUpsert(errKey, props));
+        sink.accept(new GraphEvent.EdgeUpsert(fileKey, "CONTAINS", errKey, Map.of()));
+
+        log.warn("yaml parse error in {} at line {} col {}: {}", relPath, line, col, message);
     }
 
     private void flatten(String prefix, Object node, ProjectContext ctx, NodeKey fileKey, Consumer<GraphEvent> sink) {

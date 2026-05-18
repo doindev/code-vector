@@ -25,5 +25,12 @@ public record ScanResult(
         int handlersLinked,
         int callsResolved,
         int staleRemoved,
+        /**
+         * Count of files that failed to parse cleanly and produced a {@code ParseError} graph
+         * node instead of their normal node set. Non-zero means at least one file needs attention
+         * — query {@code MATCH (e {label:"ParseError"}) RETURN e.path, e.value} (or hit
+         * {@code /api/health} / {@code cv_health}) to see the offenders. Zero on clean scans.
+         */
+        int parseErrors,
         List<String> log) {
 }
