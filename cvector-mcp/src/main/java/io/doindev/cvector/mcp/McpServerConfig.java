@@ -101,8 +101,9 @@ public class McpServerConfig {
 
     @Bean
     public CvectorTools cvectorTools(GraphStore graphStore, ProjectResolver projectResolver,
-                                     CvectorScanService cvectorScanService, JobRegistry jobRegistry) {
-        return new CvectorTools(graphStore, projectResolver, cvectorScanService, jobRegistry);
+                                     CvectorScanService cvectorScanService, JobRegistry jobRegistry,
+                                     org.springframework.context.ApplicationEventPublisher events) {
+        return new CvectorTools(graphStore, projectResolver, cvectorScanService, jobRegistry, events);
     }
 
     @Bean

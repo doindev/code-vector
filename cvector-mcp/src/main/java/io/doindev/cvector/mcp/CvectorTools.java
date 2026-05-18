@@ -2,6 +2,7 @@ package io.doindev.cvector.mcp;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.doindev.cvector.core.config.ActiveProjectChangedEvent;
 import io.doindev.cvector.core.config.CvectorConfig;
 import io.doindev.cvector.core.config.CvectorConfig.ProjectEntry;
 import io.doindev.cvector.core.store.GraphStore;
@@ -13,6 +14,7 @@ import io.doindev.cvector.rules.RulesEngine;
 import io.doindev.cvector.rules.Violation;
 import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
+import org.springframework.context.ApplicationEventPublisher;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -60,13 +62,39 @@ public class CvectorTools {
     private final ProjectResolver projects;
     private final CvectorScanService scanService;
     private final JobRegistry jobs;
+    /**
+     * Used to fire {@link ActiveProjectChangedEvent} whenever an MCP tool mutates
+     * {@code settings.json}'s {@code activeProject}. The dashboard's WorkspaceSwitcher
+     * listens to this event so its in-memory {@code ActiveProject} bean (and dependent
+     * caches) stay in sync without forcing a process restart. Optional — in
+     * {@code cvector serve} (stdio-only) there's no listener, so the event is a no-op
+     * but harmless. Null when running in a context where the publisher isn't injected
+     * (e.g. unit tests).
+     */
+    private final ApplicationEventPublisher events;
 
     public CvectorTools(GraphStore store, ProjectResolver projects, CvectorScanService scanService,
-                        JobRegistry jobs) {
+                        JobRegistry jobs, ApplicationEventPublisher events) {
         this.store = store;
         this.projects = projects;
         this.scanService = scanService;
         this.jobs = jobs;
+        this.events = events;
+    }
+
+    /**
+     * Best-effort fire of {@link ActiveProjectChangedEvent}. Null-safe so unit tests
+     * that construct {@code CvectorTools} without a publisher don't NPE here.
+     */
+    private void publishActiveProjectChanged(String newName, String newProjectId,
+                                             String previousName, String reason) {
+        if (events == null) return;
+        try {
+            events.publishEvent(new ActiveProjectChangedEvent(newName, newProjectId, previousName, reason));
+        } catch (RuntimeException ignored) {
+            // Listeners can throw; we never want a listener failure to break the tool call's
+            // primary contract (settings.json was already saved). Swallow and continue.
+        }
     }
 
     // ===========================================================================================
@@ -122,6 +150,7 @@ public class CvectorTools {
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
+        publishActiveProjectChanged(newActive, target.projectId(), previous, "cv_set_default_project");
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("ok", true);
         out.put("previousDefault", previous);
@@ -147,14 +176,22 @@ public class CvectorTools {
         Boolean isolatedFlag = Boolean.TRUE.equals(isolated) ? Boolean.TRUE : null;
         ProjectEntry created = new ProjectEntry(projectId, name, normalised.toString(), null, isolatedFlag);
         updated.put(name, created);
+        String previousActive = cfg.activeProject();
+        String resolvedActive = previousActive != null ? previousActive : name;
         CvectorConfig next = new CvectorConfig(
-                cfg.activeProject() != null ? cfg.activeProject() : name,
+                resolvedActive,
                 updated, cfg.neo4j(), cfg.backend(), cfg.rest(), cfg.mcp(), cfg.docker(),
                 cfg.rules(), cfg.kuzu());
         try {
             projects.service().save(projects.configRoot(), next);
         } catch (IOException e) {
             throw new UncheckedIOException(e);
+        }
+        if (!resolvedActive.equals(previousActive)) {
+            // First project in the workspace — settings.json went from no active project to
+            // this one. The dashboard's ActiveProject bean needs to learn about it so
+            // /api/projects stops returning the empty-workspace placeholder.
+            publishActiveProjectChanged(resolvedActive, projectId, previousActive, "cv_add_project");
         }
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("ok", true);
@@ -204,9 +241,11 @@ public class CvectorTools {
         CvectorConfig cfg = projects.loadConfig();
         Map<String, ProjectEntry> updated = new LinkedHashMap<>(cfg.projects());
         updated.remove(target.name());
-        String nextActive = target.name().equals(cfg.activeProject())
+        String previousActive = cfg.activeProject();
+        boolean activeWasRemoved = target.name().equals(previousActive);
+        String nextActive = activeWasRemoved
                 ? (updated.isEmpty() ? null : updated.keySet().iterator().next())
-                : cfg.activeProject();
+                : previousActive;
         CvectorConfig next = new CvectorConfig(
                 nextActive, updated, cfg.neo4j(), cfg.backend(), cfg.rest(), cfg.mcp(), cfg.docker(),
                 cfg.rules(), cfg.kuzu());
@@ -214,6 +253,17 @@ public class CvectorTools {
             projects.service().save(projects.configRoot(), next);
         } catch (IOException e) {
             throw new UncheckedIOException(e);
+        }
+        if (activeWasRemoved) {
+            // The dashboard's in-memory ActiveProject bean still points at the project we
+            // just deleted. Without this notification, /api/health and every per-project
+            // endpoint serves stale data tied to a projectId that no longer exists. The
+            // listener in cvector-rest calls WorkspaceSwitcher.switchTo(...) to swap the
+            // bean (and flush caches) before the next dashboard request lands.
+            String nextActiveProjectId = nextActive != null && updated.get(nextActive) != null
+                    ? updated.get(nextActive).projectId()
+                    : null;
+            publishActiveProjectChanged(nextActive, nextActiveProjectId, previousActive, "cv_remove_project");
         }
         out.put("removed", true);
         // Report the actual delete count so the caller can verify the operation against the
