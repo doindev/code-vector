@@ -261,6 +261,10 @@ public class InProcessScanService {
                         filesScanned, parserMs + flushMs, parserMs, flushMs));
                 log.line(String.format("nodes upserted: %d, edges upserted: %d", nodesUpserted, edgesUpserted));
                 if (ingestor instanceof KuzuIngestor ki) touchedNodeIds = ki.touchedNodeIds();
+                // Out-of-band size probe — guarantees the 75% / 90% warning fires before
+                // this short-lived CLI JVM exits, which can happen well within the
+                // monitor's scheduled tick interval on small scans.
+                kuzu.checkSizeNow();
             }
 
             int linkedNow = KuzuPostScan.resolveDeferredHandlers(kuzu, ctx.projectId());
