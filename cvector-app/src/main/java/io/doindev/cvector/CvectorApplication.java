@@ -1,5 +1,6 @@
 package io.doindev.cvector;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.doindev.cvector.cli.CvectorCommand;
 import io.doindev.cvector.core.config.CvectorConfig;
 import io.doindev.cvector.core.config.CvectorConfigService;
@@ -9,7 +10,9 @@ import org.springframework.boot.ExitCodeGenerator;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.WebApplicationType;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.builder.SpringApplicationBuilder;
+import org.springframework.context.annotation.Bean;
 import picocli.CommandLine;
 import picocli.CommandLine.IFactory;
 
@@ -62,8 +65,8 @@ public class CvectorApplication implements CommandLineRunner, ExitCodeGenerator 
             int port = 2969;
             String host = "127.0.0.1";
             Map<String, Object> serverMap = null;
-            String mcpTransport = CvectorConfig.McpConfig.TRANSPORT_SSE;
-            String mcpSseEndpoint = null;
+            String mcpTransport = CvectorConfig.McpConfig.TRANSPORT_STREAMABLE;
+            String mcpHttpPath = null;
             try {
                 CvectorConfigService svc = new CvectorConfigService();
                 Path root = svc.findConfigRoot(Paths.get("").toAbsolutePath());
@@ -74,8 +77,8 @@ public class CvectorApplication implements CommandLineRunner, ExitCodeGenerator 
                     if (rest.host() != null && !rest.host().isBlank()) host = rest.host();
                     serverMap = rest.server();
                     CvectorConfig.McpConfig mcpCfg = cfg.mcpOrDefault();
-                    mcpTransport = mcpCfg.transport();
-                    mcpSseEndpoint = extractMcpSsePath(mcpCfg.url(), host, port);
+                    mcpTransport = CvectorConfig.McpConfig.canonicalTransport(mcpCfg.transport());
+                    mcpHttpPath = extractMcpSsePath(mcpCfg.url(), host, port);
                 }
             } catch (Exception ignored) {
                 // Boot with defaults; the operator can fix settings.json and restart.
@@ -83,8 +86,9 @@ public class CvectorApplication implements CommandLineRunner, ExitCodeGenerator 
             // Co-host the MCP server with the dashboard unless the user opted out by setting
             // mcp.transport: "stdio" — stdio MCP can't be paired with an HTTP dashboard from
             // the same terminal (the JSON-RPC reader would race the user for stdin), so we
-            // skip the profile entirely and `cvector dashboard` runs alone. "http" / "sse"
-            // both wire Spring AI's WebMVC MCP transport into Tomcat.
+            // skip the profile entirely and `cvector dashboard` runs alone. "streamable" /
+            // "sse" both wire Spring AI's WebMVC MCP transport into Tomcat — which one is
+            // determined below by spring.ai.mcp.server.protocol.
             boolean coHostMcp = !CvectorConfig.McpConfig.TRANSPORT_STDIO.equalsIgnoreCase(mcpTransport);
             // Defaults via .properties() — lowest precedence, env vars and any user-set
             // settings.json values below will override.
@@ -110,23 +114,36 @@ public class CvectorApplication implements CommandLineRunner, ExitCodeGenerator 
             if (serverMap != null) flattenServerProps("server", serverMap, serverOverrides);
             // application-mcp.properties pins spring.ai.mcp.server.stdio=true for `cvector serve`.
             // When co-hosting MCP with the dashboard we want HTTP transport instead, so flip
-            // stdio off and pin the message endpoint to /mcp to match the documented default
-            // mcp.url. System properties (slot 6) beat profile-specific application properties
-            // (slot 9), so the override here wins over what the mcp profile loads. `if
-            // (System.getProperty(key) == null)` semantics in applySystemProperties still let
-            // an explicit -Dspring.ai… on the cvector command line take priority.
+            // stdio off and select the active HTTP protocol via spring.ai.mcp.server.protocol
+            // (Spring AI 2.0 picks ONE of SSE / STREAMABLE / STATELESS based on this property
+            // and conditionally wires the matching auto-config). System properties (slot 6)
+            // beat profile-specific application properties (slot 9), so these overrides win
+            // over what the mcp profile loads. `if (System.getProperty(key) == null)`
+            // semantics in applySystemProperties still let an explicit -Dspring.ai… on the
+            // cvector command line take priority.
             if (coHostMcp) {
                 serverOverrides.put("spring.ai.mcp.server.stdio", "false");
-                // SSE subscription endpoint: derived from settings.json mcp.url path so
-                // operators who want the SSE handler at a non-default path (e.g.
-                // /mcp/cvector) can express that in one place. Falls back to /sse when
-                // mcp.url is absent or its path is empty.
-                serverOverrides.put("spring.ai.mcp.server.sse-endpoint",
-                        mcpSseEndpoint != null && !mcpSseEndpoint.isBlank() ? mcpSseEndpoint : "/sse");
-                // Message POST endpoint: stays at /mcp. Spring AI emits a session-keyed
-                // URL like /mcp?sessionId=… in the `endpoint` SSE event, so clients
-                // never need to know this path verbatim.
-                serverOverrides.put("spring.ai.mcp.server.sse-message-endpoint", "/mcp");
+                if (CvectorConfig.McpConfig.TRANSPORT_SSE.equalsIgnoreCase(mcpTransport)) {
+                    // MCP 2024-11-05 "HTTP+SSE" transport — two endpoints, sessionId on the
+                    // query param. Spring AI emits the per-session URL like
+                    // /mcp/message?sessionId=… in the `endpoint` SSE event, so clients
+                    // never need to know the POST path verbatim. We honour mcp.url's path
+                    // component as the SSE GET path so an operator who set the URL to
+                    // .../sse/cvector gets the handler at the matching location.
+                    serverOverrides.put("spring.ai.mcp.server.protocol", "SSE");
+                    serverOverrides.put("spring.ai.mcp.server.sse-endpoint",
+                            mcpHttpPath != null && !mcpHttpPath.isBlank() ? mcpHttpPath : "/sse");
+                    serverOverrides.put("spring.ai.mcp.server.sse-message-endpoint", "/mcp/message");
+                } else {
+                    // MCP 2025-03-26 "Streamable HTTP" transport — single endpoint, session
+                    // on Mcp-Session-Id header. Default for new installs; modern MCP clients
+                    // (Eclipse Copilot, MCP Inspector v2, newer Claude integrations) speak
+                    // this. mcp.url's path component drives the endpoint location, falling
+                    // back to /mcp.
+                    serverOverrides.put("spring.ai.mcp.server.protocol", "STREAMABLE");
+                    serverOverrides.put("spring.ai.mcp.server.streamable-http.mcp-endpoint",
+                            mcpHttpPath != null && !mcpHttpPath.isBlank() ? mcpHttpPath : "/mcp");
+                }
             }
             applySystemProperties(serverOverrides);
             builder.web(WebApplicationType.SERVLET).properties(defaultProps.toArray(String[]::new));
@@ -225,5 +242,23 @@ public class CvectorApplication implements CommandLineRunner, ExitCodeGenerator 
     @Override
     public int getExitCode() {
         return exitCode;
+    }
+
+    /**
+     * Jackson 2 {@link ObjectMapper} bean — restored manually because Spring Boot 4 dropped
+     * the {@code JacksonAutoConfiguration} that used to auto-create one. Boot 4 now ships
+     * the new {@code tools.jackson.databind.json.JsonMapper} (Jackson 3) as the default,
+     * but most of cvector still wires the Jackson 2 type (JsonCache, SettingsController,
+     * AuditService, CvectorTools, ...). Rather than migrate every call site to Jackson 3,
+     * we keep Jackson 2 on the classpath (already transitively present) and re-expose its
+     * ObjectMapper here. {@code @ConditionalOnMissingBean} keeps the door open for a
+     * future migration: any module that wants to provide a customised ObjectMapper —
+     * e.g. with extra modules registered — can just declare its own bean and ours steps
+     * aside.
+     */
+    @Bean
+    @ConditionalOnMissingBean
+    public ObjectMapper objectMapper() {
+        return new ObjectMapper();
     }
 }

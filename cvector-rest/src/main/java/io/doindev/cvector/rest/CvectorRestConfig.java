@@ -105,7 +105,7 @@ public class CvectorRestConfig {
      */
     @Bean
     public org.springframework.boot.web.server.WebServerFactoryCustomizer<
-            org.springframework.boot.web.embedded.tomcat.TomcatServletWebServerFactory> tomcatWriteBufferCustomizer() {
+            org.springframework.boot.tomcat.servlet.TomcatServletWebServerFactory> tomcatWriteBufferCustomizer() {
         return factory -> factory.addConnectorCustomizers(connector -> {
             connector.setProperty("socket.appWriteBufSize", "65536");
             connector.setProperty("socket.appReadBufSize", "65536");

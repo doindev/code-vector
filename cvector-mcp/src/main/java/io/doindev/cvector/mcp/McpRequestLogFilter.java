@@ -81,15 +81,23 @@ public class McpRequestLogFilter extends OncePerRequestFilter {
         long start = System.nanoTime();
         String method = request.getMethod();
         String path = request.getRequestURI();
-        String sessionId = request.getParameter("sessionId");
-        // Only serialise the POST path — the SSE GET is the long-lived response stream and
-        // serialising it would prevent any concurrency at all. The race only happens when
-        // two POSTs both try to write back through the SAME sseBuilder for the same
-        // session, so the lock is keyed by sessionId and scoped to POST handling.
-        boolean serialise = "POST".equals(method) && sessionId != null && path != null && path.startsWith("/mcp");
+        // SSE (legacy, 2024-11-05) keys the session via ?sessionId=… on POSTs.
+        // Streamable HTTP (2025-03-26) keys it via the Mcp-Session-Id header.
+        // Read both so the log line is useful regardless of which transport is active.
+        String sseSessionId = request.getParameter("sessionId");
+        String streamableSessionId = request.getHeader("Mcp-Session-Id");
+        String sessionId = sseSessionId != null ? sseSessionId : streamableSessionId;
+        // Only serialise the legacy-SSE POST path — Spring AI 1.x's
+        // WebMvcMcpSessionTransport writes responses through a shared SseBuilder bound to
+        // the SSE GET request, and that builder is not thread-safe. Streamable HTTP doesn't
+        // share a single builder across concurrent POSTs (each request has its own response
+        // body) so the lock is unnecessary and would just block parallel tool calls. Gate
+        // on the *query param* (legacy SSE only) rather than on `sessionId != null`.
+        boolean serialise = "POST".equals(method) && sseSessionId != null
+                && path != null && path.startsWith("/mcp");
         try {
             if (serialise) {
-                Object lock = sessionLocks.computeIfAbsent(sessionId, k -> new Object());
+                Object lock = sessionLocks.computeIfAbsent(sseSessionId, k -> new Object());
                 synchronized (lock) {
                     chain.doFilter(request, response);
                 }

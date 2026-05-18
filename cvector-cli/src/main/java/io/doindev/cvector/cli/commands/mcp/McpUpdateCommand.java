@@ -12,17 +12,18 @@ import java.nio.file.Path;
 import java.util.concurrent.Callable;
 
 /**
- * {@code cvector mcp update --transport <http|sse> <URL>}. Writes the mcp section of
- * settings.json and exits. Validates transport up front so an invalid value can't silently
- * land in the file.
+ * {@code cvector mcp update --transport <streamable|sse|stdio> <URL>}. Writes the mcp section
+ * of settings.json and exits. Validates transport up front so an invalid value can't silently
+ * land in the file. The legacy {@code http} alias is accepted and stored as {@code streamable}.
  */
 @Component
 @Command(name = "update", description = "Update the MCP connection settings in .cvector/settings.json.",
         mixinStandardHelpOptions = true)
 public class McpUpdateCommand implements Callable<Integer> {
 
-    @Option(names = "--transport", description = "Transport: http (default), sse, or stdio.",
-            defaultValue = CvectorConfig.McpConfig.TRANSPORT_HTTP)
+    @Option(names = "--transport", description = "Transport: streamable (default), sse, or stdio. "
+            + "'http' is accepted as a legacy alias for streamable.",
+            defaultValue = CvectorConfig.McpConfig.TRANSPORT_STREAMABLE)
     private String transport;
 
     @Parameters(index = "0", arity = "0..1",
@@ -39,15 +40,16 @@ public class McpUpdateCommand implements Callable<Integer> {
     @Override
     public Integer call() throws Exception {
         if (!CvectorConfig.McpConfig.isValidTransport(transport)) {
-            System.err.println("invalid --transport: '" + transport + "' (allowed: http, sse, stdio)");
+            System.err.println("invalid --transport: '" + transport + "' (allowed: streamable, sse, stdio; 'http' accepted as alias for streamable)");
             return 2;
         }
         Path root = runtime.resolveConfigRoot();
         CvectorConfigService svc = runtime.configService();
+        String canonical = CvectorConfig.McpConfig.canonicalTransport(transport);
         CvectorConfig updated = svc.update(root, before -> {
             CvectorConfig.McpConfig current = before.mcpOrDefault();
             String newUrl = (url == null || url.isBlank()) ? current.url() : url;
-            CvectorConfig.McpConfig next = new CvectorConfig.McpConfig(newUrl, transport.toLowerCase());
+            CvectorConfig.McpConfig next = new CvectorConfig.McpConfig(newUrl, canonical);
             return new CvectorConfig(
                     before.activeProject(), before.projects(), before.neo4j(),
                     before.backend(), before.rest(), next, before.docker(), before.rules(), before.kuzu());

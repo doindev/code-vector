@@ -14,7 +14,13 @@ import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { ThemeService } from '../../core/theme.service';
 
 type Backend = 'embedded' | 'remote' | 'docker';
-type Transport = 'http' | 'sse' | 'stdio';
+/**
+ * MCP transport options surfaced in the dashboard. The backend canonicalises legacy
+ * {@code 'http'} into {@code 'streamable'} before persisting, so we never need to display
+ * 'http' as a separate choice — but we accept it on the wire for back-compat with older
+ * settings.json files. See {@code CvectorConfig.McpConfig.canonicalTransport}.
+ */
+type Transport = 'streamable' | 'sse' | 'stdio' | 'http';
 
 interface RestSection { port: number; host: string; }
 interface McpSection { url: string; transport: Transport; }
@@ -189,14 +195,32 @@ interface SettingsPatch {
             <div class="mb-3">
               <label class="form-label small text-secondary">Transport</label>
               <select class="form-select" [(ngModel)]="mcpTransport" name="mcpTransport">
-                <option value="sse">sse (default — Spring AI 1.0.0 only supports SSE)</option>
-                <option value="http">http (alias for sse — kept for back-compat)</option>
-                <option value="stdio">stdio (use cvector serve instead)</option>
+                <option value="streamable">streamable (default — MCP 2025-03-26 HTTP; Eclipse Copilot, Inspector v2, newer Claude)</option>
+                <option value="sse">sse (legacy — MCP 2024-11-05 HTTP+SSE; original Claude Desktop, MCP Inspector v1)</option>
+                <option value="stdio">stdio (subprocess JSON-RPC — use 'cvector serve' on the client side)</option>
               </select>
             </div>
+            @if (mcpTransport() === 'stdio') {
+              <div class="alert alert-info small p-2 mb-3">
+                <i class="bi bi-info-circle"></i>
+                stdio can't run alongside the dashboard from one terminal — the JSON-RPC
+                reader would race the user for stdin. The dashboard will boot without an
+                HTTP MCP transport; clients should spawn <code>cvector serve</code> as a
+                subprocess instead.
+              </div>
+            }
             <div class="mb-3">
               <label class="form-label small text-secondary">URL</label>
               <input class="form-control font-monospace" [(ngModel)]="mcpUrl" name="mcpUrl" />
+              <div class="form-text small">
+                @if (mcpTransport() === 'streamable') {
+                  Single endpoint; session via the <code>Mcp-Session-Id</code> header. Default path: <code>/mcp</code>.
+                } @else if (mcpTransport() === 'sse') {
+                  GET <code>/sse</code> opens the stream; POSTs go to <code>/mcp/message?sessionId=…</code>.
+                } @else {
+                  Informational only — stdio clients spawn the cvector subprocess directly.
+                }
+              </div>
             </div>
             <button class="btn cv-bg-accent btn-sm" (click)="saveMcp()">Save MCP</button>
           </div>
@@ -254,7 +278,7 @@ export class SettingsComponent implements OnInit {
   readonly restHost = signal<string>('127.0.0.1');
   readonly restPort = signal<number>(2969);
   readonly mcpUrl = signal<string>('');
-  readonly mcpTransport = signal<Transport>('sse');
+  readonly mcpTransport = signal<Transport>('streamable');
   readonly dockerImage = signal<string>('neo4j');
   readonly dockerVersion = signal<string>('5');
   readonly dockerContainer = signal<string>('cvector-neo4j');
@@ -286,7 +310,11 @@ export class SettingsComponent implements OnInit {
     this.restHost.set(d.rest?.host ?? '127.0.0.1');
     this.restPort.set(d.rest?.port ?? 2969);
     this.mcpUrl.set(d.mcp?.url ?? '');
-    this.mcpTransport.set(d.mcp?.transport ?? 'sse');
+    // Map legacy 'http' (still emitted by very old settings.json) to its canonical
+    // 'streamable' name so the <select> shows the right option. The backend already
+    // canonicalises on write; this covers reads from pre-migration files.
+    const incoming = (d.mcp?.transport ?? 'streamable') as Transport;
+    this.mcpTransport.set(incoming === 'http' ? 'streamable' : incoming);
     this.dockerImage.set(d.docker?.image ?? 'neo4j');
     this.dockerVersion.set(d.docker?.neo4jVersion ?? '5');
     this.dockerContainer.set(d.docker?.containerName ?? 'cvector-neo4j');

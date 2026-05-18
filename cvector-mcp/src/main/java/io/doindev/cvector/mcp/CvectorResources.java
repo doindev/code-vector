@@ -67,7 +67,7 @@ public class CvectorResources {
     private McpServerFeatures.SyncResourceSpecification resource(
             String uri, String name, String description,
             java.util.function.Function<McpSchema.ReadResourceRequest, Object> reader) {
-        McpSchema.Resource res = new McpSchema.Resource(uri, name, description, MIME_JSON, null);
+        McpSchema.Resource res = new McpSchema.Resource(uri, name, null, description, MIME_JSON, null, null, null);
         return new McpServerFeatures.SyncResourceSpecification(res, (exchange, req) -> {
             try {
                 Object payload = reader.apply(req);
