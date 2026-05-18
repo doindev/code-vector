@@ -118,38 +118,96 @@ public final class EmbeddedKuzu implements AutoCloseable {
         long bufferSize = (bufferSizeBytes != null && bufferSizeBytes > 0)
                 ? bufferSizeBytes
                 : resolveBufferSize();
-        try {
-            // Database(path, buffer_size, enableCompression, readOnly, maxDbSize, autoCheckpoint, checkpointThreshold).
-            // autoCheckpoint=true is fine; the threshold is what controls how often we fsync.
-            this.database = new Database(
-                    dbPath.toString(),
-                    bufferSize,
-                    /* enableCompression */ true,
-                    /* readOnly */ false,
-                    DEFAULT_MAX_DB_SIZE,
-                    /* autoCheckpoint */ true,
-                    DEFAULT_CHECKPOINT_THRESHOLD);
-            this.connection = new Connection(this.database);
-            // Use all available cores. Kuzu's intra-query parallelism speeds up reads dramatically
-            // and gives smaller gains on per-row writes (which serialize on the storage layer).
+        // If a previous cvector died ungracefully (SIGKILL, crash, power-loss), the
+        // sibling .cvector-lock file points at a now-dead PID. Wipe it before we try
+        // to open — keeps the failure path's diagnostic accurate if the open does
+        // contend with something else, and lets a fresh writeLockfile() drop a
+        // current entry on success.
+        clearStaleLockfile(dbPath);
+        // Kuzu's directory lock is OS-managed (LockFileEx on Windows, fcntl on Unix), so it
+        // is released the instant the holding process exits — graceful or killed. But two
+        // legitimate races can still surface "Could not set lock" briefly:
+        //   1. In-place dashboard restart: child JVM tries to open before the parent's
+        //      Spring shutdown hook finished closing Kuzu. The new
+        //      `cvector.restart.waitForPid` handshake in CvectorApplication already
+        //      bridges most of that delay, but Kuzu's close() can still trail the
+        //      handle-release by a kernel tick or two on Windows.
+        //   2. Windows Defender / file-indexer transiently holding handles on the DB
+        //      directory after the holder dies. Sub-second window typically, occasionally
+        //      a few seconds under heavy AV load.
+        // Retry with exponential backoff for up to ~30 s. Anything still failing past
+        // that is almost certainly a live owner (another running cvector, an AV not
+        // letting go) — fall through and throw the enriched message.
+        long[] backoffMillis = {250, 500, 1000, 2000, 4000, 4000, 4000, 4000, 4000, 4000, 4000, 4000};
+        // Kuzu's Database(...) constructor declares `throws Exception` in the 0.11.x JNI
+        // binding — the lock-failure case surfaces as a plain java.lang.Exception, not a
+        // RuntimeException. Catch Exception so the retry path actually fires; the
+        // non-lock branch wraps and rethrows as IOException unchanged.
+        Exception lastLockFailure = null;
+        Database openedDb = null;
+        Connection openedConn = null;
+        for (int attempt = 0; attempt < backoffMillis.length + 1; attempt++) {
             try {
-                this.connection.setMaxNumThreadForExec(Runtime.getRuntime().availableProcessors());
-            } catch (RuntimeException ignored) { /* older Kuzu builds may not expose this */ }
-            writeLockfile();
-        } catch (RuntimeException e) {
-            // Kuzu's open-time failure on a held file lock is opaque ("Could not set lock on
-            // file"); enrich it with the PID + timestamp from a sibling .cvector-lock file
-            // that we write at successful open. Helps users figure out which other process
-            // owns the DB without grepping for `cvector` in their task list.
-            String msg = e.getMessage() != null ? e.getMessage() : "";
-            if (msg.contains("Could not set lock")) {
-                String diag = readLockfile(dbPath);
-                throw new IOException("Kuzu database at " + dbPath + " is held by another cvector process"
-                        + (diag != null ? " (" + diag + ")" : "")
-                        + ". Stop the other process first, or set kuzu.sharedDb=false / isolated=true on this project to use its own DB.", e);
+                // Database(path, buffer_size, enableCompression, readOnly, maxDbSize, autoCheckpoint, checkpointThreshold).
+                // autoCheckpoint=true is fine; the threshold is what controls how often we fsync.
+                openedDb = new Database(
+                        dbPath.toString(),
+                        bufferSize,
+                        /* enableCompression */ true,
+                        /* readOnly */ false,
+                        DEFAULT_MAX_DB_SIZE,
+                        /* autoCheckpoint */ true,
+                        DEFAULT_CHECKPOINT_THRESHOLD);
+                openedConn = new Connection(openedDb);
+                break;
+            } catch (Exception e) {
+                String msg = e.getMessage() != null ? e.getMessage() : "";
+                if (!msg.contains("Could not set lock")) {
+                    throw new IOException("failed to open Kuzu database at " + dbPath + ": " + msg, e);
+                }
+                lastLockFailure = e;
+                if (attempt >= backoffMillis.length) break;
+                long wait = backoffMillis[attempt];
+                log.info("kuzu lock at {} held by another process; retrying in {} ms (attempt {}/{})",
+                        dbPath, wait, attempt + 1, backoffMillis.length);
+                try {
+                    Thread.sleep(wait);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("interrupted while waiting for Kuzu lock at " + dbPath, ie);
+                }
             }
-            throw new IOException("failed to open Kuzu database at " + dbPath + ": " + e.getMessage(), e);
         }
+        if (openedDb == null) {
+            // Final-attempt failure path. Distinguish "live cvector still holding the lock"
+            // (the original message + recovery hint) from "no live owner — must be AV /
+            // file-indexer / kernel-handle leak" (points the user at the actual culprit).
+            String diag = readLockfile(dbPath);
+            Long heldByPid = parseLockfilePid(dbPath);
+            boolean liveHolder = heldByPid != null && ProcessHandle.of(heldByPid).isPresent();
+            String message;
+            if (liveHolder) {
+                message = "Kuzu database at " + dbPath + " is held by another cvector process"
+                        + (diag != null ? " (" + diag + ")" : "")
+                        + ". Stop the other process first, or set isolated=true on this project to use its own DB.";
+            } else {
+                message = "Kuzu database at " + dbPath + " refused to acquire its directory lock after ~30 s,"
+                        + " but no live cvector process owns it"
+                        + (diag != null ? " (last entry: " + diag + ")" : "")
+                        + ". An antivirus or file-indexer is likely holding a handle on the directory —"
+                        + " run `handle.exe " + dbPath.getParent() + "` (Windows) to see the holder,"
+                        + " or exclude " + dbPath.getParent() + " from your AV's real-time scan.";
+            }
+            throw new IOException(message, lastLockFailure);
+        }
+        this.database = openedDb;
+        this.connection = openedConn;
+        // Use all available cores. Kuzu's intra-query parallelism speeds up reads dramatically
+        // and gives smaller gains on per-row writes (which serialize on the storage layer).
+        try {
+            this.connection.setMaxNumThreadForExec(Runtime.getRuntime().availableProcessors());
+        } catch (RuntimeException ignored) { /* older Kuzu builds may not expose this */ }
+        writeLockfile();
         log.debug("opened Kuzu database at {}", dbPath);
     }
 
@@ -177,6 +235,58 @@ public final class EmbeddedKuzu implements AutoCloseable {
             String content = Files.readString(lock).trim().replace("\n", ", ");
             return content;
         } catch (IOException ignored) { return null; }
+    }
+
+    /**
+     * Parse the {@code pid=N} line out of {@code .cvector-lock}. Used to probe whether
+     * the recorded holder is still alive before deciding the right failure message
+     * (live cvector vs. stale-pid-with-AV-holding-handles). Returns {@code null} when
+     * the file doesn't exist, can't be read, or has no parseable PID — callers treat
+     * "unknown" the same as "no live holder" for messaging purposes.
+     */
+    private static Long parseLockfilePid(Path dbPath) {
+        Path lock = dbPath.resolveSibling(".cvector-lock");
+        try {
+            if (!Files.exists(lock)) return null;
+            for (String line : Files.readAllLines(lock)) {
+                String trimmed = line.trim();
+                if (trimmed.startsWith("pid=")) {
+                    try {
+                        return Long.parseLong(trimmed.substring(4).trim());
+                    } catch (NumberFormatException ignored) {
+                        return null;
+                    }
+                }
+            }
+            return null;
+        } catch (IOException ignored) {
+            return null;
+        }
+    }
+
+    /**
+     * Delete {@code .cvector-lock} if it exists and the PID it names is no longer alive
+     * — typical leftover after a SIGKILL / crash / power-loss exit where
+     * {@code deleteOnExit()} never ran. Pure diagnostic cleanup: the OS already released
+     * the Kuzu directory lock when the process died, so this only fixes the misleading
+     * "owned by pid=X" suffix on any subsequent failure message. Best-effort; an
+     * IOException here doesn't abort the open.
+     */
+    private static void clearStaleLockfile(Path dbPath) {
+        Path lock = dbPath.resolveSibling(".cvector-lock");
+        if (!Files.exists(lock)) return;
+        Long heldByPid = parseLockfilePid(dbPath);
+        if (heldByPid == null) {
+            // No parseable PID — treat as stale; nothing useful to keep.
+            try { Files.deleteIfExists(lock); } catch (IOException ignored) { }
+            return;
+        }
+        if (!ProcessHandle.of(heldByPid).isPresent()) {
+            try {
+                Files.deleteIfExists(lock);
+                log.info("cleared stale Kuzu lockfile at {} (pid={} no longer alive)", lock, heldByPid);
+            } catch (IOException ignored) { }
+        }
     }
 
     /**

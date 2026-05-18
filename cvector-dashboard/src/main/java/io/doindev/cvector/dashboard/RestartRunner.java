@@ -24,17 +24,25 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * flow:
  * <ol>
  *   <li>Spawn a detached child JVM running the same {@code java -jar cvector.jar dashboard}
- *       command, in the same working directory.</li>
+ *       command, in the same working directory. The parent's PID is passed as
+ *       {@code -Dcvector.restart.waitForPid=<pid>} so the child can wait for the
+ *       parent to fully exit (and release the Kuzu directory lock) before booting
+ *       Spring. See {@link io.doindev.cvector.CvectorApplication#awaitParentExit}.</li>
  *   <li>Reply 202 Accepted to the caller so the browser knows the restart kicked off.</li>
  *   <li>Schedule a graceful Spring shutdown ~700 ms later — long enough for the response to
- *       flush, short enough that the new process's port-bind doesn't race the old one (Tomcat
- *       releases the listen socket on context close).</li>
+ *       flush, short enough that the child's handshake-wait stays short on the happy path.
+ *       Tomcat releases the listen socket and Kuzu releases its file lock during the
+ *       Spring shutdown hook that {@code System.exit(0)} fires.</li>
  * </ol>
  *
  * <p>Detachment is platform-specific:
  * <ul>
- *   <li>Windows: {@code cmd /c start "" /B java -jar …} — {@code start /B} creates a process
- *       that survives the parent and doesn't open a console window.</li>
+ *   <li>Windows: {@code powershell.exe -NoProfile -WindowStyle Hidden -Command Start-Process
+ *       -FilePath 'java' -ArgumentList … -WindowStyle Hidden}. Earlier versions used
+ *       {@code cmd /c start "" /B} but that tethers the child to the parent's console
+ *       handle on modern Windows — the child dies when the parent exits. PowerShell's
+ *       {@code Start-Process} creates a properly detached process that survives parent
+ *       death; the extra ~300 ms PS-boot cost is fine for a once-per-restart flow.</li>
  *   <li>Linux/macOS: {@code sh -c "nohup java -jar … >/dev/null 2>&1 &"} — {@code nohup} +
  *       background redirection makes the child immune to the parent's exit.</li>
  * </ul>
@@ -76,9 +84,11 @@ public class RestartRunner {
                     "hint", "restart works only when running from the packaged cvector.jar");
         }
         try {
-            Process child = spawnDetached(jar);
+            long parentPid = ProcessHandle.current().pid();
+            Process child = spawnDetached(jar, parentPid);
             requestedAt = Instant.now();
-            log.info("restart: spawned replacement pid={} from jar={}", child.pid(), jar);
+            log.info("restart: spawned replacement pid={} from jar={} (parent pid={})",
+                    child.pid(), jar, parentPid);
 
             // Schedule the parent shutdown after a brief delay so the 202 response can flush
             // before the JVM goes away. Using SpringApplication.exit ensures Spring lifecycle
@@ -114,19 +124,23 @@ public class RestartRunner {
     }
 
     /**
-     * Build the detach command for the current platform and exec it.
+     * Build the detach command for the current platform and exec it. The {@code parentPid}
+     * is threaded through as a JVM system property ({@code cvector.restart.waitForPid}) so
+     * the child can wait for the parent to fully exit (and release the Kuzu directory lock)
+     * before opening its own Kuzu handle — see
+     * {@link io.doindev.cvector.CvectorApplication#awaitParentExit}.
      *
-     * <p>Windows: {@code cmd /c start /B …} unexpectedly tethers the child to the parent's
-     * console — when the parent's JVM exits the child dies too. PowerShell's
-     * {@code Start-Process -WindowStyle Hidden} cleanly creates a new console-less process
-     * that survives parent death (verified manually). We invoke PowerShell from Java to get
-     * that semantics; it's slower to start (~300ms PS boot) but reliable.
+     * <p>Windows: invoked via PowerShell because {@code cmd /c start /B} tethers the child
+     * to the parent's console on modern Windows; PowerShell's {@code Start-Process
+     * -WindowStyle Hidden} cleanly creates a console-less process that survives the parent.
+     * The ~300 ms PowerShell boot cost is acceptable for a once-per-restart flow.
      *
      * <p>Unix: {@code nohup java -jar … >/dev/null 2>&1 &} — standard daemon-fork pattern.
      */
-    private static Process spawnDetached(String jar) throws Exception {
+    private static Process spawnDetached(String jar, long parentPid) throws Exception {
         String os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
         boolean windows = os.contains("win");
+        String waitFlag = "-Dcvector.restart.waitForPid=" + parentPid;
         List<String> cmd = new ArrayList<>();
         if (windows) {
             // PowerShell quoting: each ArgumentList entry is a separate token; we wrap the
@@ -136,12 +150,12 @@ public class RestartRunner {
             cmd.add("-WindowStyle");
             cmd.add("Hidden");
             cmd.add("-Command");
-            cmd.add("Start-Process -FilePath 'java' -ArgumentList '-jar','"
+            cmd.add("Start-Process -FilePath 'java' -ArgumentList '" + waitFlag + "','-jar','"
                     + jar.replace("'", "''") + "','dashboard' -WindowStyle Hidden");
         } else {
             cmd.add("sh");
             cmd.add("-c");
-            cmd.add("nohup java -jar '" + jar.replace("'", "'\\''")
+            cmd.add("nohup java " + waitFlag + " -jar '" + jar.replace("'", "'\\''")
                     + "' dashboard >/dev/null 2>&1 &");
         }
         ProcessBuilder pb = new ProcessBuilder(cmd)
