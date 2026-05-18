@@ -28,7 +28,7 @@ The script will:
 1. Run `mvn -Pdist install -DskipTests` to build the bundled `cvector.exe` + trimmed JRE.
 2. Copy the dist to `%LOCALAPPDATA%\Programs\cvector\` (overwriting any prior install).
 3. Add that directory to your **user** PATH (no admin rights needed).
-4. Create `%USERPROFILE%\.cvector\project.json` with sensible defaults (only if missing).
+4. Create `%USERPROFILE%\.cvector\settings.json` with sensible defaults — `backend: "embedded"`, a placeholder `default` project rooted at `%USERPROFILE%` (only if neither `settings.json` nor a legacy `project.json` already exists).
 
 When it finishes, open a **new** terminal so PATH changes take effect, then:
 

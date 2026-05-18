@@ -110,7 +110,9 @@ public class SettingsController {
             Object urlObj = m.get("url");
             Object tObj = m.get("transport");
             String url = urlObj == null ? before.mcpOrDefault().url() : String.valueOf(urlObj);
-            String transport = tObj == null ? before.mcpOrDefault().transport() : String.valueOf(tObj).toLowerCase();
+            String transport = tObj == null
+                    ? before.mcpOrDefault().transport()
+                    : CvectorConfig.McpConfig.canonicalTransport(String.valueOf(tObj));
             if (!CvectorConfig.McpConfig.isValidTransport(transport)) {
                 transport = before.mcpOrDefault().transport();
             }

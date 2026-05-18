@@ -30,7 +30,7 @@ The script will:
 2. Copy the bundle to `~/.local/share/cvector` (overwriting any prior install).
 3. Symlink `~/.local/bin/cvector` to the bundled launcher.
 4. Append `export PATH="$HOME/.local/bin:$PATH"` to your shell profile (`~/.zshrc` or `~/.bash_profile`) **only if not already present**.
-5. Create `~/.cvector/project.json` with sensible defaults (only if missing).
+5. Create `~/.cvector/settings.json` with sensible defaults — `backend: "embedded"`, a placeholder `default` project rooted at `$HOME` (only if neither `settings.json` nor a legacy `project.json` already exists).
 
 When it finishes, open a **new** terminal and try:
 
