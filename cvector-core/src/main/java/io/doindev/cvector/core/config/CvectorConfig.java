@@ -299,15 +299,19 @@ public record CvectorConfig(
     public record McpConfig(String url, String transport) {
 
         /**
-         * Legacy alias for {@link #TRANSPORT_STREAMABLE}. Old settings.json files that predate
-         * the Spring AI 2.0 bump may still carry {@code "http"}; {@link #canonicalTransport}
-         * folds it into {@code streamable} so the rest of the codebase sees a single name.
+         * MCP 2025-03-26 "Streamable HTTP" transport. Single endpoint (default {@code /mcp}),
+         * session via {@code Mcp-Session-Id} header, optional SSE stream-back. The canonical
+         * user-facing label for the modern HTTP MCP protocol — what {@code settings.json}
+         * stores, what the dashboard UI shows, what the CLI accepts. Default for new installs.
+         * Modern MCP clients (Eclipse Copilot, MCP Inspector v2, newer Claude integrations)
+         * speak this protocol.
          */
         public static final String TRANSPORT_HTTP = "http";
         /**
-         * MCP 2025-03-26 "Streamable HTTP" transport. Single endpoint (default {@code /mcp}),
-         * session via {@code Mcp-Session-Id} header, optional SSE stream-back. This is what
-         * modern MCP clients (Eclipse Copilot, MCP Inspector v2) default to.
+         * Legacy alias for {@link #TRANSPORT_HTTP}. Briefly written into some settings.json
+         * files during the Spring AI 2.0 transition; {@link #canonicalTransport} folds it
+         * back into {@code "http"} on read so the dashboard / CLI / server all see one
+         * canonical value.
          */
         public static final String TRANSPORT_STREAMABLE = "streamable";
         /**
@@ -326,13 +330,13 @@ public record CvectorConfig(
         private static final String DEFAULT_URL = "http://127.0.0.1:2969/mcp";
 
         public static McpConfig defaults() {
-            return new McpConfig(DEFAULT_URL, TRANSPORT_STREAMABLE);
+            return new McpConfig(DEFAULT_URL, TRANSPORT_HTTP);
         }
 
         public McpConfig withDefaults() {
             return new McpConfig(
                     url == null || url.isBlank() ? DEFAULT_URL : url,
-                    transport == null || transport.isBlank() ? TRANSPORT_STREAMABLE : canonicalTransport(transport));
+                    transport == null || transport.isBlank() ? TRANSPORT_HTTP : canonicalTransport(transport));
         }
 
         /** Validates the transport string is one of the supported values. */
@@ -345,14 +349,17 @@ public record CvectorConfig(
         }
 
         /**
-         * Collapses the {@code http} legacy alias into {@code streamable} and lower-cases
-         * the result. Anything not in the known set is returned as-is so callers can still
-         * surface a useful error message — pair with {@link #isValidTransport} for guarding.
+         * Collapses the {@code streamable} legacy alias into {@code http} and lower-cases
+         * the result. The user-facing schema accepts three values — {@code http} / {@code sse}
+         * / {@code stdio} — and {@code streamable} folds into {@code http} so the rest of
+         * the codebase sees a single canonical name. Anything not in the known set is
+         * returned as-is so callers can still surface a useful error message — pair with
+         * {@link #isValidTransport} for guarding.
          */
         public static String canonicalTransport(String t) {
             if (t == null) return null;
             String lower = t.toLowerCase();
-            return TRANSPORT_HTTP.equals(lower) ? TRANSPORT_STREAMABLE : lower;
+            return TRANSPORT_STREAMABLE.equals(lower) ? TRANSPORT_HTTP : lower;
         }
     }
 

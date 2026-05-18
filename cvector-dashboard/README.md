@@ -88,7 +88,7 @@ cvector dashboard running
   backend:    kuzu (embedded)
   api:        http://localhost:2969/api
   dashboard:  http://localhost:2969/dashboard
-  mcp:        http://localhost:2969/mcp  (transport: streamable)
+  mcp:        http://localhost:2969/mcp  (transport: http)
 ...
 opened http://localhost:2969/dashboard/ in default browser
 ```
@@ -150,7 +150,7 @@ Started with `cvector dashboard`, the JVM also exposes an MCP server on the same
 
 | Choice | Protocol | Default endpoint | Clients |
 |---|---|---|---|
-| `streamable` *(default)* | MCP 2025-03-26 — Streamable HTTP | `POST /mcp` + `Mcp-Session-Id` header | Eclipse Copilot, MCP Inspector v2, newer Claude |
+| `http` *(default)* | MCP 2025-03-26 — Streamable HTTP | `POST /mcp` + `Mcp-Session-Id` header | Eclipse Copilot, MCP Inspector v2, newer Claude |
 | `sse` | MCP 2024-11-05 — HTTP+SSE | `GET /sse` then `POST /mcp/message?sessionId=…` | Original Claude Desktop, MCP Inspector v1 |
 | `stdio` | JSON-RPC over stdin/stdout | n/a — dashboard skips co-hosting | Use `cvector serve` as a subprocess instead |
 
@@ -168,7 +168,7 @@ The Settings view (`/dashboard/settings`) is the single GUI surface for `setting
 
 - **Backend.** Switch between `embedded` / `remote` / `docker`. Shows Neo4j credentials inline for remote and Docker image / port fields for docker. Password masking is enforced by the REST layer — sending the literal `"***"` back is a no-op.
 - **REST listener.** Port + bind host. Warning banner appears if you flip `host` from `127.0.0.1` to `0.0.0.0` (off-loopback exposure has no built-in auth).
-- **MCP server.** Transport dropdown (streamable / sse / stdio) + URL field. Helper text under the URL adjusts to the chosen transport (Streamable HTTP defaults to `/mcp`; SSE uses `/sse` + `/mcp/message`; stdio shows an info banner explaining it can't co-host with the dashboard).
+- **MCP server.** Transport dropdown (http / sse / stdio) + URL field. Helper text under the URL adjusts to the chosen transport (`http` = MCP 2025-03-26 Streamable HTTP at `/mcp`; `sse` = legacy MCP 2024-11-05 at `/sse` + `/mcp/message`; `stdio` shows an info banner explaining it can't co-host with the dashboard).
 - **Appearance.** Light / dark theme toggle (browser-only, not persisted to `settings.json`).
 
 Any save that needs a restart sets a `restartRequired` flag in the response; the page shows a yellow banner with a "Restart required — click to restart" button that triggers the in-place restart flow and reloads once the new JVM is reachable.

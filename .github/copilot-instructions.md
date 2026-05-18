@@ -63,10 +63,10 @@ java -jar cvector-app/target/cvector.jar rules               # 0 violations on t
 
 | `mcp.transport` | Protocol | Endpoint | Notes |
 |---|---|---|---|
-| `streamable` *(default)* | MCP 2025-03-26 "Streamable HTTP" | `POST /mcp`, session via `Mcp-Session-Id` header | Modern clients: Eclipse Copilot, MCP Inspector v2, newer Claude. |
+| `http` *(default)* | MCP 2025-03-26 "Streamable HTTP" | `POST /mcp`, session via `Mcp-Session-Id` header | Modern clients: Eclipse Copilot, MCP Inspector v2, newer Claude. |
 | `sse` | MCP 2024-11-05 "HTTP+SSE" | `GET /sse` → endpoint event → `POST /mcp/message?sessionId=…` | Legacy clients: original Claude Desktop, MCP Inspector v1. |
 | `stdio` | JSON-RPC over stdin/stdout | n/a (subprocess) | Skips co-hosting entirely — only `cvector serve` exposes the MCP server. |
-| `http` | alias | — | Legacy value, canonicalised to `streamable` on read/write. |
+| `streamable` | alias | — | Legacy value briefly written during the Spring AI 2.0 transition, canonicalised back to `http` on read/write. |
 
 `CvectorApplication.coHostMcp` translates this into `spring.ai.mcp.server.protocol=STREAMABLE` (or `SSE`) + the matching endpoint property at JVM-system-property precedence (slot 6), so it beats the `application-mcp.properties` defaults (slot 9). Spring AI 2.0's auto-config wires one of `WebMvcStreamableServerTransportProvider` / `WebMvcSseServerTransportProvider` based on that property; the others stay inert. `cvector serve` always uses stdio regardless of this setting.
 
@@ -176,7 +176,7 @@ Old installs may carry `.cvector/project.json` — still readable, but every wri
 | Add an MCP resource | New `out.add(resource(...))` call in `CvectorResources.getResources()`. URI under `cvector://`. MIME `application/json`. |
 | Add a rule | New class in `cvector-rules/.../builtin/` implementing `Rule`, register in the `RulesEngine` builtin list. Remember `isPathExcluded`. |
 | Add a Cypher query helper | `GraphStore` interface in `cvector-core/store`. Keep it parameterized — never concatenate user input into Cypher. Implement on both `KuzuGraphStore` (Kuzu dialect) and `Neo4jGraphStore`. |
-| Switch active MCP transport | `cvector mcp update --transport <streamable\|sse\|stdio>` (writes `settings.json`), then restart the dashboard. |
+| Switch active MCP transport | `cvector mcp update --transport <http\|sse\|stdio>` (writes `settings.json`), then restart the dashboard. |
 
 ## Things to avoid
 

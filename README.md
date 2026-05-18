@@ -205,7 +205,7 @@ You can switch any time without changing your data model — the parsers emit th
   },
   "mcp": {
     "url": "http://127.0.0.1:2969/mcp",
-    "transport": "streamable"
+    "transport": "http"
   },
   "docker": {
     "image": "neo4j",
@@ -232,7 +232,7 @@ You can switch any time without changing your data model — the parsers emit th
 | `rest.host` | string | `"127.0.0.1"` | Bind address. `127.0.0.1` keeps the dashboard loopback-only; use `0.0.0.0` to expose on the network. Easier: `cvector host 0.0.0.0`. |
 | `rest.server` | object | `null` | Free-form Spring Boot `server.*` overrides — any property the Boot binder accepts (e.g. `server.ssl.*`, `server.compression.*`, `server.servlet.session.*`, `server.tomcat.*`). Nested objects are flattened to dotted keys; lists are comma-joined. On boot, each entry is promoted to a JVM system property — Spring Boot precedence slot 6 — so settings.json values **override matching OS environment variables** (slot 7). Explicit `-Dserver.foo=…` on the cvector command line still wins (already-set system properties aren't overwritten). |
 | `mcp.url` | string | `"http://127.0.0.1:2969/mcp"` | Informational URL clients can use to reach the MCP server. The server itself binds at `rest.host:rest.port`. The path component drives the live endpoint — set it to `http://.../sse` if you switch `transport` to `sse`. |
-| `mcp.transport` | string | `"streamable"` | One of `"streamable"` *(default, MCP 2025-03-26)* / `"sse"` *(legacy, MCP 2024-11-05)* / `"stdio"`. Legacy `"http"` is accepted and canonicalised to `"streamable"` on read/write. See [MCP transports](#mcp-transports) for the protocol-level differences. |
+| `mcp.transport` | string | `"http"` | One of `"http"` *(default, MCP 2025-03-26 Streamable HTTP)* / `"sse"` *(legacy, MCP 2024-11-05 HTTP+SSE)* / `"stdio"`. The intermediate alias `"streamable"` is accepted on read and canonicalised back to `"http"` on write. See [MCP transports](#mcp-transports) for the protocol-level differences. |
 | `docker.image` | string | `"neo4j"` | Docker image name (without tag). |
 | `docker.containerName` | string | `"cvector-neo4j"` | Compose service / container name. |
 | `docker.neo4jVersion` | string | `"5"` | Image tag — used as `{image}:{neo4jVersion}`. |
@@ -349,7 +349,7 @@ cvector db --docker
 | `cvector db --docker` | Set `backend: "docker"` and save. |
 | `cvector host <addr>` | Update `rest.host` (e.g. `0.0.0.0` to expose the dashboard on the LAN). |
 | `cvector mcp` | Show current MCP config. |
-| `cvector mcp update --transport <streamable\|sse\|stdio> <URL>` | Update `mcp.transport` and `mcp.url`. (`http` is accepted as a legacy alias for `streamable`.) Restart the dashboard / serve process to pick up the new transport. |
+| `cvector mcp update --transport <http\|sse\|stdio> <URL>` | Update `mcp.transport` and `mcp.url`. (`streamable` is accepted as a legacy alias for `http`.) Restart the dashboard / serve process to pick up the new transport. |
 | `cvector --backend <mode> <subcommand>` | One-shot backend override that does **not** persist to `settings.json`. |
 | `--embedded` *(global flag)* | Legacy back-compat; equivalent to `--backend embedded` at the root level. Subcommands no longer inherit it (it would collide with `cvector db --embedded`). |
 | Env `CVECTOR_EMBEDDED=true` | Same as the `--embedded` flag for shell scripts / Docker. |
@@ -799,11 +799,11 @@ cvector supports all three MCP transports the spec defines. Pick one via `mcp.tr
 
 | `mcp.transport` | Protocol | Wire shape | Best for |
 |---|---|---|---|
-| `streamable` *(default)* | MCP 2025-03-26 — **Streamable HTTP** | Single endpoint `POST /mcp`. Server assigns an `Mcp-Session-Id` response header on the `initialize` call; clients echo it back on every subsequent request. Optional SSE stream-back when the server has more than one response. | Modern MCP clients: **Eclipse Copilot**, MCP Inspector v2, newer Claude integrations. |
+| `http` *(default)* | MCP 2025-03-26 — **Streamable HTTP** | Single endpoint `POST /mcp`. Server assigns an `Mcp-Session-Id` response header on the `initialize` call; clients echo it back on every subsequent request. Optional SSE stream-back when the server has more than one response. | Modern MCP clients: **Eclipse Copilot**, MCP Inspector v2, newer Claude integrations. |
 | `sse` | MCP 2024-11-05 — **HTTP+SSE** | Two endpoints. Client opens `GET /sse` to receive an `endpoint` event carrying `/mcp/message?sessionId=<uuid>`, then `POST`s every JSON-RPC call to that per-session URL. Responses come back on the original SSE stream. | Legacy MCP clients: original Claude Desktop, MCP Inspector v1, anything pre-2025. |
 | `stdio` | JSON-RPC over the subprocess's stdin/stdout | No port involved. The MCP client launches `cvector serve` as a child process. | Claude CLI, agent frameworks that spawn the server, and any client that doesn't want a network socket. Setting this **disables HTTP MCP co-hosting on the dashboard** — use `cvector serve` instead. |
 
-Internally, `streamable` and `sse` flip `spring.ai.mcp.server.protocol` (`STREAMABLE` / `SSE`) plus the matching endpoint property — Spring AI's auto-config wires the matching `WebMvc*ServerTransportProvider` and the others stay inert. CORS is open on `/sse`, `/mcp`, and `/mcp/**` (allowed origin patterns: `*`) so browser-hosted MCP Inspector tabs can connect.
+Internally, `http` and `sse` flip `spring.ai.mcp.server.protocol` (`STREAMABLE` / `SSE`) plus the matching endpoint property — Spring AI's auto-config wires the matching `WebMvc*ServerTransportProvider` and the others stay inert. CORS is open on `/sse`, `/mcp`, and `/mcp/**` (allowed origin patterns: `*`) so browser-hosted MCP Inspector tabs can connect.
 
 A workspace can hold any combination of MCP clients pointed at the same cvector dashboard — the only constraint is that one server instance speaks one HTTP protocol at a time. If you have clients on both protocols, run two cvector processes on different ports, or upgrade the older client.
 
@@ -986,7 +986,7 @@ In the Inspector connection panel:
 
 | `mcp.transport` | Inspector "Transport Type" | URL |
 |---|---|---|
-| `streamable` *(default)* | **Streamable HTTP** | `http://localhost:2969/mcp` |
+| `http` *(default)* | **Streamable HTTP** | `http://localhost:2969/mcp` |
 | `sse` | **SSE** | `http://localhost:2969/sse` |
 
 Click **Connect**. The CORS headers cvector ships on `/sse`, `/mcp`, and `/mcp/**` (allowed origin patterns: `*`) let the Inspector's browser tab complete the handshake.
