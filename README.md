@@ -14,6 +14,7 @@ Code knowledge graph with a polyglot scanner, a Picocli CLI, a Spring Boot REST 
 4. [CLI commands](#cli-commands)
 5. [REST API](#rest-api)
 6. [MCP server](#mcp-server)
+   - [MCP transports](#mcp-transports)
    - [Tools](#mcp-tools)
    - [Long-running tools: async + cv_job_status](#long-running-tools-async--cv_job_status)
    - [Resources](#mcp-resources)
@@ -32,11 +33,21 @@ Code knowledge graph with a polyglot scanner, a Picocli CLI, a Spring Boot REST 
 
 | Component | Minimum | Notes |
 |---|---|---|
-| **Java** | 17 (compile target) | Runs on JDK 21+ to enable virtual threads in MCP/dashboard. |
+| **Java** | 17 (compile target) | Runs on JDK 21+ to enable virtual threads on the dashboard. (Virtual threads are intentionally **disabled** on the `mcp` profile — see [Spring profiles](#spring-profiles).) |
 | **Maven** | 3.9+ | The build uses ANTLR4 maven plugin for grammar generation. |
 | **OS** | Windows / Linux / macOS | Build is OS-agnostic. |
 | **Neo4j** | *(optional)* 5.x | Only required if you opt out of the embedded KuzuDB default — see [Backends](#backends--settingsjson). The Kuzu native library is bundled in the fat-jar for all three platforms. |
 | **Docker** | *(optional)* | Only needed for the `docker` backend mode where cvector manages a Neo4j container for you. |
+
+### Stack (current, all on the `kuzu` branch)
+
+| Component | Version | Status |
+|---|---|---|
+| Spring Boot | **4.1.0-RC1** | Pre-release. Spring Framework 7. |
+| Spring AI | **2.0.0-M6** | Pre-release milestone — adds the MCP Streamable HTTP transport. |
+| MCP SDK | **2.0.0-M2** | Pinned via `io.modelcontextprotocol.sdk:mcp-bom` in the root pom. |
+| KuzuDB | 0.11.3 | Native lib bundled in the fat-jar; auto-extracted on first load. |
+| Angular | 17 | Optional dashboard SPA (build with `-Pdashboard-ui`). |
 
 ### Optional: starting a local Neo4j manually
 
@@ -194,7 +205,7 @@ You can switch any time without changing your data model — the parsers emit th
   },
   "mcp": {
     "url": "http://127.0.0.1:2969/mcp",
-    "transport": "http"
+    "transport": "streamable"
   },
   "docker": {
     "image": "neo4j",
@@ -220,8 +231,8 @@ You can switch any time without changing your data model — the parsers emit th
 | `rest.port` | integer | `2969` | Port the dashboard / REST API binds to. |
 | `rest.host` | string | `"127.0.0.1"` | Bind address. `127.0.0.1` keeps the dashboard loopback-only; use `0.0.0.0` to expose on the network. Easier: `cvector host 0.0.0.0`. |
 | `rest.server` | object | `null` | Free-form Spring Boot `server.*` overrides — any property the Boot binder accepts (e.g. `server.ssl.*`, `server.compression.*`, `server.servlet.session.*`, `server.tomcat.*`). Nested objects are flattened to dotted keys; lists are comma-joined. On boot, each entry is promoted to a JVM system property — Spring Boot precedence slot 6 — so settings.json values **override matching OS environment variables** (slot 7). Explicit `-Dserver.foo=…` on the cvector command line still wins (already-set system properties aren't overwritten). |
-| `mcp.url` | string | `"http://127.0.0.1:2969/mcp"` | Informational URL clients can use to reach the MCP server. The server itself binds at `rest.host:rest.port`. |
-| `mcp.transport` | string | `"http"` | One of `"http"` / `"sse"` / `"stdio"`. Drives how MCP clients connect. |
+| `mcp.url` | string | `"http://127.0.0.1:2969/mcp"` | Informational URL clients can use to reach the MCP server. The server itself binds at `rest.host:rest.port`. The path component drives the live endpoint — set it to `http://.../sse` if you switch `transport` to `sse`. |
+| `mcp.transport` | string | `"streamable"` | One of `"streamable"` *(default, MCP 2025-03-26)* / `"sse"` *(legacy, MCP 2024-11-05)* / `"stdio"`. Legacy `"http"` is accepted and canonicalised to `"streamable"` on read/write. See [MCP transports](#mcp-transports) for the protocol-level differences. |
 | `docker.image` | string | `"neo4j"` | Docker image name (without tag). |
 | `docker.containerName` | string | `"cvector-neo4j"` | Compose service / container name. |
 | `docker.neo4jVersion` | string | `"5"` | Image tag — used as `{image}:{neo4jVersion}`. |
@@ -338,7 +349,7 @@ cvector db --docker
 | `cvector db --docker` | Set `backend: "docker"` and save. |
 | `cvector host <addr>` | Update `rest.host` (e.g. `0.0.0.0` to expose the dashboard on the LAN). |
 | `cvector mcp` | Show current MCP config. |
-| `cvector mcp update --transport <http\|sse\|stdio> <URL>` | Update `mcp.transport` and `mcp.url`. |
+| `cvector mcp update --transport <streamable\|sse\|stdio> <URL>` | Update `mcp.transport` and `mcp.url`. (`http` is accepted as a legacy alias for `streamable`.) Restart the dashboard / serve process to pick up the new transport. |
 | `cvector --backend <mode> <subcommand>` | One-shot backend override that does **not** persist to `settings.json`. |
 | `--embedded` *(global flag)* | Legacy back-compat; equivalent to `--backend embedded` at the root level. Subcommands no longer inherit it (it would collide with `cvector db --embedded`). |
 | Env `CVECTOR_EMBEDDED=true` | Same as the `--embedded` flag for shell scripts / Docker. |
@@ -562,8 +573,8 @@ custom:
 | Profile | When | What changes |
 |---|---|---|
 | (default) | CLI commands | Single-shot execution, no web/MCP. |
-| `mcp` | `cvector serve` | Stdio JSON-RPC server, MCP capabilities enabled, virtual threads on. |
-| (web mode) | `cvector dashboard` | Embedded servlet container on `rest.host:rest.port` (default `127.0.0.1:2969`), virtual threads on. |
+| `mcp` | `cvector serve` *(profile only)* and `cvector dashboard` *(profile co-active alongside the web stack)* | MCP capabilities enabled. **Virtual threads are intentionally disabled here** (`spring.threads.virtual.enabled=false` in `application-mcp.properties`) — Spring AI's `McpServerSession.handle(...).block()` pins the carrier thread on large SSE writes, starving sibling tasks. Stay on platform threads. |
+| (web mode) | `cvector dashboard` | Embedded servlet container on `rest.host:rest.port` (default `127.0.0.1:2969`). Virtual threads on. `mcp` profile is co-active so the chosen MCP HTTP transport runs in the same Tomcat. |
 
 ### Environment variables
 
@@ -778,9 +789,23 @@ After upgrading, run `cvector scan` once per project to populate the new shared 
 
 ## MCP server
 
-Run with `cvector serve` (stdio JSON-RPC) or co-host with the dashboard (`cvector dashboard` adds SSE on `/sse` + `/mcp`). Default capabilities: **33 tools**, **9 resources**, **9 prompts**.
+cvector ships a full MCP server with **33 tools**, **9 resources**, and **9 prompts**. Run it via `cvector serve` (stdio subprocess) or co-host it with the dashboard (`cvector dashboard` adds the chosen HTTP transport in the same Tomcat).
 
 The MCP server runs in-process with the graph store — `cv_scan_project`, `cv_purge_project`, and friends reuse the dashboard's live Kuzu/Neo4j handle rather than spawning a subprocess, which avoids the file-lock collisions an out-of-process scan would hit on the embedded backend.
+
+### MCP transports
+
+cvector supports all three MCP transports the spec defines. Pick one via `mcp.transport` in `settings.json` (or via the Settings view in the dashboard, or via `cvector mcp update --transport ...`). Each transport selects a different Spring AI auto-configuration at boot — to switch, edit the setting and restart the dashboard / serve process.
+
+| `mcp.transport` | Protocol | Wire shape | Best for |
+|---|---|---|---|
+| `streamable` *(default)* | MCP 2025-03-26 — **Streamable HTTP** | Single endpoint `POST /mcp`. Server assigns an `Mcp-Session-Id` response header on the `initialize` call; clients echo it back on every subsequent request. Optional SSE stream-back when the server has more than one response. | Modern MCP clients: **Eclipse Copilot**, MCP Inspector v2, newer Claude integrations. |
+| `sse` | MCP 2024-11-05 — **HTTP+SSE** | Two endpoints. Client opens `GET /sse` to receive an `endpoint` event carrying `/mcp/message?sessionId=<uuid>`, then `POST`s every JSON-RPC call to that per-session URL. Responses come back on the original SSE stream. | Legacy MCP clients: original Claude Desktop, MCP Inspector v1, anything pre-2025. |
+| `stdio` | JSON-RPC over the subprocess's stdin/stdout | No port involved. The MCP client launches `cvector serve` as a child process. | Claude CLI, agent frameworks that spawn the server, and any client that doesn't want a network socket. Setting this **disables HTTP MCP co-hosting on the dashboard** — use `cvector serve` instead. |
+
+Internally, `streamable` and `sse` flip `spring.ai.mcp.server.protocol` (`STREAMABLE` / `SSE`) plus the matching endpoint property — Spring AI's auto-config wires the matching `WebMvc*ServerTransportProvider` and the others stay inert. CORS is open on `/sse`, `/mcp`, and `/mcp/**` (allowed origin patterns: `*`) so browser-hosted MCP Inspector tabs can connect.
+
+A workspace can hold any combination of MCP clients pointed at the same cvector dashboard — the only constraint is that one server instance speaks one HTTP protocol at a time. If you have clients on both protocols, run two cvector processes on different ports, or upgrade the older client.
 
 ### MCP tools
 
@@ -948,9 +973,9 @@ npx @modelcontextprotocol/inspector --cli "%LOCALAPPDATA%\Programs\cvector\cvect
 
 That mode prints the JSON-RPC handshake to the terminal so you can verify `initialize` succeeds without opening a browser tab.
 
-### Testing the HTTP/SSE server (dashboard mode) with Inspector
+### Testing the HTTP server (dashboard mode) with Inspector
 
-`cvector dashboard` exposes the same tools over Spring AI's WebMVC SSE transport. Start the dashboard, then point Inspector at the SSE URL:
+`cvector dashboard` exposes the same tools over HTTP. Which protocol the Inspector should pick depends on the current `mcp.transport` setting:
 
 ```bash
 cvector.exe dashboard                       # leave running in another terminal
@@ -959,18 +984,40 @@ npx @modelcontextprotocol/inspector         # opens the web UI with no preset
 
 In the Inspector connection panel:
 
-| Field | Value |
-|---|---|
-| Transport Type | `SSE` (**not** "Streamable HTTP" — Spring AI 1.0.0 only implements the SSE transport) |
-| URL | `http://localhost:2969/sse` (or whatever `mcp.url` is set to in your `.cvector/settings.json`) |
+| `mcp.transport` | Inspector "Transport Type" | URL |
+|---|---|---|
+| `streamable` *(default)* | **Streamable HTTP** | `http://localhost:2969/mcp` |
+| `sse` | **SSE** | `http://localhost:2969/sse` |
 
 Click **Connect**. The CORS headers cvector ships on `/sse`, `/mcp`, and `/mcp/**` (allowed origin patterns: `*`) let the Inspector's browser tab complete the handshake.
 
-If you get **"Failed to fetch"**, you're almost always on the wrong transport — switch from "Streamable HTTP" to "SSE" in the dropdown. If you get a 404 on `/sse`, your `mcp.url` in `settings.json` is pointing at a different path; either match the URL or restart the dashboard after editing.
+Common gotchas:
+
+- **"Failed to fetch"** almost always means the Inspector's transport dropdown is set to the protocol your dashboard isn't serving. Either flip the dropdown or run `cvector mcp update --transport <choice>` and restart.
+- **404 on `/mcp` or `/sse`** means `mcp.url` in `settings.json` points at a different path. Match the URL or restart the dashboard after editing.
+- **Tools list shows up but tool calls hang silently.** Classic Streamable-HTTP-client-on-an-SSE-server (or vice versa) symptom — the handshake half-succeeds because the initial `initialize` is forgiving, but subsequent POSTs land at the wrong handler. Confirm transport match.
+
+For a scripted smoke check, see the Python drivers in `.test/` (`test_stdio.py`, `test_streamable.py`, `test_sse.py`) — they exercise the full `initialize` → `notifications/initialized` → `tools/list` handshake against a freshly-built jar.
 
 ### GitHub Copilot for Eclipse
 
-No `setup-*` helper exists for Eclipse Copilot yet (the plugin's MCP support is new and the settings location depends on the plugin version), but every MCP-aware client consumes the same server-definition JSON. Paste the snippet below wherever your Copilot for Eclipse install accepts MCP server configuration:
+Eclipse Copilot's MCP support uses the modern **Streamable HTTP** transport — which is the cvector default since the Spring AI 2.0 / MCP SDK 2.0 bump, so a freshly-installed cvector dashboard works out of the box. Two equivalent ways to wire it up:
+
+**Option A — point Copilot at the running dashboard (recommended).** Leave `cvector dashboard` running in another terminal (or as a Windows / launchd service), then add an MCP server entry in Eclipse:
+
+```json
+{
+  "mcpServers": {
+    "cvector": {
+      "url": "http://localhost:2969/mcp"
+    }
+  }
+}
+```
+
+Copilot opens a Streamable HTTP session against `/mcp`; cvector replies with an `Mcp-Session-Id` header, and every subsequent tool call carries that header. No subprocess, no stdin/stdout plumbing, and the dashboard SPA stays available on the same port.
+
+**Option B — let Copilot launch `cvector serve` as a stdio subprocess.** Use this if you'd rather not keep a long-running dashboard around:
 
 ```json
 {
@@ -985,7 +1032,7 @@ No `setup-*` helper exists for Eclipse Copilot yet (the plugin's MCP support is 
 
 (Linux / macOS: replace the `command` with the absolute path to the installed `cvector` binary — no `.exe`.)
 
-**Where to put it** — try these in order, the right location varies by plugin version:
+**Where to put the snippet** — try these in order, the right location varies by plugin version:
 
 1. **Eclipse → Preferences → GitHub Copilot → Model Context Protocol** (or `MCP Servers`). If you see an `Edit JSON` / `Configure` button, paste the snippet directly into the editor.
 2. **Workspace file**: `<workspace>/.metadata/.plugins/com.github.copilot/mcp.json`. The plugin id varies — search your workspace `.metadata/.plugins/` for a directory containing `copilot` or `mcp`.
@@ -995,12 +1042,10 @@ No `setup-*` helper exists for Eclipse Copilot yet (the plugin's MCP support is 
 
 - Restart Eclipse (or use the plugin's "Reload MCP Servers" command if present).
 - Open Copilot Chat and ask "what tools do you have?" — `cv_search`, `cv_explain`, `cv_impact`, etc. should show up alongside Copilot's built-in tools.
-- First-launch traces appear in `~/.cvector/mcp-server.log` — look for `cvector mcp server (stdio) ready` followed by `Registered tools: 33`.
+- For option A, watch the dashboard's `~/.cvector/mcp-server.log`: each Copilot call logs `mcp POST /mcp -> 200 (… ms) sessionId=<uuid>` via `McpRequestLogFilter`. A `404 [STALE-SESSION]` line means Copilot is sending a session id the server has evicted — restart the dashboard and reconnect.
+- For option B, the launch banner reads `cvector mcp server (stdio) ready` followed by `Registered tools: 33`.
 
-**If your Copilot plugin version doesn't expose MCP yet**, two workarounds:
-
-- Bridge stdio → SSE via a proxy like [`mcp-proxy`](https://github.com/sparfenyuk/mcp-proxy) and point Copilot at the SSE URL once the plugin gains SSE support.
-- Use [Continue.dev for Eclipse](https://www.continue.dev) instead — it has full first-party MCP support and consumes the same JSON snippet.
+**Earlier Copilot plugin versions that only speak SSE.** Run cvector with `mcp.transport=sse` (`cvector mcp update --transport sse`) and point Copilot at `http://localhost:2969/sse`. The dashboard then exposes the legacy MCP 2024-11-05 protocol and Streamable HTTP clients no longer work against it. If you need both at the same time, run two cvector processes on different ports.
 
 ---
 
