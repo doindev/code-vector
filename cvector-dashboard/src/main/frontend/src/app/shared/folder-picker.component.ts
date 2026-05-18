@@ -67,7 +67,7 @@ interface RootsResponse {
                  (keydown.enter)="navigateTo(pathInput.value)"
                  (input)="onPathInput($event)"
                  #pathInput
-                 placeholder="Type a path and press Enter" />
+                 placeholder="Type a path and press Enter, or pick from the list below" />
         </div>
 
         @if (showRoots()) {
@@ -107,8 +107,8 @@ interface RootsResponse {
           </div>
           <div class="d-flex gap-2">
             <button class="btn btn-sm btn-outline-secondary" (click)="onCancel()">Cancel</button>
-            <button class="btn btn-sm btn-primary" (click)="onSelect()"
-                    [disabled]="!currentPath()">
+            <button class="btn btn-sm btn-primary" (click)="onSelect(pathInput.value)"
+                    [disabled]="!currentPath() && !pathInput.value.trim()">
               <i class="bi bi-check2"></i> Select this folder
             </button>
           </div>
@@ -271,7 +271,27 @@ export class FolderPickerComponent implements OnInit {
     });
   }
 
-  onSelect(): void {
+  /**
+   * Emit the chosen folder. Accepts an optional {@code typedValue} so the parent can pass
+   * the raw text the user typed in the picker's pathbox — if it differs from
+   * {@code currentPath()}, we navigate-then-select so the user can't accidentally walk
+   * away with the previously-displayed path when they type a new one and forget to press
+   * Enter. The original "click a folder row → click Select" path still works unchanged.
+   */
+  onSelect(typedValue?: string): void {
+    const typed = (typedValue ?? '').trim();
+    if (typed && typed !== this.currentPath()) {
+      // The user typed a different path than what the directory listing is currently
+      // showing. Validate it (navigateTo will do the existence check via /fs/list) and
+      // only emit once the navigation succeeds so we never emit a non-existent path.
+      this.http.get<{ path: string }>('/api/dashboard/fs/list?path=' + encodeURIComponent(typed))
+          .subscribe({
+            next: (r) => this.selected.emit(r?.path ?? typed),
+            error: (err) => this.error.set(
+                err?.error?.error ?? err?.error?.message ?? err?.message ?? 'Path not found'),
+          });
+      return;
+    }
     const p = this.currentPath();
     if (!p) return;
     this.selected.emit(p);

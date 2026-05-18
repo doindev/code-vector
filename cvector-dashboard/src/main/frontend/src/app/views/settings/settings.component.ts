@@ -23,7 +23,20 @@ type Backend = 'embedded' | 'remote' | 'docker';
 type Transport = 'http' | 'sse' | 'stdio' | 'streamable';
 
 interface RestSection { port: number; host: string; }
-interface McpSection { url: string; transport: Transport; }
+/**
+ * MCP session timeout knobs writable from settings.json. Every field is independent
+ * and `null` means "don't override" — the JVM keeps the application-mcp default.
+ *  - requestTimeoutMs      → spring.ai.mcp.server.request-timeout
+ *  - keepAliveIntervalMs   → spring.ai.mcp.server.streamable-http.keep-alive-interval (http)
+ *                            or spring.ai.mcp.server.keep-alive-interval (sse)
+ *  - asyncRequestTimeoutMs → spring.mvc.async.request-timeout (-1 = no SSE eviction)
+ */
+interface McpTimeoutsSection {
+  requestTimeoutMs: number | null;
+  keepAliveIntervalMs: number | null;
+  asyncRequestTimeoutMs: number | null;
+}
+interface McpSection { url: string; transport: Transport; timeouts?: McpTimeoutsSection | null; }
 interface DockerSection {
   image: string;
   containerName: string;
@@ -228,6 +241,52 @@ interface SettingsPatch {
 
         <div class="col-lg-6">
           <div class="cv-surface h-100">
+            <h2 class="fs-6 fw-semibold mb-3">MCP session timeouts <span class="badge text-bg-secondary fw-normal">advanced</span></h2>
+            <p class="small text-secondary mb-3">
+              All fields are optional. Leave blank to keep the cvector defaults
+              pinned in <code>application-mcp.properties</code>. Restart required.
+            </p>
+            <div class="mb-3">
+              <label class="form-label small text-secondary">Request timeout (ms)</label>
+              <input class="form-control" type="number" min="0" placeholder="default ~20000"
+                     [ngModel]="mcpRequestTimeoutMs()" (ngModelChange)="mcpRequestTimeoutMs.set($event)"
+                     name="mcpRequestTimeoutMs" />
+              <div class="form-text small">
+                Per-tool-call ceiling. Wired to <code>spring.ai.mcp.server.request-timeout</code>.
+              </div>
+            </div>
+            <div class="mb-3">
+              <label class="form-label small text-secondary">Keep-alive interval (ms)</label>
+              <input class="form-control" type="number" min="0" placeholder="default disabled"
+                     [ngModel]="mcpKeepAliveIntervalMs()" (ngModelChange)="mcpKeepAliveIntervalMs.set($event)"
+                     name="mcpKeepAliveIntervalMs" />
+              <div class="form-text small">
+                Server → client ping interval. Helps when load balancers / proxies drop idle
+                connections. Wired to
+                @if (mcpTransport() === 'sse') {
+                  <code>spring.ai.mcp.server.keep-alive-interval</code>.
+                } @else {
+                  <code>spring.ai.mcp.server.streamable-http.keep-alive-interval</code>.
+                }
+              </div>
+            </div>
+            <div class="mb-3">
+              <label class="form-label small text-secondary">Async stream timeout (ms)</label>
+              <input class="form-control" type="number" placeholder="default -1 (no eviction)"
+                     [ngModel]="mcpAsyncRequestTimeoutMs()" (ngModelChange)="mcpAsyncRequestTimeoutMs.set($event)"
+                     name="mcpAsyncRequestTimeoutMs" />
+              <div class="form-text small">
+                How long Spring MVC keeps an idle SSE / Streamable-HTTP stream open before
+                evicting the session. <code>-1</code> = forever. Wired to
+                <code>spring.mvc.async.request-timeout</code>.
+              </div>
+            </div>
+            <button class="btn cv-bg-accent btn-sm" (click)="saveMcpTimeouts()">Save timeouts</button>
+          </div>
+        </div>
+
+        <div class="col-lg-6">
+          <div class="cv-surface h-100">
             <h2 class="fs-6 fw-semibold mb-3">Appearance</h2>
             <div class="mb-3">
               <label class="form-label small text-secondary d-block">Theme</label>
@@ -279,6 +338,11 @@ export class SettingsComponent implements OnInit {
   readonly restPort = signal<number>(2969);
   readonly mcpUrl = signal<string>('');
   readonly mcpTransport = signal<Transport>('http');
+  // null = field omitted from settings.json → use cvector default. Empty input clears
+  // back to null so users can drop a previously-set override with no friction.
+  readonly mcpRequestTimeoutMs = signal<number | null>(null);
+  readonly mcpKeepAliveIntervalMs = signal<number | null>(null);
+  readonly mcpAsyncRequestTimeoutMs = signal<number | null>(null);
   readonly dockerImage = signal<string>('neo4j');
   readonly dockerVersion = signal<string>('5');
   readonly dockerContainer = signal<string>('cvector-neo4j');
@@ -316,6 +380,10 @@ export class SettingsComponent implements OnInit {
     // that still carry 'streamable' verbatim.
     const incoming = (d.mcp?.transport ?? 'http') as Transport;
     this.mcpTransport.set(incoming === 'streamable' ? 'http' : incoming);
+    const t = d.mcp?.timeouts;
+    this.mcpRequestTimeoutMs.set(t?.requestTimeoutMs ?? null);
+    this.mcpKeepAliveIntervalMs.set(t?.keepAliveIntervalMs ?? null);
+    this.mcpAsyncRequestTimeoutMs.set(t?.asyncRequestTimeoutMs ?? null);
     this.dockerImage.set(d.docker?.image ?? 'neo4j');
     this.dockerVersion.set(d.docker?.neo4jVersion ?? '5');
     this.dockerContainer.set(d.docker?.containerName ?? 'cvector-neo4j');
@@ -353,6 +421,20 @@ export class SettingsComponent implements OnInit {
 
   saveMcp(): void {
     this.put({ mcp: { url: this.mcpUrl(), transport: this.mcpTransport() } });
+  }
+
+  /**
+   * Persist just the timeouts sub-section. Empty inputs become `null`s in the patch so
+   * clearing a field rolls the JVM back to the cvector default rather than persisting a
+   * meaningless zero.
+   */
+  saveMcpTimeouts(): void {
+    const timeouts: McpTimeoutsSection = {
+      requestTimeoutMs: nullIfBlank(this.mcpRequestTimeoutMs()),
+      keepAliveIntervalMs: nullIfBlank(this.mcpKeepAliveIntervalMs()),
+      asyncRequestTimeoutMs: nullIfBlank(this.mcpAsyncRequestTimeoutMs()),
+    };
+    this.put({ mcp: { timeouts } });
   }
 
   private put(patch: SettingsPatch): void {
@@ -432,4 +514,17 @@ export class SettingsComponent implements OnInit {
     };
     setTimeout(tick, 500);
   }
+}
+
+/**
+ * An empty <input type="number"> emits `null` on Angular's two-way binding, but a blank
+ * <input type="text"> can also surface as a literal empty string. Normalise both to `null`
+ * so the timeouts PATCH transmits "no override" cleanly instead of an unparseable empty
+ * string (which the SettingsController's `toLong` would reject anyway, but explicit is
+ * better than relying on fallback semantics).
+ */
+function nullIfBlank(v: number | null | undefined | string): number | null {
+  if (v === null || v === undefined || v === '') return null;
+  const n = typeof v === 'number' ? v : Number(v);
+  return Number.isFinite(n) ? n : null;
 }

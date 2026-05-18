@@ -296,7 +296,7 @@ public record CvectorConfig(
      * {@link RestConfig#host} and {@link RestConfig#port} regardless.
      */
     @JsonInclude(JsonInclude.Include.NON_NULL)
-    public record McpConfig(String url, String transport) {
+    public record McpConfig(String url, String transport, McpTimeouts timeouts) {
 
         /**
          * MCP 2025-03-26 "Streamable HTTP" transport. Single endpoint (default {@code /mcp}),
@@ -330,13 +330,19 @@ public record CvectorConfig(
         private static final String DEFAULT_URL = "http://127.0.0.1:2969/mcp";
 
         public static McpConfig defaults() {
-            return new McpConfig(DEFAULT_URL, TRANSPORT_HTTP);
+            return new McpConfig(DEFAULT_URL, TRANSPORT_HTTP, null);
         }
 
         public McpConfig withDefaults() {
             return new McpConfig(
                     url == null || url.isBlank() ? DEFAULT_URL : url,
-                    transport == null || transport.isBlank() ? TRANSPORT_HTTP : canonicalTransport(transport));
+                    transport == null || transport.isBlank() ? TRANSPORT_HTTP : canonicalTransport(transport),
+                    timeouts);
+        }
+
+        /** Returns timeouts, never null — falls back to defaults when settings.json omits the section. */
+        public McpTimeouts timeoutsOrDefault() {
+            return timeouts != null ? timeouts.withDefaults() : McpTimeouts.defaults();
         }
 
         /** Validates the transport string is one of the supported values. */
@@ -360,6 +366,58 @@ public record CvectorConfig(
             if (t == null) return null;
             String lower = t.toLowerCase();
             return TRANSPORT_STREAMABLE.equals(lower) ? TRANSPORT_HTTP : lower;
+        }
+
+        /**
+         * Per-MCP-session timeout knobs writable from {@code settings.json}. All fields are
+         * optional; a {@code null} (or omitted) field means "don't override" — the value
+         * pinned in {@code application-mcp.properties} (or Spring AI's own default) wins.
+         * Applied at boot by {@code CvectorApplication.coHostMcp} as JVM system properties
+         * with the matching {@code spring.ai.mcp.server.*} / {@code spring.mvc.async.*} keys.
+         *
+         * <p>Why three knobs and not more: these cover the three failure modes operators
+         * actually hit in the field — agent calls timing out mid-tool (requestTimeoutMs),
+         * idle SSE sessions getting evicted too aggressively or held forever
+         * (asyncRequestTimeoutMs), and clients dropping their connection because the server
+         * goes quiet between responses (keepAliveIntervalMs). Anything more specific
+         * (Tomcat keep-alive, connection timeout, HTTP session timeout) can already be set
+         * via the existing free-form {@code rest.server.*} flattener.
+         *
+         * @param requestTimeoutMs       How long a single MCP request (tool call, resource
+         *                               fetch) may take before the server gives up and
+         *                               returns an error. Wired to
+         *                               {@code spring.ai.mcp.server.request-timeout}.
+         *                               Spring AI default: 20 s.
+         * @param keepAliveIntervalMs    Server → client ping interval. For
+         *                               {@code transport: http} (Streamable HTTP) wired to
+         *                               {@code spring.ai.mcp.server.streamable-http.keep-alive-interval};
+         *                               for {@code transport: sse} wired to
+         *                               {@code spring.ai.mcp.server.keep-alive-interval}.
+         *                               Default: disabled. Set when intermediaries (load
+         *                               balancers, reverse proxies) drop idle connections.
+         * @param asyncRequestTimeoutMs  Spring MVC's async-request lifetime ceiling — controls
+         *                               how long SSE streams (and Streamable HTTP optional
+         *                               SSE stream-backs) stay open while idle. Wired to
+         *                               {@code spring.mvc.async.request-timeout}. Default:
+         *                               {@code -1} (no timeout). Set a positive value to
+         *                               evict idle MCP sessions sooner — useful when a
+         *                               disconnected client leaks resources.
+         */
+        @JsonInclude(JsonInclude.Include.NON_NULL)
+        public record McpTimeouts(Long requestTimeoutMs,
+                                  Long keepAliveIntervalMs,
+                                  Long asyncRequestTimeoutMs) {
+
+            public static McpTimeouts defaults() {
+                return new McpTimeouts(null, null, null);
+            }
+
+            public McpTimeouts withDefaults() {
+                // Pass-through — every field is intentionally optional, so "no value" means
+                // "let application-mcp.properties / Spring AI defaults stand". The
+                // method exists for symmetry with the other config records.
+                return this;
+            }
         }
     }
 

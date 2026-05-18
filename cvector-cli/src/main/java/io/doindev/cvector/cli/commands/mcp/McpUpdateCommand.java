@@ -50,7 +50,9 @@ public class McpUpdateCommand implements Callable<Integer> {
         CvectorConfig updated = svc.update(root, before -> {
             CvectorConfig.McpConfig current = before.mcpOrDefault();
             String newUrl = (url == null || url.isBlank()) ? current.url() : url;
-            CvectorConfig.McpConfig next = new CvectorConfig.McpConfig(newUrl, canonical);
+            // Preserve any existing timeouts the user set via settings.json or the REST API —
+            // `cvector mcp update` only changes url + transport.
+            CvectorConfig.McpConfig next = new CvectorConfig.McpConfig(newUrl, canonical, current.timeouts());
             return new CvectorConfig(
                     before.activeProject(), before.projects(), before.neo4j(),
                     before.backend(), before.rest(), next, before.docker(), before.rules(), before.kuzu());
